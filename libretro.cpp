@@ -23,6 +23,10 @@
 #include "mednafen/hash/md5.h"
 #include "mednafen/ss/ss.h"
 
+#ifdef PORTANDROID
+#include "emu_retro.h"
+#endif
+
 /* Forward declarations */
 void MDFN_LoadGameCheats(void *override_ptr);
 void MDFN_FlushGameCheats(int nosave);
@@ -2147,7 +2151,11 @@ void retro_run(void)
    spec.SoundBufSize = 0;
    spec.VideoFormatChanged = false;
    spec.SoundFormatChanged = false;
-
+#ifdef PORTANDROID
+   if(cb_settings.frame_skip_direct) {
+       spec.skip = cb_context.video_skip;
+   }
+#endif
    EmulateSpecStruct *espec = (EmulateSpecStruct*)&spec;
 
    if (spec.SoundRate != last_sound_rate)
