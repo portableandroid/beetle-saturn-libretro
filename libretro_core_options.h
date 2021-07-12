@@ -198,6 +198,31 @@ struct retro_core_option_definition option_defs_us[] = {
       },
       "disabled"
    },
+   
+   {
+      "beetle_saturn_shared_int",
+      "Shared Internal Memory (Restart)",
+      "Enables shared internal memory.",
+      {
+         { "enabled", NULL },
+         { "disabled", NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+   
+   {
+      "beetle_saturn_shared_ext",
+      "Shared Backup Memory (Restart)",
+      "Enables shared backup memory.",
+      {
+         { "enabled", NULL },
+         { "disabled", NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+   
    {
       "beetle_saturn_midsync",
       "Mid-frame Input Synchronization",
@@ -512,6 +537,7 @@ struct retro_core_option_definition option_defs_us[] = {
       },
       "disabled"
    },
+
    { NULL, NULL, NULL, {{0}}, NULL },
 };
 

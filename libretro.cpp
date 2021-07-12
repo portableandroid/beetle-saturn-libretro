@@ -38,8 +38,6 @@ static INLINE bool DBG_NeedCPUHooks(void) { return false; } // <-- replaces debu
 
 #include <bitset>
 
-#include <zlib.h>
-
 struct retro_perf_callback perf_cb;
 retro_get_cpu_features_t perf_get_cpu_features_cb = NULL;
 retro_log_printf_t log_cb;
@@ -967,7 +965,6 @@ static void Emulate(EmulateSpecStruct* espec_arg)
    }
    catch(std::exception& e)
    {
-    MDFN_DispMessage("%s", e.what());
     BackupRAM_SaveDelay = (int64)60 * (EmulatedSS.MasterClock / MDFN_MASTERCLOCK_FIXED(1));  // 60 second retry delay.
    }
   }
@@ -987,7 +984,6 @@ static void Emulate(EmulateSpecStruct* espec_arg)
    }
    catch(std::exception& e)
    {
-    MDFN_DispMessage("%s", e.what());
     CartNV_SaveDelay = (int64)60 * (EmulatedSS.MasterClock / MDFN_MASTERCLOCK_FIXED(1));  // 60 second retry delay.
    }
   }
@@ -1019,7 +1015,9 @@ typedef struct
    const char *name;
 } CartName;
 
-static bool InitCommon(const unsigned cpucache_emumode, const unsigned cart_type, const unsigned smpc_area)
+uint32 ss_horrible_hacks;
+
+static bool InitCommon(const unsigned cpucache_emumode, const unsigned cart_type, const unsigned smpc_area, const uint32 horrible_hacks )
 {
 #ifdef MDFN_SS_DEV_BUILD
  ss_dbg_mask = SS_DBG_ERROR;
@@ -1096,6 +1094,8 @@ static bool InitCommon(const unsigned cpucache_emumode, const unsigned cart_type
       CPU[i].Init(cpucache_emumode == CPUCACHE_EMUMODE_DATA_CB);
       CPU[i].SetMD5((bool)i);
    }
+
+   ss_horrible_hacks = horrible_hacks;
 
    //
    // Initialize backup memory.
@@ -1197,9 +1197,9 @@ static bool InitCommon(const unsigned cpucache_emumode, const unsigned cart_type
    //
    //
 
-   try { LoadRTC();       } catch(MDFN_Error& e) { if(e.GetErrno() != ENOENT) throw; }
-   try { LoadBackupRAM(); } catch(MDFN_Error& e) { if(e.GetErrno() != ENOENT) throw; }
-   try { LoadCartNV();    } catch(MDFN_Error& e) { if(e.GetErrno() != ENOENT) throw; }
+   LoadRTC();
+   LoadBackupRAM();
+   LoadCartNV();
 
    BackupBackupRAM();
    BackupCartNV();
@@ -1313,7 +1313,7 @@ static MDFN_COLD void LoadCartNV(void)
       return;
 
    nvs = filestream_open(
-         MDFN_MakeFName(MDFNMKF_SAV, 0, ext),
+         MDFN_MakeFName(MDFNMKF_CART, 0, ext),
          RETRO_VFS_FILE_ACCESS_READ,
          RETRO_VFS_FILE_ACCESS_HINT_NONE);
 
@@ -1345,7 +1345,7 @@ static MDFN_COLD void SaveCartNV(void)
 
    if(ext)
    {
-      FileStream nvs(MDFN_MakeFName(MDFNMKF_SAV, 0, ext), MODE_WRITE_INPLACE);
+      FileStream nvs(MDFN_MakeFName(MDFNMKF_CART, 0, ext), MODE_WRITE_INPLACE);
 
       if(nv16)
       {
@@ -1694,13 +1694,20 @@ bool retro_load_game_special(unsigned, const struct retro_game_info *, size_t)
    return false;
 }
 
-static bool old_cdimagecache = false;
+static bool cdimagecache = false;
 
 static bool boot = true;
 
-// shared memory cards support
-static bool shared_memorycards = false;
-static bool shared_memorycards_toggle = false;
+// shared internal memory support
+bool shared_intmemory = false;
+bool shared_intmemory_toggle = false;
+
+
+// shared backup memory support
+bool shared_backup = false;
+bool shared_backup_toggle = false;
+
+
 
 static void check_variables(bool startup)
 {
@@ -1708,6 +1715,32 @@ static void check_variables(bool startup)
 
    if (startup)
    {
+      var.key = "beetle_saturn_cdimagecache";
+      cdimagecache = false;
+
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         if (!strcmp(var.value, "enabled"))
+            cdimagecache = true;
+
+      var.key = "beetle_saturn_shared_int";
+
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         if (!strcmp(var.value, "enabled"))
+            shared_intmemory_toggle = true;
+         else if (!strcmp(var.value, "disabled"))
+            shared_intmemory_toggle = false;
+      }
+
+      var.key = "beetle_saturn_shared_ext";
+
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      {
+         if (!strcmp(var.value, "enabled"))
+            shared_backup_toggle = true;
+         else if (!strcmp(var.value, "disabled"))
+            shared_backup_toggle = false;
+      }
    }
 
    var.key = "beetle_saturn_region";
@@ -1767,6 +1800,7 @@ static void check_variables(bool startup)
       input_multitap( 1, connected );
    }
 
+
    var.key = "beetle_saturn_multitap_port2";
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -1780,21 +1814,10 @@ static void check_variables(bool startup)
       input_multitap( 2, connected );
    }
 
-   var.key = "beetle_saturn_cdimagecache";
 
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      bool cdimage_cache = true;
-      if (!strcmp(var.value, "enabled"))
-         cdimage_cache = true;
-      else if (!strcmp(var.value, "disabled"))
-         cdimage_cache = false;
-      if (cdimage_cache != old_cdimagecache)
-      {
-         old_cdimagecache = cdimage_cache;
-      }
-   }
 
+
+   
    var.key = "beetle_saturn_midsync";
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -1927,6 +1950,7 @@ static bool MDFNI_LoadGame( const char *name )
    unsigned cpucache_emumode;
    int cart_type;
    unsigned region;
+   uint32 horrible_hacks = 0;
 
    // .. safe defaults
    region = SMPC_AREA_NA;
@@ -1953,7 +1977,7 @@ static bool MDFNI_LoadGame( const char *name )
          uint8 fd_id[16];
          char sgid[16 + 1] = { 0 };
 
-         if ( disc_load_content( MDFNGameInfo, name, fd_id, sgid ) )
+         if ( disc_load_content( MDFNGameInfo, name, fd_id, sgid, cdimagecache ) )
          {
             log_cb(RETRO_LOG_INFO, "Game ID is: %s\n", sgid );
 
@@ -1969,7 +1993,7 @@ static bool MDFNI_LoadGame( const char *name )
             {
                disc_detect_region( &region );
 
-               DB_Lookup(nullptr, sgid, fd_id, &region, &cart_type, &cpucache_emumode );
+               DB_Lookup(nullptr, sgid, fd_id, &region, &cart_type, &cpucache_emumode, &horrible_hacks );
 
                // forced region setting?
                if ( setting_region != 0 ) {
@@ -1982,7 +2006,7 @@ static bool MDFNI_LoadGame( const char *name )
                }
 
                // GO!
-               if ( InitCommon( cpucache_emumode, cart_type, region ) )
+               if ( InitCommon( cpucache_emumode, cart_type, region, horrible_hacks ) )
                {
                   MDFN_LoadGameCheats(NULL);
                   MDFNMP_InstallReadPatches();
@@ -2024,7 +2048,7 @@ static bool MDFNI_LoadGame( const char *name )
    }
 
    // Initialise with safe parameters
-   InitCommon( cpucache_emumode, cart_type, region );
+   InitCommon( cpucache_emumode, cart_type, region, horrible_hacks );
 
    MDFN_LoadGameCheats(NULL);
    MDFNMP_InstallReadPatches();
@@ -2058,8 +2082,9 @@ bool retro_load_game(const struct retro_game_info *info)
 
    check_variables(true);
    //make sure shared memory cards and save states are enabled only at startup
-   shared_memorycards = shared_memorycards_toggle;
-
+   shared_intmemory = shared_intmemory_toggle;
+   shared_backup = shared_backup_toggle;
+   
    // Let's try to load the game. If this fails then things are very wrong.
    if (MDFNI_LoadGame(retro_cd_path) == false)
       return false;
@@ -2273,8 +2298,7 @@ unsigned retro_get_region(void)
 {
    if (is_pal)
        return RETRO_REGION_PAL;  //Ben Swith PAL
-   else
-       return RETRO_REGION_NTSC;
+   return RETRO_REGION_NTSC;
 }
 
 unsigned retro_api_version(void)
@@ -2432,14 +2456,21 @@ const char *MDFN_MakeFName(MakeFName_Type type, int id1, const char *cd1)
          snprintf(fullpath, sizeof(fullpath), "%s%c%s.%s",
                retro_save_directory,
                retro_slash,
-               (!shared_memorycards) ? retro_cd_base_name : "mednafen_saturn_libretro_shared",
+               (!shared_intmemory) ? retro_cd_base_name : "mednafen_saturn_libretro_shared",
                cd1);
+         break;
+      case MDFNMKF_CART:
+         snprintf(fullpath, sizeof(fullpath), "%s%c%s.%s",
+               retro_save_directory,
+               retro_slash,
+               (!shared_backup) ? retro_cd_base_name : "mednafen_saturn_libretro_shared",
+               cd1);
+         break;
+      default:
          break;
       case MDFNMKF_FIRMWARE:
          snprintf(fullpath, sizeof(fullpath), "%s%c%s", retro_base_directory,
                retro_slash, cd1);
-         break;
-      default:
          break;
    }
 
