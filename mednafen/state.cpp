@@ -15,7 +15,6 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#include <stdio.h>
 #include <string.h>
 
 #include <boolean.h>
@@ -28,22 +27,13 @@
 #include "mednafen-endian.h"
 #include "state.h"
 
+#define SSEEK_END	2
+#define SSEEK_CUR	1
+#define SSEEK_SET	0
+
 #define RLSB 		MDFNSTATE_RLSB	//0x80000000
 
-static int read32le(uint32_t *Bufo, FILE *fp)
-{
-   uint32_t buf;
-   if(fread(&buf,1,4,fp)<4)
-      return 0;
-#ifdef MSB_FIRST
-   *(uint32_t*)Bufo=((buf&0xFF)<<24)|((buf&0xFF00)<<8)|((buf&0xFF0000)>>8)|((buf&0xFF000000)>>24);
-#else
-   *(uint32_t*)Bufo=buf;
-#endif
-   return 1;
-}
-
-int32_t smem_read(StateMem *st, void *buffer, uint32_t len)
+static int32_t smem_read(StateMem *st, void *buffer, uint32_t len)
 {
    if ((len + st->loc) > st->len)
       return 0;
@@ -54,7 +44,7 @@ int32_t smem_read(StateMem *st, void *buffer, uint32_t len)
    return(len);
 }
 
-int32_t smem_write(StateMem *st, void *buffer, uint32_t len)
+static int32_t smem_write(StateMem *st, void *buffer, uint32_t len)
 {
    if ((len + st->loc) > st->malloced)
    {
@@ -74,21 +64,13 @@ int32_t smem_write(StateMem *st, void *buffer, uint32_t len)
    return(len);
 }
 
-int32_t smem_putc(StateMem *st, int value)
-{
-   uint8_t tmpval = value;
-   if(smem_write(st, &tmpval, 1) != 1)
-      return(-1);
-   return(1);
-}
-
-int32_t smem_seek(StateMem *st, uint32_t offset, int whence)
+static int32_t smem_seek(StateMem *st, uint32_t offset, int whence)
 {
    switch(whence)
    {
-      case SEEK_SET: st->loc = offset; break;
-      case SEEK_END: st->loc = st->len - offset; break;
-      case SEEK_CUR: st->loc += offset; break;
+      case SSEEK_SET: st->loc = offset; break;
+      case SSEEK_END: st->loc = st->len - offset; break;
+      case SSEEK_CUR: st->loc += offset; break;
    }
 
    if(st->loc > st->len)
@@ -100,7 +82,7 @@ int32_t smem_seek(StateMem *st, uint32_t offset, int whence)
    return(0);
 }
 
-int smem_write32le(StateMem *st, uint32_t b)
+static int smem_write32le(StateMem *st, uint32_t b)
 {
    uint8_t s[4];
    s[0]=b;
@@ -110,7 +92,7 @@ int smem_write32le(StateMem *st, uint32_t b)
    return((smem_write(st, s, 4)<4)?0:4);
 }
 
-int smem_read32le(StateMem *st, uint32_t *b)
+static int smem_read32le(StateMem *st, uint32_t *b)
 {
    uint8_t s[4];
 
@@ -126,6 +108,8 @@ static void SubWrite(StateMem *st, const SFORMAT *sf)
 {
    while(sf->size || sf->name)	// Size can sometimes be zero, so also check for the text name.  These two should both be zero only at the end of a struct.
    {
+      char nameo[1 + 255];
+
       if(!sf->size || !sf->data)
       {
          sf++;
@@ -140,15 +124,11 @@ static void SubWrite(StateMem *st, const SFORMAT *sf)
          continue;
       }
 
-      int32_t bytesize = sf->size;
-      uintptr_t p = (uintptr_t)sf->data;
-      uint32 repcount = sf->repcount;
+      int32_t bytesize       = sf->size;
+      uintptr_t p            = (uintptr_t)sf->data;
+      uint32 repcount        = sf->repcount;
       const size_t repstride = sf->repstride;
-      char nameo[1 + 255];
-      const int slen = strlen(sf->name);
-
-      if(slen > 255)
-      	log_cb( RETRO_LOG_WARN, "State variable name \"%s\" is too long.", sf->name);
+      const int slen         = strlen(sf->name);
 
       memcpy(&nameo[1], sf->name, slen);
       nameo[0] = slen;
@@ -164,7 +144,6 @@ static void SubWrite(StateMem *st, const SFORMAT *sf)
 			for(int32 bool_monster = 0; bool_monster < bytesize; bool_monster++)
 			{
 				uint8 tmp_bool = ((bool *)p)[bool_monster];
-				//printf("Bool write: %.31s\n", sf->name);
 				smem_write(st, &tmp_bool, 1);
 			}
 		}
@@ -256,12 +235,8 @@ static int ReadStateChunk(StateMem *st, const SFORMAT *sf, uint32 size)
 
 			if(recorded_size != tmp->size * (1 + tmp->repcount))
 			{
-				log_cb( RETRO_LOG_ERROR, "Variable in save state wrong size: %s.  Need: %d, got: %d\n", toa + 1, tmp->size * (1 + tmp->repcount), recorded_size);
-				if(smem_seek(st, recorded_size, SEEK_CUR) < 0)
-				{
-					log_cb( RETRO_LOG_ERROR, "Seek error\n");
+				if(smem_seek(st, recorded_size, SSEEK_CUR) < 0)
 					return(0);
-				}
 			}
 			else
 			{
@@ -281,38 +256,15 @@ static int ReadStateChunk(StateMem *st, const SFORMAT *sf, uint32 size)
 					{
 						// Converting downwards is necessary for the case of sizeof(bool) > 1
 						for(int32 bool_monster = expected_size - 1; bool_monster >= 0; bool_monster--)
-						{
 							((bool *)p)[bool_monster] = ((uint8 *)p)[bool_monster];
-						}
-					}
-					else
-					{
-						/*switch(type)
-						{
-							case 2: Endian_A16_Swap((void*)p, expected_size / sizeof(uint16_t)); break;
-							case 4: Endian_A32_Swap((void*)p, expected_size / sizeof(uint32_t)); break;
-							case 8: Endian_A64_Swap((void*)p, expected_size / sizeof(uint64_t)); break;
-						}*/
 					}
 				} while(p += repstride, repcount--);
 			}
 		}
 		else
 		{
-			log_cb( RETRO_LOG_ERROR, "Unknown variable in save state: %s\n", toa + 1);
-			if(smem_seek(st, recorded_size, SEEK_CUR) < 0)
-			{
-				log_cb( RETRO_LOG_ERROR, "Seek error\n");
+			if(smem_seek(st, recorded_size, SSEEK_CUR) < 0)
 				return(0);
-			}
-		}
-	} // while(...)
-
-	for(SFMap_t::const_iterator it = sfmap.begin(); it != sfmap.end(); it++)
-	{
-		if(sfmap_found.find(it->second->name) == sfmap_found.end())
-		{
-			log_cb( RETRO_LOG_WARN, "Variable of bytesize %u missing from save state: %s\n", it->second->size * (1 + it->second->repcount), it->second->name);
 		}
 	}
 
@@ -346,9 +298,9 @@ static int WriteStateChunk(StateMem *st, const char *sname, SFORMAT *sf)
 
 	end_pos = st->loc;
 
-	smem_seek(st, data_start_pos - 4, SEEK_SET);
+	smem_seek(st, data_start_pos - 4, SSEEK_SET);
 	smem_write32le(st, end_pos - data_start_pos);
-	smem_seek(st, end_pos, SEEK_SET);
+	smem_seek(st, end_pos, SSEEK_SET);
 
 	return(end_pos - data_start_pos);
 }
@@ -389,25 +341,16 @@ static int MDFNSS_StateAction_internal( void *st_p, int load, int data_only, SSD
          }
          else
          {
-            if ( smem_seek(st, tmp_size, SEEK_CUR ) < 0 )
-            {
-               log_cb( RETRO_LOG_ERROR, "Chunk seek failure.\n" );
+            if ( smem_seek(st, tmp_size, SSEEK_CUR ) < 0 )
                return(0);
-            }
          }
       }
 
-      if ( smem_seek(st, -total, SEEK_CUR) < 0 )
-      {
-         log_cb( RETRO_LOG_ERROR, "Reverse seek error.\n" );
+      if ( smem_seek(st, -total, SSEEK_CUR) < 0 )
          return(0);
-      }
 
-      if( !found && !section->optional ) // Not found.  We are sad!
-      {
-         log_cb( RETRO_LOG_ERROR, "Section missing:  %.32s\n", section->name);
+      if( !found) // Not found.  We are sad!
          return(0);
-      }
 
    }
 	else
@@ -427,7 +370,6 @@ int MDFNSS_StateAction(void *st_p, int load, int data_only, SFORMAT *sf, const c
 
    love.sf       = sf;
    love.name     = name;
-   love.optional = optional;
 
    return(MDFNSS_StateAction_internal(st, load, 0, &love));
 }

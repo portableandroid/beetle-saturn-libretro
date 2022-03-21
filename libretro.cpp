@@ -109,6 +109,7 @@ static char retro_slash = '\\';
 static char retro_slash = '/';
 #endif
 
+static bool libretro_supports_option_categories = false;
 static bool libretro_supports_bitmasks = false;
 
 extern MDFNGI EmulatedSS;
@@ -130,9 +131,6 @@ MDFNGI *MDFNGameInfo = NULL;
 
 static sscpu_timestamp_t MidSync(const sscpu_timestamp_t timestamp);
 
-#ifdef MDFN_SS_DEV_BUILD
-uint32 ss_dbg_mask;
-#endif
 static bool NeedEmuICache;
 static const uint8 BRAM_Init_Data[0x10] = { 0x42, 0x61, 0x63, 0x6b, 0x55, 0x70, 0x52, 0x61, 0x6d, 0x20, 0x46, 0x6f, 0x72, 0x6d, 0x61, 0x74 };
 
@@ -174,9 +172,6 @@ uint32 SH7095_BusLock;
 static uint32 SH7095_DB;
 
 #include "mednafen/ss/scu.inc"
-#ifdef HAVE_DEBUG
-#include "mednafen/ss/debug.inc"
-#endif
 
 static sha256_digest BIOS_SHA256;   // SHA-256 hash of the currently-loaded BIOS; used for save state sanity checks.
 static std::bitset<1U << (27 - SH7095_EXT_MAP_GRAN_BITS)> FMIsWriteable;
@@ -318,7 +313,6 @@ static INLINE void BusRW_DB_CS0(const uint32 A, uint32& DB, const bool BurstHax,
   else
    *SH2DMAHax -= 8;
 
-  //printf("FT FRT%08x %zu %08x %04x %d %d\n", A, sizeof(T), A, V, SMPC_IsSlaveOn(), SH7095_mem_timestamp);
   if(IsWrite)
   {
    if(sizeof(T) != 1)
@@ -573,10 +567,7 @@ template<unsigned c>
 static sscpu_timestamp_t SH_DMA_EventHandler(sscpu_timestamp_t et)
 {
  if(et < SH7095_mem_timestamp)
- {
-  //printf("SH-2 DMA %d reschedule %d->%d\n", c, et, SH7095_mem_timestamp);
   return SH7095_mem_timestamp;
- }
 
  // Must come after the (et < SH7095_mem_timestamp) check.
  if(MDFN_UNLIKELY(SH7095_BusLock))
@@ -712,19 +703,8 @@ static INLINE bool EventHandler(const sscpu_timestamp_t timestamp)
 
  while(timestamp >= (e = events[SS_EVENT__SYNFIRST].next)->event_time)  // If Running = 0, EventHandler() may be called even if there isn't an event per-se, so while() instead of do { ... } while
  {
-#ifdef MDFN_SS_DEV_BUILD
-  const sscpu_timestamp_t etime = e->event_time;
-#endif
   sscpu_timestamp_t nt;
   nt = e->event_handler(e->event_time);
-
-#ifdef MDFN_SS_DEV_BUILD
-  if(MDFN_UNLIKELY(nt <= etime))
-  {
-   fprintf(stderr, "which=%d event_time=%d nt=%d timestamp=%d\n", (int)(e - events), etime, nt, timestamp);
-   assert(nt > etime);
-  }
-#endif
 
   SS_SetEventNT(e, nt);
  }
@@ -740,10 +720,7 @@ static void CheckEventsByMemTS_Sub(void)
 static void CheckEventsByMemTS(void)
 {
  if(MDFN_UNLIKELY(SH7095_mem_timestamp >= next_event_ts))
- {
-  //puts("Woot");
   CheckEventsByMemTS_Sub();
- }
 }
 
 
@@ -765,26 +742,16 @@ static int32 NO_INLINE RunLoop(EmulateSpecStruct* espec)
 {
  sscpu_timestamp_t eff_ts = 0;
 
- //printf("%d %d\n", SH7095_mem_timestamp, CPU[0].timestamp);
-
  do
  {
   do
   {
-#ifdef HAVE_DEBUG
-   if(DebugMode)
-    DBG_CPUHandler<0>(eff_ts);
-#endif
 
    CPU[0].Step<0, EmulateICache, DebugMode>();
    CPU[0].DMA_BusTimingKludge();
 
    while(MDFN_LIKELY(CPU[0].timestamp > CPU[1].timestamp))
    {
-#ifdef HAVE_DEBUG
-    if(DebugMode)
-     DBG_CPUHandler<1>(eff_ts);
-#endif
 
     CPU[1].Step<1, EmulateICache, DebugMode>();
    }
@@ -797,7 +764,6 @@ static int32 NO_INLINE RunLoop(EmulateSpecStruct* espec)
   } while(MDFN_LIKELY(eff_ts < next_event_ts));
  } while(MDFN_LIKELY(EventHandler(eff_ts)));
 
- //printf(" End: %d %d -- %d\n", SH7095_mem_timestamp, CPU[0].timestamp, eff_ts);
  return eff_ts;
 }
 #pragma GCC pop_options
@@ -898,11 +864,7 @@ static void Emulate(EmulateSpecStruct* espec_arg)
  Running = true;  // Set before ForceEventUpdates()
  ForceEventUpdates(0);
 
-#ifdef WANT_DEBUGGER
- #define RLTDAT true
-#else
  #define RLTDAT false
-#endif
  static int32 (*const rltab[2][2])(EmulateSpecStruct*) =
  {
   //     DebugMode=false        DebugMode=true
@@ -998,9 +960,6 @@ static MDFN_COLD void Cleanup(void)
 {
  CART_Kill();
 
-#ifdef HAVE_DEBUG
- DBG_Kill();
-#endif
  VDP1::Kill();
  VDP2::Kill();
  SOUND_Kill();
@@ -1019,15 +978,6 @@ uint32 ss_horrible_hacks;
 
 static bool InitCommon(const unsigned cpucache_emumode, const unsigned cart_type, const unsigned smpc_area, const uint32 horrible_hacks )
 {
-#ifdef MDFN_SS_DEV_BUILD
- ss_dbg_mask = SS_DBG_ERROR;
- {
-  std::vector<uint64> dms = MDFN_GetSettingMultiUI("ss.dbg_mask");
-
-  for(uint64 dmse : dms)
-   ss_dbg_mask |= dmse;
- }
-#endif
  //
 
    unsigned i;
@@ -1175,10 +1125,6 @@ static bool InitCommon(const unsigned cpucache_emumode, const unsigned cart_type
    InitEvents();
    UpdateInputLastBigTS = 0;
 
-#ifdef HAVE_DEBUG
-   DBG_Init();
-#endif
-
    // Apply multi-tap state to SMPC
    SMPC_SetMultitap( 0, setting_multitap_port1 );
    SMPC_SetMultitap( 1, setting_multitap_port2 );
@@ -1239,13 +1185,6 @@ static bool InitCommon(const unsigned cpucache_emumode, const unsigned cart_type
 
 static MDFN_COLD void CloseGame(void)
 {
-#ifdef MDFN_SS_DEV_BUILD
- VDP1::MakeDump("/tmp/vdp1_dump.h");
- VDP2::MakeDump("/tmp/vdp2_dump.h");
-#endif
- //
- //
-
  SaveBackupRAM();
  SaveCartNV();
  SaveRTC();
@@ -1814,9 +1753,15 @@ static void check_variables(bool startup)
       input_multitap( 2, connected );
    }
 
+   var.key = "beetle_saturn_opposite_directions";
 
-
-
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "enabled"))
+         opposite_directions = true;
+      else if (!strcmp(var.value, "disabled"))
+         opposite_directions = false;
+   }
    
    var.key = "beetle_saturn_midsync";
 
@@ -2108,6 +2053,23 @@ bool retro_load_game(const struct retro_game_info *info)
    frame_count = 0;
    internal_frame_count = 0;
 
+   struct retro_core_option_display option_display;
+   option_display.visible = false;
+   if (is_pal)
+   {
+      option_display.key = "beetle_saturn_initial_scanline";
+      environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+      option_display.key = "beetle_saturn_last_scanline";
+      environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+   }
+   else
+   {
+      option_display.key = "beetle_saturn_initial_scanline_pal";
+      environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+      option_display.key = "beetle_saturn_last_scanline_pal";
+      environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+   }
+
    return true;
 }
 
@@ -2291,6 +2253,7 @@ void retro_deinit(void)
    log_cb(RETRO_LOG_INFO, "[%s]: Estimated FPS: %.5f\n",
          MEDNAFEN_CORE_NAME, (double)video_frames * 44100 / audio_frames);
 
+   libretro_supports_option_categories = false;
    libretro_supports_bitmasks = false;
 }
 
@@ -2311,7 +2274,9 @@ void retro_set_environment( retro_environment_t cb )
    struct retro_vfs_interface_info vfs_iface_info;
    environ_cb = cb;
 
-   libretro_set_core_options(environ_cb);
+   libretro_supports_option_categories = false;
+   libretro_set_core_options(environ_cb,
+           &libretro_supports_option_categories);
 
    vfs_iface_info.required_interface_version = 1;
    vfs_iface_info.iface                      = NULL;

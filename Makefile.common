@@ -2,19 +2,19 @@ SOURCES_CXX :=
 SOURCES_C   :=
 
 DEPS_DIR     := $(CORE_DIR)/deps
-LIBRETRO_DIR := $(CORE_DIR)/libretro-common
+LIBRETRO_COMMON_DIR := $(CORE_DIR)/libretro-common
 MEDNAFEN_DIR := $(CORE_DIR)/mednafen
 CORE_EMU_DIR := $(MEDNAFEN_DIR)/ss
 CDROM_DIR    := $(MEDNAFEN_DIR)/cdrom
 
 INCFLAGS := -I$(CORE_DIR) \
-	         -I$(MEDNAFEN_DIR) \
-				-I$(MEDNAFEN_DIR)/include \
-				-I$(MEDNAFEN_DIR)/intl \
-				-I$(MEDNAFEN_DIR)/hw_sound \
-				-I$(MEDNAFEN_DIR)/hw_cpu \
-				-I$(MEDNAFEN_DIR)/hw_misc \
-				-I$(LIBRETRO_DIR)/include
+	    -I$(MEDNAFEN_DIR) \
+	    -I$(MEDNAFEN_DIR)/include \
+	    -I$(MEDNAFEN_DIR)/intl \
+	    -I$(MEDNAFEN_DIR)/hw_sound \
+	    -I$(MEDNAFEN_DIR)/hw_cpu \
+	    -I$(MEDNAFEN_DIR)/hw_misc \
+	    -I$(LIBRETRO_COMMON_DIR)/include
 
 ZLIB_INCFLAGS = -I$(DEPS_DIR)/zlib-1.2.11
 
@@ -23,8 +23,7 @@ ZLIB_SOURCES_C = \
 		$(DEPS_DIR)/zlib-1.2.11/crc32.c \
 		$(DEPS_DIR)/zlib-1.2.11/inffast.c \
 		$(DEPS_DIR)/zlib-1.2.11/inflate.c \
-		$(DEPS_DIR)/zlib-1.2.11/inftrees.c \
-		$(DEPS_DIR)/zlib-1.2.11/zutil.c
+		$(DEPS_DIR)/zlib-1.2.11/inftrees.c
 
 ifeq ($(HAVE_GRIFFIN),1)
 SOURCES_CXX += beetle_ss_griffin.cpp
@@ -35,8 +34,8 @@ endif
 ifeq ($(HAVE_CDROM), 1)
    FLAGS += -DHAVE_CDROM
 
-   SOURCES_C += $(LIBRETRO_DIR)/cdrom/cdrom.c \
-                $(LIBRETRO_DIR)/vfs/vfs_implementation_cdrom.c
+   SOURCES_C += $(LIBRETRO_COMMON_DIR)/cdrom/cdrom.c \
+                $(LIBRETRO_COMMON_DIR)/vfs/vfs_implementation_cdrom.c
 
    ifeq ($(CDROM_DEBUG), 1)
       FLAGS += -DCDROM_DEBUG
@@ -45,11 +44,6 @@ endif
 
 ifeq ($(NEED_THREADING), 1)
    FLAGS += -DWANT_THREADING -DHAVE_THREADS
-endif
-
-ifeq ($(NEED_CRC32), 1)
-   FLAGS += -DWANT_CRC32
-	SOURCES_C += $(CORE_DIR)/scrc32.c
 endif
 
 ifeq ($(NEED_DEINTERLACER), 1)
@@ -78,10 +72,6 @@ ifeq ($(NEED_BPP), 32)
 FLAGS += -DWANT_32BPP
 endif
 
-ifeq ($(WANT_NEW_API), 1)
-FLAGS += -DWANT_NEW_API
-endif
-
 ifeq ($(NO_COMPUTED_GOTO), 1)
 FLAGS += -DNO_COMPUTED_GOTO
 endif
@@ -96,9 +86,14 @@ endif
 
 ifeq ($(HAVE_CHD), 1)
    FLAGS += -DHAVE_CHD -D_7ZIP_ST
+ifeq ($(SYSTEM_LIBCHDR), 1)
+   INCFLAGS += $(shell pkg-config --cflags libchdr)
+   LIBS += $(shell pkg-config --libs libchdr)
+else
    INCFLAGS += \
    -I$(DEPS_DIR)/lzma-19.00/include \
    -I$(DEPS_DIR)/libchdr/include
+endif
 endif
 
 ifeq ($(NEED_TREMOR), 1)
@@ -133,12 +128,11 @@ ifneq ($(HAVE_GRIFFIN), 1)
 	$(CORE_EMU_DIR)/input/wheel.cpp
 
 SOURCES_CXX += \
-					$(CORE_EMU_DIR)/cart/backup.cpp \
-					$(CORE_EMU_DIR)/cart/cs1ram.cpp \
-					$(CORE_EMU_DIR)/cart/debug.cpp \
-					$(CORE_EMU_DIR)/cart/extram.cpp \
-					$(CORE_EMU_DIR)/cart/rom.cpp \
-					$(CORE_EMU_DIR)/cart/ar4mp.cpp
+	       $(CORE_EMU_DIR)/cart/backup.cpp \
+	       $(CORE_EMU_DIR)/cart/cs1ram.cpp \
+	       $(CORE_EMU_DIR)/cart/extram.cpp \
+	       $(CORE_EMU_DIR)/cart/rom.cpp \
+	       $(CORE_EMU_DIR)/cart/ar4mp.cpp
 
 SOURCES_CXX += $(MEDNAFEN_DIR)/hw_cpu/m68k/m68k.cpp
 
@@ -162,9 +156,9 @@ SOURCES_CXX += $(CDROM_DIR)/CDAccess.cpp \
 	$(CDROM_DIR)/l-ec.cpp \
 	$(CDROM_DIR)/edc_crc32.cpp
 endif
-   FLAGS += -DNEED_CD
 
 ifeq ($(HAVE_CHD), 1)
+ifneq ($(SYSTEM_LIBCHDR), 1)
 SOURCES_C += \
 	$(DEPS_DIR)/lzma-19.00/src/Alloc.c \
 	$(DEPS_DIR)/lzma-19.00/src/Bra86.c \
@@ -180,6 +174,7 @@ SOURCES_C += \
 	$(DEPS_DIR)/libchdr/src/libchdr_chd.c \
 	$(DEPS_DIR)/libchdr/src/libchdr_flac.c \
 	$(DEPS_DIR)/libchdr/src/libchdr_huffman.c
+endif
 
 SOURCES_CXX += \
 	$(CDROM_DIR)/CDAccess_CHD.cpp
@@ -207,6 +202,8 @@ SOURCES_C += $(MEDNAFEN_DIR)/mednafen-endian.c \
 SOURCES_CXX += $(MEDNAFEN_DIR)/hash/sha256.cpp \
 					$(MEDNAFEN_DIR)/hash/md5.cpp
 
+ifeq ($(HAVE_CHD), 1)
+ifneq ($(SYSTEM_LIBCHDR), 1)
 ifeq ($(SYSTEM_ZLIB), 1)
 	INCFLAGS += $(shell pkg-config --cflags zlib)
 	LIBS += $(shell pkg-config --libs zlib)
@@ -214,27 +211,29 @@ else
 	INCFLAGS += $(ZLIB_INCFLAGS)
 	SOURCES_C += $(ZLIB_SOURCES_C)
 endif
+endif
+endif
 
 ifneq ($(STATIC_LINKING), 1)
-SOURCES_C += $(LIBRETRO_DIR)/streams/file_stream.c \
-				 $(LIBRETRO_DIR)/streams/file_stream_transforms.c \
-				 $(LIBRETRO_DIR)/file/file_path.c \
-				 $(LIBRETRO_DIR)/file/retro_dirent.c \
-				 $(LIBRETRO_DIR)/lists/dir_list.c \
-				 $(LIBRETRO_DIR)/lists/string_list.c \
-				 $(LIBRETRO_DIR)/vfs/vfs_implementation.c \
-				 $(LIBRETRO_DIR)/compat/compat_strl.c \
-				 $(LIBRETRO_DIR)/compat/compat_strcasestr.c \
-				 $(LIBRETRO_DIR)/compat/compat_posix_string.c \
-				 $(LIBRETRO_DIR)/compat/fopen_utf8.c \
-				 $(LIBRETRO_DIR)/encodings/encoding_utf.c \
-				 $(LIBRETRO_DIR)/memmap/memalign.c \
-				 $(LIBRETRO_DIR)/string/stdstring.c \
-				 $(LIBRETRO_DIR)/time/rtime.c
+SOURCES_C += $(LIBRETRO_COMMON_DIR)/streams/file_stream.c \
+				 $(LIBRETRO_COMMON_DIR)/streams/file_stream_transforms.c \
+				 $(LIBRETRO_COMMON_DIR)/file/file_path.c \
+				 $(LIBRETRO_COMMON_DIR)/file/retro_dirent.c \
+				 $(LIBRETRO_COMMON_DIR)/lists/dir_list.c \
+				 $(LIBRETRO_COMMON_DIR)/lists/string_list.c \
+				 $(LIBRETRO_COMMON_DIR)/vfs/vfs_implementation.c \
+				 $(LIBRETRO_COMMON_DIR)/compat/compat_strl.c \
+				 $(LIBRETRO_COMMON_DIR)/compat/compat_strcasestr.c \
+				 $(LIBRETRO_COMMON_DIR)/compat/compat_posix_string.c \
+				 $(LIBRETRO_COMMON_DIR)/compat/fopen_utf8.c \
+				 $(LIBRETRO_COMMON_DIR)/encodings/encoding_utf.c \
+				 $(LIBRETRO_COMMON_DIR)/memmap/memalign.c \
+				 $(LIBRETRO_COMMON_DIR)/string/stdstring.c \
+				 $(LIBRETRO_COMMON_DIR)/time/rtime.c
 
 ifeq ($(NEED_THREADING), 1)
-SOURCES_C += $(LIBRETRO_DIR)/rthreads/rthreads.c \
-				 $(LIBRETRO_DIR)/rthreads/rsemaphore.c
+SOURCES_C += $(LIBRETRO_COMMON_DIR)/rthreads/rthreads.c \
+				 $(LIBRETRO_COMMON_DIR)/rthreads/rsemaphore.c
 endif
 
 endif

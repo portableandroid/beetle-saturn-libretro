@@ -145,23 +145,10 @@ void MDFNMP_InstallReadPatches(void)
  if(!CheatsActive) return;
 
  std::vector<SUBCHEAT>::iterator chit;
-
-#if 0
- for(unsigned int x = 0; x < 8; x++)
-  for(chit = SubCheats[x].begin(); chit != SubCheats[x].end(); chit++)
-  {
-   if(MDFNGameInfo->InstallReadPatch)
-    MDFNGameInfo->InstallReadPatch(chit->addr);
-  }
-#endif
 }
 
 void MDFNMP_RemoveReadPatches(void)
 {
-#if 0
- if(MDFNGameInfo->RemoveReadPatches)
-  MDFNGameInfo->RemoveReadPatches();
-#endif
 }
 
 /* This function doesn't allocate any memory for "name" */
@@ -279,19 +266,10 @@ static bool TestConditions(const char *string)
  unsigned int bytelen;
  bool passed = 1;
 
- //printf("TR: %s\n", string);
  while(sscanf(string, "%u %c %63s %63s %63s", &bytelen, &endian, address, operation, value) == 5 && passed)
  {
   uint64 v_value;
   uint64 value_at_address;
-#if 0
-  uint32 v_address;
-
-  if(address[0] == '0' && address[1] == 'x')
-   v_address = strtoul(address + 2, NULL, 16);
-  else
-   v_address = strtoul(address, NULL, 10);
-#endif
 
   if(value[0] == '0' && value[1] == 'x')
    v_value = strtoull(value + 2, NULL, 16);
@@ -300,20 +278,6 @@ static bool TestConditions(const char *string)
 
   value_at_address = 0;
 
-#if 0
-  for(unsigned int x = 0; x < bytelen; x++)
-  {
-   unsigned int shiftie;
-
-   if(endian == 'B')
-    shiftie = (bytelen - 1 - x) * 8;
-   else
-    shiftie = x * 8;
-   value_at_address |= MDFNGameInfo->MemRead(v_address + x) << shiftie;
-  }
-#endif
-
-  //printf("A: %08x, V: %08llx, VA: %08llx, OP: %s\n", v_address, v_value, value_at_address, operation);
   if(!strcmp(operation, ">="))
   {
    if(!(value_at_address >= v_value))
@@ -374,14 +338,11 @@ static bool TestConditions(const char *string)
    if(value_at_address | v_value)
     passed = 0;
   }
-  else
-   puts("Invalid operation");
   string = strchr(string, ',');
   if(string == NULL)
    break;
   else
    string++;
-  //printf("Foo: %s\n", string);
  }
 
  return(passed);
