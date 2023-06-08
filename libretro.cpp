@@ -29,6 +29,9 @@
 #include "input.h"
 #include "disc.h"
 
+#ifdef PORTANDROID
+#include "emu_retro.h"
+#endif
 
 #define MEDNAFEN_CORE_NAME                   "Beetle Saturn"
 #define MEDNAFEN_CORE_VERSION                "v1.29.0"
@@ -722,7 +725,11 @@ void retro_run(void)
    spec.surface = surf;
    spec.LineWidths = rects;
    spec.SoundBufSize = 0;
-
+#ifdef PORTANDROID
+   if(cb_settings.frame_skip_direct) {
+      spec.skip = cb_context.video_skip;
+   }
+#endif
    EmulateSpecStruct *espec = (EmulateSpecStruct*)&spec;
 
    Emulate(espec);
