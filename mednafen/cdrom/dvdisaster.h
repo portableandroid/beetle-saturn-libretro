@@ -46,6 +46,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <boolean.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /***
  *** dvdisaster.c
  ***/
@@ -63,7 +69,7 @@ uint32_t EDCCrc32(const unsigned char*, int);
  ***
  * This is currently the hardcoded GF(2**8).
  * int32_t gives abundant space for the GF.
- * Squeezing it down to uint8 won't probably gain much,
+ * Squeezing it down to uint8_t won't probably gain much,
  * so we implement this defensively here.
  *
  * Note that some performance critical stuff needs to
@@ -98,10 +104,8 @@ typedef struct _ReedSolomonTables
 } ReedSolomonTables;
 
 GaloisTables* CreateGaloisTables(int32_t);
-void FreeGaloisTables(GaloisTables*);
 
 ReedSolomonTables *CreateReedSolomonTables(GaloisTables*, int32_t, int32_t, int);
-void FreeReedSolomonTables(ReedSolomonTables*);
 
 /*** 
  *** l-ec.c
@@ -118,15 +122,10 @@ void FreeReedSolomonTables(ReedSolomonTables*);
 
 void GetPVector(unsigned char*, unsigned char*, int);
 void SetPVector(unsigned char*, unsigned char*, int);
-void FillPVector(unsigned char*, unsigned char, int);
-void AndPVector(unsigned char*, unsigned char, int);
-void OrPVector(unsigned char*, unsigned char, int);
 
 void GetQVector(unsigned char*, unsigned char*, int);
 void SetQVector(unsigned char*, unsigned char*, int);
 void FillQVector(unsigned char*, unsigned char, int);
-void AndQVector(unsigned char*, unsigned char, int);
-void OrQVector(unsigned char*, unsigned char, int);
 
 int DecodePQ(ReedSolomonTables*, unsigned char*, int, int*, int);
 
@@ -138,12 +137,13 @@ int DecodePQ(ReedSolomonTables*, unsigned char*, int, int*, int);
 #define CD_RAW_C2_SECTOR_SIZE (2352+294)  /* main channel plus C2 vector */
 
 int CheckEDC(const unsigned char*, bool);
-int CheckMSF(unsigned char*, int);
 
 
 int ValidateRawSector(unsigned char *frame, bool xaMode);
 bool Init_LEC_Correct(void);
-void Kill_LEC_Correct(void);
 
+#ifdef __cplusplus
+}
+#endif
 
 #endif				/* DVDISASTER_H */

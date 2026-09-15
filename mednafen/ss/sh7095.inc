@@ -15,13 +15,13 @@
 ** GNU General Public License for more details.
 **
 ** You should have received a copy of the GNU General Public License
-** along with this program; if not, write to the Free Software Foundation, Inc.,
+** along with z program; if not, write to the Free Software Foundation, Inc.,
 ** 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
 /*
  Emulation implementation notes/deficiencies:
-	Cache multiple-way tag collisions (ostensibly an illegal condition) during reads/writes are not handled accurately.
+	z->Cache multiple-way tag collisions (ostensibly an illegal condition) during reads/writes are not handled accurately.
 
 	Overall timing is extremely approximate.
 
@@ -33,20 +33,20 @@
 	Misaligned memory accesses(that cause address errors) aren't emulated correctly(for
 	future reference, there's a difference between how cache versus external bus is accessed
 	for misaligned addresses, and perhaps a difference between 32-bit and 16-bit spaces as
-	defined by the BSC too; and then there's misaligned OPM register access semantics...).
+	defined by the z->BSC too; and then there's misaligned OPM register access semantics...).
 
 	Address errors occur one instruction too soon.
 
-	SLEEP instruction, standby mode, and DMA burst stalls are handled by thoroughly (ab)using the 
+	SLEEP instruction, standby mode, and DMA burst stalls are handled by thoroughly (ab)using the
 	IF/ID pipeline emulation and opcode dispatch mechanism.
 
-	Individual module clocking disabling functionality of SBYCR isn't handled.
+	Individual module clocking disabling functionality of z->SBYCR isn't handled.
 
 	Interrupts are typically delayed by one instruction, but when the interrupt is handled,
 	the current interrupt state is used instead of the previous interrupt state.
 	This can result in the exception-handling pseudo-op code being called when there's
 	no "current" exception to process, which is a quasi-error condition; there's code to log
-	this condition and recover from it.  An SH-2 code sequence that can cause this condition
+	z condition and recover from it.  An SH-2 code sequence that can cause z condition
 	if there's currently a pending/unacked interrupt:
 		<interrupt-enabling instruction>
 		<interrupt-acknowledging instruction>
@@ -56,82 +56,176 @@
 	Emulation of SH-2 master/slave bus sharing is very approximate.  On a real SH-2, internal bus cycles may affect
 	bus grant timing, need to run tests(though emulating that behavior would probably be unrealistic performance-wise).
 
-	The SCU C-bus DMA ExtHalt kludge doesn't work totally as intended when full cache emulation is enabled(and the
+	The SCU C-bus DMA z->ExtHalt kludge doesn't work totally as intended when full cache emulation is enabled(and the
 	interruptible/resumable slave CPU code is used), but it proooobably won't be a problem in practice because on
 	a real Saturn, after the write that triggers the SCU DMA, a few CPU bus accesses can get in before the SCU hogs the bus.
 
-	SCI, UBC, and BSC are mostly unemulated.
+	z->SCI, UBC, and z->BSC are mostly unemulated.
 */
 
 /* TODO:
 	Check address error exception order, sleep versus exceptions.
 
-	Make sure RecalcPendingIntPEX() is called in all places it needs to be called(which is arguably too many...).
+	Make sure SH7095_RecalcPendingIntPEX(z) is called in all places it needs to be called(which is arguably too many...).
 */
 
 #ifdef MSB_FIRST
  #define NE32ASU8_IDX_ADJ(T, idx) (idx)
+ #define SH7095_RBO_BE_U8(base, A) (((const uint8_t*)(base))[(A)])
 #else
  #define NE32ASU8_IDX_ADJ(T, idx) ( ((idx) & ~(sizeof(T) - 1)) ^ (4 - (sizeof(T))) )
+ #define SH7095_RBO_BE_U8(base, A) (((const uint8_t*)(base))[(A) ^ 1])
 #endif
 
-SH7095::SH7095(const char* const name_arg, const unsigned event_id_dma_arg, uint8 (*exivecfn_arg)(void)) : event_id_dma(event_id_dma_arg), ExIVecFetch(exivecfn_arg), CBH_Setting(false), EIC_Setting(false), DM_Setting(false), cpu_name(name_arg)
+/* Single-load BE u32 read from uint16_t-array storage.  Across the bus
+ * the SH7095 wants MSW-at-lower-address (BE word convention), but each
+ * uint16_t in the fast-map slot is stored in native byte order.  On LE
+ * host a 32-bit native load yields [low(LSW), high(LSW), high(MSW),
+ * low(MSW)] packed as a uint32_t = LSW<<16 | MSW; rotate-by-16 swaps
+ * the halves to give the desired MSW<<16 | LSW.  On BE host the native
+ * 32-bit load is already MSW<<16 | LSW.  memcpy is the portable
+ * single-load idiom: strict-aliasing safe (memcpy is exempt) and
+ * alignment-safe (the compiler emits a single 32-bit load on host
+ * arches that permit unaligned access -- x86, ARMv7+, modern MIPS --
+ * and falls back to byte-by-byte without a fault elsewhere).  The
+ * SH7095's 16-bit bus guarantees the incoming A is 2-byte aligned for
+ * word/longword accesses (address-error exception elsewhere covers
+ * misuse); the `A & ~1u` masks off the within-word bit for safety. */
+/* forward declarations for free functions defined
+ * later in this file. */
+static void SH7095_RecalcMRWFP_0(SH7095* z);
+static void SH7095_RecalcMRWFP_1_7(SH7095* z);
+static void SH7095_DMA_RecalcRunning(SH7095* z);
+static void SH7095_FRT_WDT_Recalc_NET(SH7095* z);
+static void SH7095_FRT_WDT_Update(SH7095* z);
+static void SH7095_INTC_Reset(SH7095* z);
+static void SH7095_RecalcPendingIntPEX(SH7095* z);
+static void SH7095_SCI_Reset(SH7095* z);
+static void SH7095_WDT_Reset(SH7095* z, bool from_internal_wdt);
+static void SH7095_WDT_StandbyReset(SH7095* z);
+static void SH7095_FRT_Reset(SH7095* z);
+static void SH7095_FRT_CheckOCR(SH7095* z);
+static void SH7095_FRT_ClockFRC(SH7095* z);
+static void SH7095_Cache_AssocPurge(SH7095* z, const uint32_t A);
+static int  SH7095_Cache_FindWay(const uint32_t* const tags, const uint32_t ATM);
+static uint8_t  SH7095_BSC_BusRead_u8 (SH7095* z, uint32_t A, const bool BurstHax, int32_t* SH2DMAHax);
+static uint16_t SH7095_BSC_BusRead_u16(SH7095* z, uint32_t A, const bool BurstHax, int32_t* SH2DMAHax);
+static uint32_t SH7095_BSC_BusRead_u32(SH7095* z, uint32_t A, const bool BurstHax, int32_t* SH2DMAHax);
+static void SH7095_BSC_BusWrite_u8 (SH7095* z, uint32_t A, uint8_t V, const bool BurstHax, int32_t* SH2DMAHax);
+static void SH7095_BSC_BusWrite_u16(SH7095* z, uint32_t A, uint16_t V, const bool BurstHax, int32_t* SH2DMAHax);
+static void SH7095_BSC_BusWrite_u32(SH7095* z, uint32_t A, uint32_t V, const bool BurstHax, int32_t* SH2DMAHax);
+static void SH7095_OnChipRegWrite_u8(SH7095* z, uint32_t A, uint32_t V);
+static void SH7095_OnChipRegWrite_u16(SH7095* z, uint32_t A, uint32_t V);
+static void SH7095_OnChipRegWrite_u32(SH7095* z, uint32_t A, uint32_t V);
+static uint8_t  SH7095_Cache_ReadDataArray_u8 (SH7095* z, uint32_t A);
+static uint16_t SH7095_Cache_ReadDataArray_u16(SH7095* z, uint32_t A);
+static uint32_t SH7095_Cache_ReadDataArray_u32(SH7095* z, uint32_t A);
+static uint32_t SH7095_Cache_ReadAddressArray (SH7095* z, uint32_t A);
+static void SH7095_DIVU_S32_S32(SH7095* z);
+static void SH7095_DIVU_S64_S32(SH7095* z);
+static void SH7095_DMA_DoTransfer(SH7095* z, unsigned ch);
+static void SH7095_DMA_StartSG(SH7095* z);
+static bool SH7095_DMA_InBurst(SH7095* z);
+static bool SH7095_DMA_RunCond(SH7095* z, unsigned ch);
+static void SH7095_DMA_CheckEnterBurstHack(SH7095* z);
+static void SH7095_SetCCR(SH7095* z, uint8_t V);
+// SH7095_SetIRL is declared extern in sh7095.h since scu.inc calls it.
+static void SH7095_SetFTCI(SH7095* z, bool state);
+static void SH7095_StateAction_SlaveResume(SH7095* z, StateMem* sm, const unsigned load, const bool data_only, const char* sname);
+static void SH7095_DoIDIF_INLINE_C0_I0(SH7095* z);
+static void SH7095_DoIDIF_INLINE_C0_I1(SH7095* z);
+static void SH7095_DoIDIF_INLINE_C1_I0(SH7095* z);
+static void SH7095_DoIDIF_INLINE_C1_I1(SH7095* z);
+MDFN_HIDE void SH7095_DoIDIF_NI_C0_I0(SH7095* z);   /* exported: sh7095_jit handlers call it */
+static void SH7095_DoIDIF_NI_C0_I1(SH7095* z);
+static void SH7095_DoIDIF_NI_C1_I0(SH7095* z);
+static void SH7095_DoIDIF_NI_C1_I1(SH7095* z);
+static void SH7095_ExtBusWrite_INLINE_SP0_u8(SH7095* z, uint32_t A, uint8_t V);
+static void SH7095_ExtBusWrite_INLINE_SP0_u16(SH7095* z, uint32_t A, uint16_t V);
+static void SH7095_ExtBusWrite_INLINE_SP0_u32(SH7095* z, uint32_t A, uint32_t V);
+static void SH7095_ExtBusWrite_INLINE_SP1_u8(SH7095* z, uint32_t A, uint8_t V);
+static void SH7095_ExtBusWrite_INLINE_SP1_u16(SH7095* z, uint32_t A, uint16_t V);
+static void SH7095_ExtBusWrite_INLINE_SP1_u32(SH7095* z, uint32_t A, uint32_t V);
+static void SH7095_Cache_WriteUpdate_u16(SH7095* z, uint32_t A, uint16_t V);
+static void SH7095_Cache_WriteUpdate_u32(SH7095* z, uint32_t A, uint32_t V);
+static void SH7095_Cache_WriteDataArray_u8(SH7095* z, uint32_t A, uint8_t V);
+static void SH7095_Cache_WriteDataArray_u16(SH7095* z, uint32_t A, uint16_t V);
+static void SH7095_Cache_WriteDataArray_u32(SH7095* z, uint32_t A, uint32_t V);
+static void SH7095_Cache_WriteAddressArray(SH7095* z, uint32_t A, uint32_t V);
+
+static INLINE uint32_t SH7095_RBO_BE_U32(const void* p)
 {
- if(this == &CPU[1])
- {
-  for(unsigned dm = 0; dm < 2; dm++)
-  {
-   //
-   // Very fragile, be careful.
-   //
-   ResumePoint = nullptr;
-   ResumeTableP[dm] = nullptr;
-   timestamp = -1;
-   FRT_WDT_NextTS = 0x7FFFFFFF;
-   Pipe_ID = 0xFEU << 24;
-   //
-   if(dm)
-    RunSlaveUntil_Debug(0);
-   else
-    RunSlaveUntil(0);
-   //
-   assert(ResumePoint == nullptr);
-   assert(ResumeTableP[dm] != nullptr);
-   assert(timestamp == -1);
-   assert(FRT_WDT_NextTS == 0x7FFFFFFF);
-   assert(Pipe_ID == (0xFEU << 24));
-  }
- }
- //
- //
- Init(false, false);
+ uint32_t v;
+ memcpy(&v, p, 4);
+#ifdef MSB_FIRST
+ return v;
+#else
+ return (v << 16) | (v >> 16);
+#endif
 }
 
-template<unsigned which, int NeedSlaveCall, bool CacheBypassHack, typename T, unsigned region, bool CacheEnabled, int32 IsInstr>
-static NO_INLINE MDFN_FASTCALL T C_MemReadRT(uint32 A) MDFN_HOT;
+/* Compile-time guard: SH7095_RBO_BE_T below dispatches on sizeof(T)
+ * with the uint32_t case as the ternary tail.  Without z guard a
+ * stray SH7095_RBO_BE_T(uint64_t, ...) would silently fall into the
+ * uint32_t arm and zero-extend.  The `char[1 - 2*!cond]` trick is
+ * portable C90 (no _Static_assert, no __builtin_*) -- a non-positive
+ * array dimension is a hard compile error.  Sized-as-void via cast,
+ * fits inside the comma expression below. */
+#define SH7095_CT_CHECK_T(T) ((void)sizeof(char[1 - 2*!(   \
+        sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4)]))
 
-template<unsigned which, int NeedSlaveCall, typename T, unsigned region, bool CacheEnabled>
-static NO_INLINE MDFN_FASTCALL void C_MemWriteRT(uint32 A, T V) MDFN_HOT;
+/* SH7095_RBO_BE_T: BE-bus read of type T (uint8_t/16/32) over a
+ * uint16_t-array fast-map slot.  Replaces the old ne16_rbo_be<T>
+ * template call inside the MemRead macro and the z->IBuffer prefetch.
+ * sizeof(T) is a compile-time constant per call site, so all but the
+ * matching ternary branch fold out at every -O level (verified: zero
+ * cmp/test/je/jmp instructions in the emitted code at -O0/-O1/-O2/-Os).
+ * The u32 path uses SH7095_RBO_BE_U32's single 32-bit load + word
+ * rotate -- ~4 fewer host insns per fetch than the prior two-uint16_t
+ * loads + shift-or combine.  Hot on the z->IBuffer prefetch path (every
+ * SH-2 sequential instruction fetch boundary).  CSE handles the
+ * multi-mention of (base) and (A) at the current callsites (verified
+ * against `SH7095_FastMap[A >> N], A` -- single FastMap load in the
+ * emitted asm). */
+#define SH7095_RBO_BE_T(T, base, A) \
+   ( SH7095_CT_CHECK_T(T), \
+     (sizeof(T) == 1) ? (T)SH7095_RBO_BE_U8((base), (A)) : \
+     (sizeof(T) == 2) ? (T)((const uint16_t*)(base))[(A) >> 1] : \
+     (T)SH7095_RBO_BE_U32((const uint8_t*)(base) + ((A) & ~1u)) )
 
-// WARNING: Template arguments CacheEnabled and CacheBypassHack are only valid for region==0.
-void SH7095::RecalcMRWFP_0(void)
+void SH7095_Construct(SH7095* z, const char* const name_arg, const unsigned event_id_dma_arg, uint8_t (*exivecfn_arg)(void))
 {
- #define MAHL_(bs,w,nsc,cbh)									\
-		 if(CCR & CCR_CE)								\
-		 {										\
-		  if(bs == 16) { MRFP16_I[0] = C_MemReadRT<w, nsc, cbh, uint16, 0x0, true, -1>; }	\
-		  if(bs == 32) { MRFP32_I[0] = C_MemReadRT<w, nsc, cbh, uint32, 0x0, true, -1>; }	\
-		  MRFP##bs[0] = C_MemReadRT <w, nsc, cbh, uint##bs, 0x0, true, false>;		\
-		  MRFPI[0]    = C_MemReadRT <w, nsc, cbh, uint32,   0x0, true, true>;		\
-		  MWFP##bs[0] = C_MemWriteRT<w, nsc, uint##bs, 0x0, true>;			\
-		 }										\
-		 else										\
-		 {										\
-		  if(bs == 16) { MRFP16_I[0] = C_MemReadRT<w, nsc, cbh, uint16, 0x0, false, false>; }\
-		  if(bs == 32) { MRFP32_I[0] = C_MemReadRT<w, nsc, cbh, uint32, 0x0, false, false>; }\
-		  MRFP##bs[0] =  C_MemReadRT <w, nsc, cbh, uint##bs, 0x0, false, false>;		\
-		  MRFPI[0]    =  C_MemReadRT <w, nsc, cbh, uint32,   0x0, false, true>;		\
-		  MWFP##bs[0] =  C_MemWriteRT<w, nsc, uint##bs, 0x0, false>;			\
+ z->event_id_dma  = event_id_dma_arg;
+ z->ExIVecFetch   = exivecfn_arg;
+ z->cpu_name      = name_arg;
+ z->CBH_Setting   = false;
+ z->EIC_Setting   = false;
+
+ if(z == &CPU[1])
+ {
+    z->resume_id = 0;
+ }
+
+ SH7095_Init(z, false, false);
+}
+
+#include "sh7095_mem_dispatch_proto.inc"
+// WARNING: Template arguments CacheEnabled and CacheBypassHack are only valid for region==0.
+static void SH7095_RecalcMRWFP_0(SH7095* z)
+{
+ #define MAHL_(bs,w,nsc,cbh) \
+		 if(z->CCR & SH7095_CCR_CE) { \
+		  if(bs == 16) { z->MRFP16_I[0] = C_MemReadRT_w##w##_n##nsc##_c##cbh##_u16_r0_e1_im1; } \
+		  if(bs == 32) { z->MRFP32_I[0] = C_MemReadRT_w##w##_n##nsc##_c##cbh##_u32_r0_e1_im1; } \
+		  z->MRFP##bs[0] = C_MemReadRT_w##w##_n##nsc##_c##cbh##_u##bs##_r0_e1_i0; \
+		  z->MRFPI[0]    = C_MemReadRT_w##w##_n##nsc##_c##cbh##_u32_r0_e1_i1; \
+		  z->MWFP##bs[0] = C_MemWriteRT_w##w##_n##nsc##_u##bs##_r0_e1; \
+		 } else { \
+		  if(bs == 16) { z->MRFP16_I[0] = C_MemReadRT_w##w##_n##nsc##_c##cbh##_u16_r0_e0_i0; } \
+		  if(bs == 32) { z->MRFP32_I[0] = C_MemReadRT_w##w##_n##nsc##_c##cbh##_u32_r0_e0_i0; } \
+		  z->MRFP##bs[0] = C_MemReadRT_w##w##_n##nsc##_c##cbh##_u##bs##_r0_e0_i0; \
+		  z->MRFPI[0]    = C_MemReadRT_w##w##_n##nsc##_c##cbh##_u32_r0_e0_i1; \
+		  z->MWFP##bs[0] = C_MemWriteRT_w##w##_n##nsc##_u##bs##_r0_e0; \
 		 }
 
  #define MAHL(w, nsc, cbh)		\
@@ -141,97 +235,87 @@ void SH7095::RecalcMRWFP_0(void)
 	 MAHL_(32, w, nsc, cbh) 	\
 	}
 
- if(this == &CPU[0])
+ if(z == &CPU[0])
  {
-  if(EIC_Setting)
+  if(z->EIC_Setting)
   {
-   if(DM_Setting)
-    MAHL(0,   -1, false)
-   else
-    MAHL(0, true, false)
+   MAHL(0, t, f)
   }
-  else if(CBH_Setting)
+  else if(z->CBH_Setting)
   {
-   MAHL(0, false, true)
+   MAHL(0, f, t)
   }
   else
   {
-   MAHL(0, false, false)
+   MAHL(0, f, f)
   }
  }
  else
  {
-  if(!EIC_Setting && CBH_Setting)
+  if(!z->EIC_Setting && z->CBH_Setting)
   {
-   MAHL(1, false, true)
+   MAHL(1, f, t)
   }
   else
   {
-   MAHL(1, false, false)
+   MAHL(1, f, f)
   }
  }
  #undef MAHL_
  #undef MAHL
 }
 
-void SH7095::RecalcMRWFP_1_7(void)
+static void SH7095_RecalcMRWFP_1_7(SH7095* z)
 {
- #define MAHL_P(w, nsc, region) {								\
-		  MRFP8[region]  = C_MemReadRT<w, nsc, false, uint8,  region, false, false>;	\
-		  MRFP16[region] = C_MemReadRT<w, nsc, false, uint16, region, false, false>;	\
-		  MRFP32[region] = C_MemReadRT<w, nsc, false, uint32, region, false, false>;	\
-		  MRFP16_I[region] = C_MemReadRT<w, nsc, false, uint16, region, false, false>;	\
-		  MRFP32_I[region] = C_MemReadRT<w, nsc, false, uint32, region, false, false>;	\
-		  MRFPI[region]  = C_MemReadRT<w, nsc, false, uint32, region, false, true>;	\
-		  MWFP8[region]  = C_MemWriteRT<w, nsc, uint8,  region, false>;	\
-		  MWFP16[region] = C_MemWriteRT<w, nsc, uint16, region, false>;	\
-		  MWFP32[region] = C_MemWriteRT<w, nsc, uint32, region, false>;	\
+ #define MAHL_P(w, nsc, region) { \
+		  z->MRFP8[region]    = C_MemReadRT_w##w##_n##nsc##_cf_u8_r##region##_e0_i0; \
+		  z->MRFP16[region]   = C_MemReadRT_w##w##_n##nsc##_cf_u16_r##region##_e0_i0; \
+		  z->MRFP32[region]   = C_MemReadRT_w##w##_n##nsc##_cf_u32_r##region##_e0_i0; \
+		  z->MRFP16_I[region] = C_MemReadRT_w##w##_n##nsc##_cf_u16_r##region##_e0_i0; \
+		  z->MRFP32_I[region] = C_MemReadRT_w##w##_n##nsc##_cf_u32_r##region##_e0_i0; \
+		  z->MRFPI[region]    = C_MemReadRT_w##w##_n##nsc##_cf_u32_r##region##_e0_i1; \
+		  z->MWFP8[region]    = C_MemWriteRT_w##w##_n##nsc##_u8_r##region##_e0; \
+		  z->MWFP16[region]   = C_MemWriteRT_w##w##_n##nsc##_u16_r##region##_e0; \
+		  z->MWFP32[region]   = C_MemWriteRT_w##w##_n##nsc##_u32_r##region##_e0; \
 		  }
 
  #define MAHL(nsc, region)					\
-		  if(this == &CPU[0])				\
+		  if(z == &CPU[0])				\
 		  { MAHL_P(0, nsc, region) }			\
 		  else						\
-		  { MAHL_P(1, false, region) }
+		  { MAHL_P(1, f, region) }
 
- if(EIC_Setting)
+ if(z->EIC_Setting)
  {
-  if(DM_Setting)
-  {
-   MAHL(-1,  1)
-  }
-  else
-  {
-   MAHL(true,  1)
-  }
-  MAHL(false, 2)
-  MAHL(false, 3)
-  MAHL(false, 4)
-  MAHL(false, 5)
-  MAHL(false, 6)
-  MAHL(false, 7)
+  MAHL(t, 1)
+  MAHL(f, 2)
+  MAHL(f, 3)
+  MAHL(f, 4)
+  MAHL(f, 5)
+  MAHL(f, 6)
+  MAHL(f, 7)
  }
  else
  {
-  MAHL(false, 1)
-  MAHL(false, 2)
-  MAHL(false, 3)
-  MAHL(false, 4)
-  MAHL(false, 5)
-  MAHL(false, 6)
-  MAHL(false, 7)
+  MAHL(f, 1)
+  MAHL(f, 2)
+  MAHL(f, 3)
+  MAHL(f, 4)
+  MAHL(f, 5)
+  MAHL(f, 6)
+  MAHL(f, 7)
  }
 
  #undef MAHL
  #undef MAHL_P
 }
 
-void SH7095::Init(const bool EmulateICache, const bool CacheBypassHack)
+void SH7095_Init(SH7095* z, const bool EmulateICache, const bool CacheBypassHack)
 {
- CBH_Setting = CacheBypassHack;
- EIC_Setting = EmulateICache;
- RecalcMRWFP_0();
- RecalcMRWFP_1_7();
+ z->CBH_Setting = CacheBypassHack;
+ z->EIC_Setting = EmulateICache;
+ SH7095_RecalcMRWFP_0(z);
+ SH7095_RecalcMRWFP_1_7(z);
  //
  //
  //
@@ -239,302 +323,296 @@ void SH7095::Init(const bool EmulateICache, const bool CacheBypassHack)
  // Initialize variables that won't be initialized elsewhere since they reflect the overall emulator timing state, or are cache variables
  // for signal inputs.
  //
- timestamp = 0;
+ z->timestamp = 0;
 
- FRT.FTI = false;
- FRT.FTCI = false;
- IRL = 0;
- NMILevel = false;
- BSC.BCR1 &= 0x7FFF; //MD5Level = false;
- ExtHalt = false;
- ExtHaltDMA = false;
+ z->FRT.FTI = false;
+ z->FRT.FTCI = false;
+ z->IRL = 0;
+ z->NMILevel = false;
+ z->BSC.BCR1 &= 0x7FFF; //MD5Level = false;
+ z->ExtHalt = false;
+ z->ExtHaltDMA = false;
 
- ResumePoint = nullptr;
+ z->resume_id = 0;
 
- TruePowerOn();
-}
-
-SH7095::~SH7095()
-{
-
+ SH7095_TruePowerOn(z);
 }
 
 //
 // Initialize everything for determinism, especially state left "undefined" by reset/power exception handling.
 //
-void SH7095::TruePowerOn(void)
+void SH7095_TruePowerOn(SH7095* z)
 {
  for(unsigned i = 0; i < 16; i++)
-  R[i] = 0;
+  z->R[i] = 0;
 
  for(unsigned i = 0; i < 16; i++)
-  WB_until[i] = timestamp;
+  z->WB_until[i] = z->timestamp;
 
- UCRead_IF_Kludge = 0;
+ z->UCRead_IF_Kludge = 0;
 
- MA_until = timestamp;
- MM_until = timestamp;
- write_finish_timestamp = timestamp;
+ z->MA_until = z->timestamp;
+ z->MM_until = z->timestamp;
+ z->write_finish_timestamp = z->timestamp;
 
- PC = 0;
+ z->PC = 0;
 
- SR = 0;
- GBR = 0;
- VBR = 0;
+ z->SR = 0;
+ z->GBR = 0;
+ z->VBR = 0;
 
- MACH = 0;
- MACL = 0;
- PR = 0;
+ z->MACH = 0;
+ z->MACL = 0;
+ z->PR = 0;
 
- EPending = 0;
- Pipe_ID = 0;
- Pipe_IF = 0;
- IBuffer = 0;
+ z->EPending = 0;
+ z->Pipe_ID = 0;
+ z->Pipe_IF = 0;
+ z->IBuffer = 0;
 
- PC_IF = PC_ID = 0;
+ z->PC_IF = z->PC_ID = 0;
 
- memset(Cache, 0, sizeof(Cache));
- memset(Cache_LRU, 0, sizeof(Cache_LRU));
- CCRC_Replace_OR[0] = 0;
- CCRC_Replace_OR[1] = 0;
- CCRC_Replace_AND = 0;
- CCR = 0;
+ memset(z->CacheTags, 0, sizeof(z->CacheTags));
+ memset(z->CacheData, 0, sizeof(z->CacheData));
+ memset(z->Cache_LRU, 0, sizeof(z->Cache_LRU));
+ z->CCRC_Replace_OR[0] = 0;
+ z->CCRC_Replace_OR[1] = 0;
+ z->CCRC_Replace_AND = 0;
+ z->CCR = 0;
  //
  //
  //
- ResumePoint = nullptr;
- Resume_cent = nullptr;
- Resume_instr = 0;
- Resume_way_match = 0;
- Resume_uint8_A = 0;
- Resume_uint16_A = 0;
- Resume_uint32_A = 0;
- Resume_unmasked_A = 0;
- Resume_uint32_V = 0;
- Resume_uint16_V = 0;
- Resume_uint8_V = 0;
+ z->resume_id = 0;
+ z->Resume_set = 0;
+ z->Resume_instr = 0;
+ z->Resume_way_match = 0;
+ z->Resume_uint8_A = 0;
+ z->Resume_uint16_A = 0;
+ z->Resume_uint32_A = 0;
+ z->Resume_unmasked_A = 0;
+ z->Resume_uint32_V = 0;
+ z->Resume_uint16_V = 0;
+ z->Resume_uint8_V = 0;
 
- Resume_MAC_L_m0 = 0;
- Resume_MAC_L_m1 = 0;
+ z->Resume_MAC_L_m0 = 0;
+ z->Resume_MAC_L_m1 = 0;
 
- Resume_MAC_W_m0 = 0;
- Resume_MAC_W_m1 = 0;
+ z->Resume_MAC_W_m0 = 0;
+ z->Resume_MAC_W_m1 = 0;
 
- Resume_ea = 0;
- Resume_new_PC = 0;
- Resume_new_SR = 0;
+ z->Resume_ea = 0;
+ z->Resume_new_PC = 0;
+ z->Resume_new_SR = 0;
 
- Resume_ipr = 0;
- Resume_exnum = 0;
- Resume_vecnum = 0;
+ z->Resume_ipr = 0;
+ z->Resume_exnum = 0;
+ z->Resume_vecnum = 0;
  //
  //
  //
- IPRA = 0;
- IPRB = 0;
- VCRWDT = 0;
- VCRA = 0;
- VCRB = 0;
- VCRC = 0;
- VCRD = 0;
- ICR = 0;
+ z->IPRA = 0;
+ z->IPRB = 0;
+ z->VCRWDT = 0;
+ z->VCRA = 0;
+ z->VCRB = 0;
+ z->VCRC = 0;
+ z->VCRD = 0;
+ z->ICR = 0;
  //
  //
  //
- BSC.BCR1 &= 0x8000;
- BSC.BCR2 = 0;
- BSC.WCR = 0;
- BSC.MCR = 0;
+ z->BSC.BCR1 &= 0x8000;
+ z->BSC.BCR2 = 0;
+ z->BSC.WCR = 0;
+ z->BSC.MCR = 0;
 
- BSC.RTCSR = 0;
- BSC.RTCSRM = 0;
- BSC.RTCNT = 0;
- BSC.RTCOR = 0;
+ z->BSC.RTCSR = 0;
+ z->BSC.RTCSRM = 0;
+ z->BSC.RTCNT = 0;
+ z->BSC.RTCOR = 0;
 
- BSC.sdram_finish_time = timestamp;
- BSC.last_mem_time = timestamp;
- BSC.last_mem_addr = 0;
- BSC.last_mem_type = 0;
+ z->BSC.sdram_finish_time = z->timestamp;
+ z->BSC.last_mem_time = z->timestamp;
+ z->BSC.last_mem_addr = 0;
+ z->BSC.last_mem_type = 0;
  //
  //
  //
- ResumePoint = nullptr;
+ z->resume_id = 0;
  //
  //
  //
- SBYCR = 0;
- Standby = false;
+ z->SBYCR = 0;
+ z->Standby = false;
  //
  //
  //
- FRT.lastts = timestamp;
+ z->FRT.lastts = z->timestamp;
 
- // Don't change FRT.FTI and FRT.FTCI here.
+ // Don't change z->FRT.FTI and z->FRT.FTCI here.
 
- FRT.FRC = 0;
- FRT.OCR[0] = FRT.OCR[1] = 0;
- FRT.FICR = 0;
- FRT.TIER = 0;
- FRT.FTCSR = 0;
- FRT.FTCSRM = 0;
- FRT.TCR = 0;
- FRT.TOCR = 0;
- FRT.RW_Temp = 0;
+ z->FRT.FRC = 0;
+ z->FRT.OCR[0] = z->FRT.OCR[1] = 0;
+ z->FRT.FICR = 0;
+ z->FRT.TIER = 0;
+ z->FRT.FTCSR = 0;
+ z->FRT.FTCSRM = 0;
+ z->FRT.TCR = 0;
+ z->FRT.TOCR = 0;
+ z->FRT.RW_Temp = 0;
 
- FRT_WDT_ClockDivider = 0;
+ z->FRT_WDT_ClockDivider = 0;
 
- WDT.WTCSR = 0;
- WDT.WTCSRM = 0;
- WDT.WTCNT = 0;
- WDT.RSTCSR = 0;
- WDT.RSTCSRM = 0;
+ z->WDT.WTCSR = 0;
+ z->WDT.WTCSRM = 0;
+ z->WDT.WTCNT = 0;
+ z->WDT.RSTCSR = 0;
+ z->WDT.RSTCSRM = 0;
 
- FRT_WDT_Recalc_NET();
+ SH7095_FRT_WDT_Recalc_NET(z);
  //
  //
  //
- DMA_Timestamp = timestamp;
- DMA_SGEndTimestamp = timestamp;
- DMA_RoundRobinRockinBoppin = 0;
- DMA_PenaltyKludgeAmount = 0;
- DMA_PenaltyKludgeAccum = 0;
- memset(DMACH, 0, sizeof(DMACH));
- DMAOR = 0;
- DMAORM = 0;
- DMA_RecalcRunning();
+ z->DMA_Timestamp = z->timestamp;
+ z->DMA_SGEndTimestamp = z->timestamp;
+ z->DMA_RoundRobinRockinBoppin = 0;
+ z->DMA_PenaltyKludgeAmount = 0;
+ z->DMA_PenaltyKludgeAccum = 0;
+ memset(z->DMACH, 0, sizeof(z->DMACH));
+ z->DMAOR = 0;
+ z->DMAORM = 0;
+ SH7095_DMA_RecalcRunning(z);
  //
  //
  //
- divide_finish_timestamp = timestamp;
- DVSR = 0;
- DVDNT = 0;
- DVDNTH = 0;
- DVDNTL = 0;
- DVDNTH_Shadow = 0;
- DVDNTL_Shadow = 0;
- VCRDIV = 0;
- DVCR = 0;
+ z->divide_finish_timestamp = z->timestamp;
+ z->DVSR = 0;
+ z->DVDNT = 0;
+ z->DVDNTH = 0;
+ z->DVDNTL = 0;
+ z->DVDNTH_Shadow = 0;
+ z->DVDNTL_Shadow = 0;
+ z->VCRDIV = 0;
+ z->DVCR = 0;
  //
  //
  //
- SCI.SMR = 0;
- SCI.BRR = 0;
- SCI.SCR = 0;
- SCI.TDR = 0;
- SCI.SSR = 0;
- SCI.SSRM = 0;
- SCI.RDR = 0;
- SCI.RSR = 0;
- SCI.TSR = 0;
+ z->SCI.SMR = 0;
+ z->SCI.BRR = 0;
+ z->SCI.SCR = 0;
+ z->SCI.TDR = 0;
+ z->SCI.SSR = 0;
+ z->SCI.SSRM = 0;
+ z->SCI.RDR = 0;
+ z->SCI.RSR = 0;
+ z->SCI.TSR = 0;
 }
 
-void SH7095::SetActive(bool active)
+void SH7095_SetActive(SH7095* z, bool active)
 {
- if(active && timestamp == SS_EVENT_DISABLED_TS)
+ if(active && z->timestamp == SS_EVENT_DISABLED_TS)
  {
-  timestamp = SH7095_mem_timestamp;
-  FRT.lastts = timestamp;
+  z->timestamp = SH7095_mem_timestamp;
+  z->FRT.lastts = z->timestamp;
 
-  DMA_Timestamp = SH7095_mem_timestamp;
-  DMA_SGEndTimestamp = SH7095_mem_timestamp;
+  z->DMA_Timestamp = SH7095_mem_timestamp;
+  z->DMA_SGEndTimestamp = SH7095_mem_timestamp;
 
-  SS_SetEventNT(&events[event_id_dma], SH7095_mem_timestamp + 1);
+  SS_SetEventNT(&events[z->event_id_dma], SH7095_mem_timestamp + 1);
   //
-  Reset(true);
+  SH7095_Reset(z, true, false);
  }
- else if(!active && timestamp != SS_EVENT_DISABLED_TS)
+ else if(!active && z->timestamp != SS_EVENT_DISABLED_TS)
  {
-  Reset(true);
+  SH7095_Reset(z, true, false);
   //
-  timestamp = SS_EVENT_DISABLED_TS;
-  SS_SetEventNT(&events[event_id_dma], SS_EVENT_DISABLED_TS);
+  z->timestamp = SS_EVENT_DISABLED_TS;
+  SS_SetEventNT(&events[z->event_id_dma], SS_EVENT_DISABLED_TS);
  }
 }
 
-void SH7095::AdjustTS(int32 delta)
+void SH7095_AdjustTS(SH7095* z, int32_t delta)
 {
- if(MDFN_UNLIKELY(timestamp == SS_EVENT_DISABLED_TS))
+ if(MDFN_UNLIKELY(z->timestamp == SS_EVENT_DISABLED_TS))
   return;
 
- timestamp += delta;
- FRT.lastts += delta;
+ z->timestamp += delta;
+ z->FRT.lastts += delta;
 
-#define ATSD(v) v = std::max<sscpu_timestamp_t>(-1000000, v + (delta))
- ATSD(DMA_Timestamp);
- ATSD(DMA_SGEndTimestamp);
+#define ATSD(v) v = ((sscpu_timestamp_t)(-1000000) > (sscpu_timestamp_t)(v + (delta)) ? (sscpu_timestamp_t)(-1000000) : (sscpu_timestamp_t)(v + (delta)))
+ ATSD(z->DMA_Timestamp);
+ ATSD(z->DMA_SGEndTimestamp);
 
- ATSD(MA_until);
- ATSD(MM_until);
+ ATSD(z->MA_until);
+ ATSD(z->MM_until);
 
  for(unsigned i = 0; i < 16; i++)
-  ATSD(WB_until[i]);
+  ATSD(z->WB_until[i]);
 
- ATSD(write_finish_timestamp);
- ATSD(divide_finish_timestamp);
+ ATSD(z->write_finish_timestamp);
+ ATSD(z->divide_finish_timestamp);
 
- ATSD(BSC.sdram_finish_time);
- ATSD(BSC.last_mem_time);
+ ATSD(z->BSC.sdram_finish_time);
+ ATSD(z->BSC.last_mem_time);
 #undef ATSD
 
- FRT_WDT_ClockDivider &= 0x00FFFFFF;
- FRT_WDT_Recalc_NET();
+ z->FRT_WDT_ClockDivider &= 0x00FFFFFF;
+ SH7095_FRT_WDT_Recalc_NET(z);
 }
-
 
 // de=1, dme=1, te=0, nmif=0, ae=0
-INLINE bool SH7095::DMA_RunCond(unsigned ch)
+static INLINE bool SH7095_DMA_RunCond(SH7095* z, unsigned ch)
 {
- return ((DMAOR & 0x07) == 0x01) && ((DMACH[ch].CHCR & 0x03) == 0x01);
+ return ((z->DMAOR & 0x07) == 0x01) && ((z->DMACH[ch].CHCR & 0x03) == 0x01);
 }
 
-bool SH7095::DMA_InBurst(void)
+static bool SH7095_DMA_InBurst(SH7095* z)
 {
- if((DMAOR & 0x08) && DMA_RunCond(0) && DMA_RunCond(1))
-  return ((DMACH[0].CHCR | DMACH[1].CHCR) & 0x10);
+ if((z->DMAOR & 0x08) && SH7095_DMA_RunCond(z, 0) && SH7095_DMA_RunCond(z, 1))
+  return ((z->DMACH[0].CHCR | z->DMACH[1].CHCR) & 0x10);
 
- if(DMA_RunCond(0))
-  return (DMACH[0].CHCR & 0x10);
- else if(DMA_RunCond(1))
-  return (DMACH[1].CHCR & 0x10);
+ if(SH7095_DMA_RunCond(z, 0))
+  return (z->DMACH[0].CHCR & 0x10);
+ else if(SH7095_DMA_RunCond(z, 1))
+  return (z->DMACH[1].CHCR & 0x10);
 
  return false;
 }
 
-void SH7095::DMA_CheckEnterBurstHack(void)
+static void SH7095_DMA_CheckEnterBurstHack(SH7095* z)
 {
- if(DMA_InBurst())
-  SetPEX(PEX_PSEUDO_DMABURST);
+ if(SH7095_DMA_InBurst(z))
+  SH7095_SetPEX(z, SH7095_PEX_PSEUDO_DMABURST);
 }
 
-
-// RecalcPendingIntPEX() will be called higher up, at the end of DMA_Update()
+// SH7095_RecalcPendingIntPEX(z) will be called higher up, at the end of SH7095_DMA_Update(z)
 //
 // Call SH7095_Bus* directly instead of through ExtBusRead, at least until we can work
-// out all this disparate timestamp nonsense properly(maybe around the time we add proper bus controller emulation? ;)).
+// out all z disparate z->timestamp nonsense properly(maybe around the time we add proper bus controller emulation? ;)).
 //
-INLINE void SH7095::DMA_DoTransfer(unsigned ch)
+static INLINE void SH7095_DMA_DoTransfer(SH7095* z, unsigned ch)
 {
- static const int8 ainc[3][4] = 
+ static const int8_t ainc[3][4] =
  {
   { 0, 1, -1, -1 },
   { 0, 2, -2, -2 },
   { 0, 4, -4, -4 },
  };
- const unsigned ts = (DMACH[ch].CHCR >> 10) & 3;
- const unsigned sm = (DMACH[ch].CHCR >> 12) & 3;
- const unsigned dm = (DMACH[ch].CHCR >> 14) & 3;
- uint32 sar = DMACH[ch].SAR;
- uint32 dar = DMACH[ch].DAR;
- uint32 tcr = DMACH[ch].TCR;
+ const unsigned ts = (z->DMACH[ch].CHCR >> 10) & 3;
+ const unsigned sm = (z->DMACH[ch].CHCR >> 12) & 3;
+ const unsigned dm = (z->DMACH[ch].CHCR >> 14) & 3;
+ uint32_t sar = z->DMACH[ch].SAR;
+ uint32_t dar = z->DMACH[ch].DAR;
+ uint32_t tcr = z->DMACH[ch].TCR;
 
  switch(ts)
  {
   case 0x00:	// 8-bit
 	{
-	 uint8 buffer;
+	 uint8_t buffer;
 
-	 buffer = BSC_BusRead<uint8>(sar & 0x07FFFFFF, false, &DMA_Timestamp);
-	 BSC_BusWrite<uint8>(dar & 0x07FFFFFF, buffer, false, &DMA_Timestamp);
+	 buffer = SH7095_BSC_BusRead_u8(z, sar & 0x07FFFFFF, false, &z->DMA_Timestamp);
+	 SH7095_BSC_BusWrite_u8(z, dar & 0x07FFFFFF, buffer, false, &z->DMA_Timestamp);
 
 	 sar += ainc[0][sm];
  	 dar += ainc[0][dm];
@@ -544,17 +622,17 @@ INLINE void SH7095::DMA_DoTransfer(unsigned ch)
 
   case 0x01:	// 16-bit
 	{
-	 uint16 buffer;
+	 uint16_t buffer;
 
-	 buffer = BSC_BusRead<uint16>(sar & 0x07FFFFFE, false, &DMA_Timestamp);
-	 BSC_BusWrite<uint16>(dar & 0x07FFFFFE, buffer, false, &DMA_Timestamp);
+	 buffer = SH7095_BSC_BusRead_u16(z, sar & 0x07FFFFFE, false, &z->DMA_Timestamp);
+	 SH7095_BSC_BusWrite_u16(z, dar & 0x07FFFFFE, buffer, false, &z->DMA_Timestamp);
 
 	 if(MDFN_UNLIKELY((sar | dar) & 0x1))
 	 {
-	  DMAOR |= 4;
-	  DMAORM |= 4;
-	  DMA_RecalcRunning();
-	  SetPEX(PEX_DMAADDR);
+	  z->DMAOR |= 4;
+	  z->DMAORM |= 4;
+	  SH7095_DMA_RecalcRunning(z);
+	  SH7095_SetPEX(z, SH7095_PEX_DMAADDR);
 	 }
 
 	 sar += ainc[1][sm];
@@ -565,17 +643,17 @@ INLINE void SH7095::DMA_DoTransfer(unsigned ch)
 
   case 0x02:	// 32-bit
 	{
-	 uint32 buffer;
+	 uint32_t buffer;
 
-	 buffer = BSC_BusRead<uint32>(sar & 0x07FFFFFC, false, &DMA_Timestamp);
-	 BSC_BusWrite<uint32>(dar & 0x07FFFFFC, buffer, false, &DMA_Timestamp);
+	 buffer = SH7095_BSC_BusRead_u32(z, sar & 0x07FFFFFC, false, &z->DMA_Timestamp);
+	 SH7095_BSC_BusWrite_u32(z, dar & 0x07FFFFFC, buffer, false, &z->DMA_Timestamp);
 
 	 if(MDFN_UNLIKELY((sar | dar) & 0x3))
 	 {
-	  DMAOR |= 4;
-	  DMAORM |= 4;
-          DMA_RecalcRunning();
-	  SetPEX(PEX_DMAADDR);
+	  z->DMAOR |= 4;
+	  z->DMAORM |= 4;
+          SH7095_DMA_RecalcRunning(z);
+	  SH7095_SetPEX(z, SH7095_PEX_DMAADDR);
 	 }
 
 	 sar += ainc[2][sm];
@@ -586,26 +664,26 @@ INLINE void SH7095::DMA_DoTransfer(unsigned ch)
 
   case 0x03:	// 4 * 32-bit, a mess...
 	{
-	 uint32 buffer[4];
+	 uint32_t buffer[4];
 
 	 if(MDFN_UNLIKELY((sar | dar) & 0x3))
 	 {
-	  DMAOR |= 4;
-	  DMAORM |= 4;
-	  DMA_RecalcRunning();
-	  SetPEX(PEX_DMAADDR);
+	  z->DMAOR |= 4;
+	  z->DMAORM |= 4;
+	  SH7095_DMA_RecalcRunning(z);
+	  SH7095_SetPEX(z, SH7095_PEX_DMAADDR);
 	 }
 
 	 for(unsigned i = 0; i < 4; i++)
 	 {
-	  buffer[i] = BSC_BusRead<uint32>((sar + (i << 2)) & 0x07FFFFFC, (bool)i, &DMA_Timestamp);
+	  buffer[i] = SH7095_BSC_BusRead_u32(z, (sar + (i << 2)) & 0x07FFFFFC, (bool)i, &z->DMA_Timestamp);
 	 }
 
 	 sar += 0x10;
 
 	 for(unsigned i = 0; i < 4; i++)
 	 {
-	  BSC_BusWrite<uint32>(dar & 0x07FFFFFC, buffer[i], false, &DMA_Timestamp);
+	  SH7095_BSC_BusWrite_u32(z, dar & 0x07FFFFFC, buffer[i], false, &z->DMA_Timestamp);
 	  dar += ainc[2][dm];
 	  tcr = (tcr - 1) & 0xFFFFFF;
 	  if(MDFN_UNLIKELY(!tcr))
@@ -617,63 +695,65 @@ INLINE void SH7095::DMA_DoTransfer(unsigned ch)
 
  if(!tcr)
  {
-  DMACH[ch].CHCR |= 2;
-  DMACH[ch].CHCRM |= 2;
-  DMA_RecalcRunning();
+  z->DMACH[ch].CHCR |= 2;
+  z->DMACH[ch].CHCRM |= 2;
+  SH7095_DMA_RecalcRunning(z);
  }
 
- DMACH[ch].SAR = sar;
- DMACH[ch].DAR = dar;
- DMACH[ch].TCR = tcr;
+ z->DMACH[ch].SAR = sar;
+ z->DMACH[ch].DAR = dar;
+ z->DMACH[ch].TCR = tcr;
 }
 
-sscpu_timestamp_t SH7095::DMA_Update(sscpu_timestamp_t et)
+sscpu_timestamp_t SH7095_DMA_Update(SH7095* z, sscpu_timestamp_t et)
 {
 
- if(MDFN_UNLIKELY(et < DMA_Timestamp))
+ if(MDFN_UNLIKELY(et < z->DMA_Timestamp))
  {
   // may happen...look into it.
-  return DMA_Timestamp + 32;
+  return z->DMA_Timestamp + 32;
  }
- else if(MDFN_UNLIKELY(ExtHaltDMA))
+ else if(MDFN_UNLIKELY(z->ExtHaltDMA))
  {
-  DMA_Timestamp = et;
-  return DMA_Timestamp + 128;
+  z->DMA_Timestamp = et;
+  if(SH2_FastDMAEvents)
+   return SS_EVENT_DISABLED_TS;     /* SH7095_DMAEventRearm on the halt transitions */
+  return z->DMA_Timestamp + 128;
  }
  else
  {
-  bool rr = DMA_RoundRobinRockinBoppin;
+  bool rr = z->DMA_RoundRobinRockinBoppin;
 
-  if(DMAOR & 0x08) 	// Round robin
+  if(z->DMAOR & 0x08) 	// Round robin
   {
-   while(DMA_RunCond(0) || DMA_RunCond(1))
+   while(SH7095_DMA_RunCond(z, 0) || SH7095_DMA_RunCond(z, 1))
    {
-    if(DMA_RunCond(rr))
+    if(SH7095_DMA_RunCond(z, rr))
     {
-     if(DMA_Timestamp >= et)
+     if(z->DMA_Timestamp >= et)
       goto TimeOver;
 
-     DMA_DoTransfer(rr);
+     SH7095_DMA_DoTransfer(z, rr);
     }
     rr = !rr;
    }
   }
   else	// ch 0 > ch1
   {
-   while(DMA_RunCond(0))
+   while(SH7095_DMA_RunCond(z, 0))
    {
-    if(DMA_Timestamp >= et)
+    if(z->DMA_Timestamp >= et)
      goto TimeOver;
 
-    DMA_DoTransfer(0);
+    SH7095_DMA_DoTransfer(z, 0);
    }
 
-   while(DMA_RunCond(1))
+   while(SH7095_DMA_RunCond(z, 1))
    {
-    if(DMA_Timestamp >= et)
+    if(z->DMA_Timestamp >= et)
      goto TimeOver;
 
-    DMA_DoTransfer(1);
+    SH7095_DMA_DoTransfer(z, 1);
    }
   }
   //
@@ -681,294 +761,294 @@ sscpu_timestamp_t SH7095::DMA_Update(sscpu_timestamp_t et)
   //
   TimeOver:;
 
-  DMA_RoundRobinRockinBoppin = rr;
-  DMA_Timestamp = std::max<sscpu_timestamp_t>(DMA_Timestamp, et - 128);
+  z->DMA_RoundRobinRockinBoppin = rr;
+  if((et - 128) > z->DMA_Timestamp) z->DMA_Timestamp = (et - 128);
 
-  DMA_CheckEnterBurstHack();
-  RecalcPendingIntPEX();	// TODO: conditionalize(or make RecalcPendingIntPEX() less expensive).
+  SH7095_DMA_CheckEnterBurstHack(z);
+  SH7095_RecalcPendingIntPEX(z);	// TODO: conditionalize(or make SH7095_RecalcPendingIntPEX(z) less expensive).
  }
 
- return et + ((et < DMA_SGEndTimestamp) ? 32 : 128);
+ if(SH2_FastDMAEvents && et >= z->DMA_SGEndTimestamp && !SH7095_DMA_RunCond(z, 0) && !SH7095_DMA_RunCond(z, 1))
+  return SS_EVENT_DISABLED_TS;      /* nothing to do until a DMAC register write (DMA_StartSG re-arms) */
+ return et + ((et < z->DMA_SGEndTimestamp) ? 32 : 128);
 }
 
-// DMA_StartSG() must be paired with a DMA_Update(SH7095_mem_timestamp) somewhere before.
-void SH7095::DMA_StartSG(void)
+// SH7095_DMA_StartSG(z) must be paired with a SH7095_DMA_Update(z, SH7095_mem_timestamp) somewhere before.
+static void SH7095_DMA_StartSG(SH7095* z)
 {
- DMA_SGEndTimestamp = DMA_Timestamp + 192;
- SS_SetEventNT(&events[event_id_dma], SH7095_mem_timestamp + 32);	// fixed + 32
+ z->DMA_SGEndTimestamp = z->DMA_Timestamp + 192;
+ SS_SetEventNT(&events[z->event_id_dma], SH7095_mem_timestamp + 32);	// fixed + 32
 
- DMA_CheckEnterBurstHack();
+ SH7095_DMA_CheckEnterBurstHack(z);
 }
 
-// Must be called after DMACH[0].CHCR or DMACH[1].CHCR or DMAOR changes.
+// Must be called after z->DMACH[0].CHCR or z->DMACH[1].CHCR or z->DMAOR changes.
 //
-// If DMA_RunCond(...) returns false, SAR and DAR and TCR for that channel
-// should not be used(due to caching of variables in DMA_DoTransfer()).
-NO_INLINE void SH7095::DMA_RecalcRunning(void)
+// If SH7095_DMA_RunCond(z, ...) returns false, SAR and DAR and TCR for that channel
+// should not be used(due to caching of variables in SH7095_DMA_DoTransfer(z)).
+static NO_INLINE void SH7095_DMA_RecalcRunning(SH7095* z)
 {
- DMA_PenaltyKludgeAmount = 0;
+ z->DMA_PenaltyKludgeAmount = 0;
 
  for(unsigned ch = 0; ch < 2; ch++)
  {
-  if(DMA_RunCond(ch))
+  if(SH7095_DMA_RunCond(z, ch))
   {
-   const int32 npka = (((DMACH[ch].CHCR >> 10) & 3) == 3 && (DMACH[ch].SAR & DMACH[ch].DAR & 0x06000000) != 0x06000000) ? 23 : 19;
+   const int32_t npka = (((z->DMACH[ch].CHCR >> 10) & 3) == 3 && (z->DMACH[ch].SAR & z->DMACH[ch].DAR & 0x06000000) != 0x06000000) ? 23 : 19;
 
-   DMA_PenaltyKludgeAmount = std::max<int32>(DMA_PenaltyKludgeAmount, npka);
+   if((npka) > z->DMA_PenaltyKludgeAmount) z->DMA_PenaltyKludgeAmount = (npka);
   }
  }
 
 #if 1
  if(MDFN_UNLIKELY(ss_horrible_hacks & HORRIBLEHACK_NOSH2DMAPENALTY))
-  DMA_PenaltyKludgeAmount = 0;
+  z->DMA_PenaltyKludgeAmount = 0;
 #endif
  //
  //
  //
 }
 
-INLINE void SH7095::DMA_BusTimingKludge(void)
+INLINE void SH7095_DMA_BusTimingKludge(SH7095* z)
 {
- timestamp += DMA_PenaltyKludgeAccum;
- DMA_PenaltyKludgeAccum = 0;
+ z->timestamp += z->DMA_PenaltyKludgeAccum;
+ z->DMA_PenaltyKludgeAccum = 0;
 }
 
-
 //
 //
 //
-void NO_INLINE SH7095::FRT_Reset(void)
+static NO_INLINE void SH7095_FRT_Reset(SH7095* z)
 {
- FRT.FRC = 0x00;
- FRT.OCR[0] = FRT.OCR[1] = 0x00;
- FRT.FICR = 0x00;
- FRT.TIER = 0x00;
- FRT.FTCSR = 0x00;
- FRT.FTCSRM = 0x00;
- FRT.TCR = 0x00;
- FRT.TOCR = 0x00;
- FRT.RW_Temp = 0x00;	// Reset or not?
+ z->FRT.FRC = 0x00;
+ z->FRT.OCR[0] = z->FRT.OCR[1] = 0x00;
+ z->FRT.FICR = 0x00;
+ z->FRT.TIER = 0x00;
+ z->FRT.FTCSR = 0x00;
+ z->FRT.FTCSRM = 0x00;
+ z->FRT.TCR = 0x00;
+ z->FRT.TOCR = 0x00;
+ z->FRT.RW_Temp = 0x00;	// SH7095_Reset_TBD_ or not?
 
- FRT_WDT_Recalc_NET();
- RecalcPendingIntPEX();
+ SH7095_FRT_WDT_Recalc_NET(z);
+ SH7095_RecalcPendingIntPEX(z);
 }
 
-INLINE void SH7095::FRT_CheckOCR(void)
+static INLINE void SH7095_FRT_CheckOCR(SH7095* z)
 {
- if(FRT.FRC == FRT.OCR[0]) // OCRA
+ if(z->FRT.FRC == z->FRT.OCR[0]) // OCRA
  {
-  if(FRT.FTCSR & 0x0001)
-   FRT.FRC = 0;
+  if(z->FRT.FTCSR & 0x0001)
+   z->FRT.FRC = 0;
 
-  if(!(FRT.FTCSR & 0x08))
+  if(!(z->FRT.FTCSR & 0x08))
   {
-   FRT.FTCSR |= 0x08;
-   FRT.FTCSRM |= 0x08;
-   RecalcPendingIntPEX();
+   z->FRT.FTCSR |= 0x08;
+   z->FRT.FTCSRM |= 0x08;
+   SH7095_RecalcPendingIntPEX(z);
   }
  }
 
- if(FRT.FRC == FRT.OCR[1]) // OCRB
+ if(z->FRT.FRC == z->FRT.OCR[1]) // OCRB
  {
-  if(!(FRT.FTCSR & 0x04))
+  if(!(z->FRT.FTCSR & 0x04))
   {
-   FRT.FTCSR |= 0x04;
-   FRT.FTCSRM |= 0x04;
-   RecalcPendingIntPEX();
+   z->FRT.FTCSR |= 0x04;
+   z->FRT.FTCSRM |= 0x04;
+   SH7095_RecalcPendingIntPEX(z);
   }
  }
 }
 
-INLINE void SH7095::FRT_ClockFRC(void)
+static INLINE void SH7095_FRT_ClockFRC(SH7095* z)
 {
- FRT.FRC++;
- if(!FRT.FRC)
+ z->FRT.FRC++;
+ if(!z->FRT.FRC)
  {
-  if(!(FRT.FTCSR & 0x02))
+  if(!(z->FRT.FTCSR & 0x02))
   {
-   FRT.FTCSR |= 0x02;	// OVF
-   FRT.FTCSRM |= 0x02;
-   RecalcPendingIntPEX();
+   z->FRT.FTCSR |= 0x02;	// OVF
+   z->FRT.FTCSRM |= 0x02;
+   SH7095_RecalcPendingIntPEX(z);
   }
  }
  //
  //
  //
- FRT_CheckOCR();
+ SH7095_FRT_CheckOCR(z);
 }
 
-
-static const uint8 wdt_cstab[8] = { 1, /**/ 6, 7, 8, 9, 10, /**/ 12, 13 };
+static const uint8_t wdt_cstab[8] = { 1, /**/ 6, 7, 8, 9, 10, /**/ 12, 13 };
 
 //
 // Call after:
-//	WDT.WTCSR, WDT.WTCNT, FRT.TCR, FRT.OCR[0], FRT.OCR[1] changes due to register write or similar.
-//	timestamp >= FRT_WDT_NextTS (after call to FRT_WDT_Update())
+//	z->WDT.WTCSR, z->WDT.WTCNT, z->FRT.TCR, z->FRT.OCR[0], z->FRT.OCR[1] changes due to register write or similar.
+//	z->timestamp >= z->FRT_WDT_NextTS (after call to SH7095_FRT_WDT_Update(z))
 //
-void SH7095::FRT_WDT_Recalc_NET(void)
+static void SH7095_FRT_WDT_Recalc_NET(SH7095* z)
 {
- int32 rt = 1000;
+ int32_t rt = 1000;
 
- if((FRT.TCR & 0x3) != 0x3)	// when == 3, count on rising edge of external clock(not handled here).
+ if((z->FRT.TCR & 0x3) != 0x3)	// when == 3, count on rising edge of external clock(not handled here).
  {
-  const uint32 frt_clockshift = 3 + ((FRT.TCR & 0x3) << 1);	// /8, /32, /128, count at falling edge
-  int32 next_frc = 0x10000;
+  const uint32_t frt_clockshift = 3 + ((z->FRT.TCR & 0x3) << 1);	// /8, /32, /128, count at falling edge
+  int32_t next_frc = 0x10000;
 
-  if(FRT.OCR[0] > FRT.FRC)
-   next_frc = FRT.OCR[0];
+  if(z->FRT.OCR[0] > z->FRT.FRC)
+   next_frc = z->FRT.OCR[0];
 
-  if(FRT.OCR[1] > FRT.FRC)
-   next_frc = FRT.OCR[1];
+  if(z->FRT.OCR[1] > z->FRT.FRC)
+   next_frc = z->FRT.OCR[1];
 
-  rt = ((next_frc - FRT.FRC) << frt_clockshift) - (FRT_WDT_ClockDivider & ((1 << frt_clockshift) - 1));
+  rt = ((next_frc - z->FRT.FRC) << frt_clockshift) - (z->FRT_WDT_ClockDivider & ((1 << frt_clockshift) - 1));
  }
 
- if(WDT.WTCSR & 0x28)	// TME(0x20) and internal use standby NMI recover bit(0x08)
+ if(z->WDT.WTCSR & 0x28)	// TME(0x20) and internal use standby NMI recover bit(0x08)
  {
-  const unsigned wdt_clockshift = wdt_cstab[WDT.WTCSR & 0x7];
-  int32 wdt_rt;
+  const unsigned wdt_clockshift = wdt_cstab[z->WDT.WTCSR & 0x7];
+  int32_t wdt_rt;
 
-  wdt_rt = ((0x100 - WDT.WTCNT) << wdt_clockshift) - (FRT_WDT_ClockDivider & ((1 << wdt_clockshift) - 1));
-  rt = std::min<int32>(rt, wdt_rt);
+  wdt_rt = ((0x100 - z->WDT.WTCNT) << wdt_clockshift) - (z->FRT_WDT_ClockDivider & ((1 << wdt_clockshift) - 1));
+  if((wdt_rt) < rt) rt = (wdt_rt);
  }
 
  assert(rt > 0);
 
- FRT_WDT_NextTS = timestamp + rt;
+ z->FRT_WDT_NextTS = z->timestamp + rt;
 }
 
-void SH7095::FRT_WDT_Update(void)
+static void SH7095_FRT_WDT_Update(SH7095* z)
 {
- assert(timestamp >= FRT.lastts);
+ assert(z->timestamp >= z->FRT.lastts);
 
- uint32 clocks = timestamp - FRT.lastts;
+ uint32_t clocks = z->timestamp - z->FRT.lastts;
 
- FRT.lastts = timestamp;
+ z->FRT.lastts = z->timestamp;
 
  //
- // 
  //
- const uint32 PreAddCD = FRT_WDT_ClockDivider;
- FRT_WDT_ClockDivider += clocks;
+ //
+ const uint32_t PreAddCD = z->FRT_WDT_ClockDivider;
+ z->FRT_WDT_ClockDivider += clocks;
 
- if((FRT.TCR & 0x3) != 0x3)	// when == 3, count on rising edge of external clock(not handled here).
+ if((z->FRT.TCR & 0x3) != 0x3)	// when == 3, count on rising edge of external clock(not handled here).
  {
-  const uint32 frt_clockshift = 3 + ((FRT.TCR & 0x3) << 1);	// /8, /32, /128, count at falling edge
-  uint32 divided_clocks = (FRT_WDT_ClockDivider >> frt_clockshift) - (PreAddCD >> frt_clockshift);
+  const uint32_t frt_clockshift = 3 + ((z->FRT.TCR & 0x3) << 1);	// /8, /32, /128, count at falling edge
+  uint32_t divided_clocks = (z->FRT_WDT_ClockDivider >> frt_clockshift) - (PreAddCD >> frt_clockshift);
 
   while(divided_clocks-- > 0)
   {
-   FRT_ClockFRC();
+   SH7095_FRT_ClockFRC(z);
   }
  }
 
- // WDT:
- if(WDT.WTCSR & 0x28)	// TME(0x20) and internal use standby NMI recover bit(0x08)
+ // z->WDT:
+ if(z->WDT.WTCSR & 0x28)	// TME(0x20) and internal use standby NMI recover bit(0x08)
  {
-  const unsigned wdt_clockshift = wdt_cstab[WDT.WTCSR & 0x7];
-  uint32 divided_clocks = (FRT_WDT_ClockDivider >> wdt_clockshift) - (PreAddCD >> wdt_clockshift);
-  uint32 tmp_counter = WDT.WTCNT;
+  const unsigned wdt_clockshift = wdt_cstab[z->WDT.WTCSR & 0x7];
+  uint32_t divided_clocks = (z->FRT_WDT_ClockDivider >> wdt_clockshift) - (PreAddCD >> wdt_clockshift);
+  uint32_t tmp_counter = z->WDT.WTCNT;
 
   tmp_counter += divided_clocks;
-  WDT.WTCNT = tmp_counter;
+  z->WDT.WTCNT = tmp_counter;
   //
   //
   if(MDFN_UNLIKELY(tmp_counter >= 0x100))
   {
-   if(MDFN_UNLIKELY(WDT.WTCSR & 0x08))
+   if(MDFN_UNLIKELY(z->WDT.WTCSR & 0x08))
    {
-    Standby = false;
-    WDT.WTCNT = 0x00;
-    WDT.WTCSR &= ~0x08;
+    z->Standby = false;
+    z->WDT.WTCNT = 0x00;
+    z->WDT.WTCSR &= ~0x08;
    }
-   else if(MDFN_UNLIKELY(WDT.WTCSR & 0x40))	// Watchdog timer mode
+   else if(MDFN_UNLIKELY(z->WDT.WTCSR & 0x40))	// Watchdog timer mode
    {
-    WDT.RSTCSR |= 0x80;
+    z->WDT.RSTCSR |= 0x80;
 
-    WDT.WTCNT = 0;
-    WDT.WTCSR = 0;
+    z->WDT.WTCNT = 0;
+    z->WDT.WTCSR = 0;
 
-    if(WDT.RSTCSR & 0x40)	// RSTE
-     Reset(!(WDT.RSTCSR & 0x20), true);
+    if(z->WDT.RSTCSR & 0x40)	// RSTE
+     SH7095_Reset(z, !(z->WDT.RSTCSR & 0x20), true);
    }
    else
    {
-    if(!(WDT.WTCSR & 0x80))
+    if(!(z->WDT.WTCSR & 0x80))
     {
-     WDT.WTCSR |= 0x80;
-     WDT.WTCSRM |= 0x80;
-     RecalcPendingIntPEX();
+     z->WDT.WTCSR |= 0x80;
+     z->WDT.WTCSRM |= 0x80;
+     SH7095_RecalcPendingIntPEX(z);
     }
    }
   }
  }
 }
 
-void SH7095::SetFTI(bool state)
+void SH7095_SetFTI(SH7095* z, bool state)
 {
- if(MDFN_UNLIKELY(timestamp == SS_EVENT_DISABLED_TS))
+ if(MDFN_UNLIKELY(z->timestamp == SS_EVENT_DISABLED_TS))
  {
-  FRT.FTI = state;
+  z->FRT.FTI = state;
   return;
  }
 
- FRT_WDT_Update();
+ SH7095_FRT_WDT_Update(z);
  //
  //
- bool prev = FRT.FTI;
- FRT.FTI = state;
+ bool prev = z->FRT.FTI;
+ z->FRT.FTI = state;
 
- if((prev ^ state) & (prev ^ (FRT.TCR >> 7)))
+ if((prev ^ state) & (prev ^ (z->FRT.TCR >> 7)))
  {
-  FRT.FICR = FRT.FRC;
-  if(!(FRT.FTCSR & 0x80))
+  z->FRT.FICR = z->FRT.FRC;
+  if(!(z->FRT.FTCSR & 0x80))
   {
-   FRT.FTCSR |= 0x80;
-   FRT.FTCSRM |= 0x80;
+   z->FRT.FTCSR |= 0x80;
+   z->FRT.FTCSRM |= 0x80;
   }
-  RecalcPendingIntPEX();
+  SH7095_RecalcPendingIntPEX(z);
  }
 }
 
-void SH7095::SetFTCI(bool state)
+static void SH7095_SetFTCI(SH7095* z, bool state)
 {
- bool prev = FRT.FTCI;
- FRT.FTCI = state;
+ bool prev = z->FRT.FTCI;
+ z->FRT.FTCI = state;
 
- if((FRT.TCR & 0x3) == 0x3)
+ if((z->FRT.TCR & 0x3) == 0x3)
  {
   if(!prev && state)
-   FRT_ClockFRC();
+   SH7095_FRT_ClockFRC(z);
  }
 }
 
-void NO_INLINE SH7095::WDT_Reset(bool from_internal_wdt)
+static NO_INLINE void SH7095_WDT_Reset(SH7095* z, bool from_internal_wdt)
 {
- WDT.WTCSR = 0x00;
- WDT.WTCSRM = 0x00;
+ z->WDT.WTCSR = 0x00;
+ z->WDT.WTCSRM = 0x00;
 
- WDT.WTCNT = 0x00;
+ z->WDT.WTCNT = 0x00;
 
  if(!from_internal_wdt)
  {
-  WDT.RSTCSR = 0x00;
-  WDT.RSTCSRM = 0x00;
+  z->WDT.RSTCSR = 0x00;
+  z->WDT.RSTCSRM = 0x00;
  }
 
- FRT_WDT_Recalc_NET();
- RecalcPendingIntPEX();
+ SH7095_FRT_WDT_Recalc_NET(z);
+ SH7095_RecalcPendingIntPEX(z);
 }
 
-void NO_INLINE SH7095::WDT_StandbyReset(void)
+static NO_INLINE void SH7095_WDT_StandbyReset(SH7095* z)
 {
- WDT.WTCSR &= 0x1F;
- WDT.WTCSRM &= 0x1F;
+ z->WDT.WTCSR &= 0x1F;
+ z->WDT.WTCSRM &= 0x1F;
 
- WDT.RSTCSR = 0x00;
- WDT.RSTCSRM = 0x00;
+ z->WDT.RSTCSR = 0x00;
+ z->WDT.RSTCSRM = 0x00;
 
- FRT_WDT_Recalc_NET();
- RecalcPendingIntPEX();
+ SH7095_FRT_WDT_Recalc_NET(z);
+ SH7095_RecalcPendingIntPEX(z);
 }
 
 //
@@ -977,7 +1057,7 @@ void NO_INLINE SH7095::WDT_StandbyReset(void)
 //
 //
 
-static INLINE uint64 DIVU64_Partial(uint64 dividend, uint32 divisor)
+static INLINE uint64_t DIVU64_Partial(uint64_t dividend, uint32_t divisor)
 {
  bool M, Q;
 
@@ -987,9 +1067,9 @@ static INLINE uint64 DIVU64_Partial(uint64 dividend, uint32 divisor)
  for(unsigned x = 0; x < 3; x++)
  {
 	if(!(Q ^ M))
-	 dividend -= (uint64)divisor << 32;
+	 dividend -= (uint64_t)divisor << 32;
 	else
-	 dividend += (uint64)divisor << 32;
+	 dividend += (uint64_t)divisor << 32;
 
 	Q = dividend >> 63;
         dividend <<= 1;
@@ -999,51 +1079,51 @@ static INLINE uint64 DIVU64_Partial(uint64 dividend, uint32 divisor)
  return dividend;
 }
 
-INLINE void SH7095::DIVU_S32_S32(void)
+static INLINE void SH7095_DIVU_S32_S32(SH7095* z)
 {
- if(!DVSR)
+ if(!z->DVSR)
  {
-  divide_finish_timestamp = MA_until + 2 + 6;
+  z->divide_finish_timestamp = z->MA_until + 2 + 6;
 
-  DVCR |= 1;
-  RecalcPendingIntPEX();
+  z->DVCR |= 1;
+  SH7095_RecalcPendingIntPEX(z);
 
-  DVDNTH = (int32)DVDNT >> 29;
+  z->DVDNTH = (int32_t)z->DVDNT >> 29;
 
-  if(!(DVCR & 2))
-   DVDNT = DVDNTL = 0x7FFFFFFF + ((int32)DVDNT < 0);
+  if(!(z->DVCR & 2))
+   z->DVDNT = z->DVDNTL = 0x7FFFFFFF + ((int32_t)z->DVDNT < 0);
   else
-   DVDNT = DVDNTL = (DVDNT << 3) | (((int32)~DVDNT >> 31) & 7);
+   z->DVDNT = z->DVDNTL = (z->DVDNT << 3) | (((int32_t)~z->DVDNT >> 31) & 7);
  }
  else
  {
-  divide_finish_timestamp = MA_until + 1 + 39;
+  z->divide_finish_timestamp = z->MA_until + 1 + 39;
 
-  if(DVSR == 0xFFFFFFFF && DVDNTL == 0x80000000)
+  if(z->DVSR == 0xFFFFFFFF && z->DVDNTL == 0x80000000)
   {
-   DVDNT = DVDNTL = 0x80000000;
-   DVDNTH = 0;
+   z->DVDNT = z->DVDNTL = 0x80000000;
+   z->DVDNTH = 0;
   }
   else
   {
-   DVDNTH = (int32)DVDNTL % (int32)DVSR;
-   DVDNT = DVDNTL = (int32)DVDNTL / (int32)DVSR;
+   z->DVDNTH = (int32_t)z->DVDNTL % (int32_t)z->DVSR;
+   z->DVDNT = z->DVDNTL = (int32_t)z->DVDNTL / (int32_t)z->DVSR;
   }
  }
- DVDNTH_Shadow = DVDNTH;
- DVDNTL_Shadow = DVDNTL;
+ z->DVDNTH_Shadow = z->DVDNTH;
+ z->DVDNTL_Shadow = z->DVDNTL;
 }
 
-INLINE void SH7095::DIVU_S64_S32(void)
+static INLINE void SH7095_DIVU_S64_S32(SH7095* z)
 {
- const int32 divisor = DVSR;
- const int64 dividend = ((int64)DVDNTH << 32) | DVDNTL;
- int64 quotient;
+ const int32_t divisor = z->DVSR;
+ const int64_t dividend = ((int64_t)z->DVDNTH << 32) | z->DVDNTL;
+ int64_t quotient;
 
  if(!divisor)
   goto Overflow;
 
- if((uint64)dividend == (1ULL << 63) && (uint32)divisor == ~(uint32)0)
+ if((uint64_t)dividend == (1ULL << 63) && (uint32_t)divisor == ~(uint32_t)0)
   goto Overflow;
 
  quotient = dividend / divisor;
@@ -1054,75 +1134,68 @@ INLINE void SH7095::DIVU_S64_S32(void)
  if(quotient < -2147483647LL || quotient > 2147483647LL)
  {
   Overflow:
-  divide_finish_timestamp = timestamp + 6;
-  DVCR |= 1;
-  RecalcPendingIntPEX();
+  z->divide_finish_timestamp = z->timestamp + 6;
+  z->DVCR |= 1;
+  SH7095_RecalcPendingIntPEX(z);
   //
-  uint64 tmp = DIVU64_Partial(dividend, divisor);
-  DVDNTH = tmp >> 32;
+  uint64_t tmp = DIVU64_Partial(dividend, divisor);
+  z->DVDNTH = tmp >> 32;
 
-  if(DVCR & 2)
-   DVDNT = DVDNTL = tmp;
+  if(z->DVCR & 2)
+   z->DVDNT = z->DVDNTL = tmp;
   else
-   DVDNT = DVDNTL = 0x7FFFFFFF + ((int32)((dividend >> 32) ^ divisor) < 0);
+   z->DVDNT = z->DVDNTL = 0x7FFFFFFF + ((int32_t)((dividend >> 32) ^ divisor) < 0);
  }
  else
  {
   SkipOVCheck:
-  divide_finish_timestamp = timestamp + 39;
-  DVDNTH = dividend % divisor;
-  DVDNT = DVDNTL = quotient;
+  z->divide_finish_timestamp = z->timestamp + 39;
+  z->DVDNTH = dividend % divisor;
+  z->DVDNT = z->DVDNTL = quotient;
  }
- DVDNTH_Shadow = DVDNTH;
- DVDNTL_Shadow = DVDNTL;
+ z->DVDNTH_Shadow = z->DVDNTH;
+ z->DVDNTL_Shadow = z->DVDNTL;
 }
 
 //
 //
-// Begin SCI
+// Begin z->SCI
 //
 //
-void SH7095::SCI_Reset(void)
+static void SH7095_SCI_Reset(SH7095* z)
 {
- SCI.SMR = 0x00;
- SCI.BRR = 0xFF;
- SCI.SCR = 0x00;
- SCI.TDR = 0xFF;
- SCI.SSR = 0x84;
- SCI.SSRM = 0x00;
- SCI.RDR = 0x00;
+ z->SCI.SMR = 0x00;
+ z->SCI.BRR = 0xFF;
+ z->SCI.SCR = 0x00;
+ z->SCI.TDR = 0xFF;
+ z->SCI.SSR = 0x84;
+ z->SCI.SSRM = 0x00;
+ z->SCI.RDR = 0x00;
  //
- SCI.RSR = 0x00;
- SCI.TSR = 0x00;
+ z->SCI.RSR = 0x00;
+ z->SCI.TSR = 0x00;
 
- RecalcPendingIntPEX();
+ SH7095_RecalcPendingIntPEX(z);
 }
 
-
 //
 //
-// End SCI
+// End z->SCI
 //
 //
 
 //
 // Misaligned/wrong-sized accesses aren't handled correctly, it's a mess, but probably doesn't matter.
 //
-template<typename T>
-NO_INLINE MDFN_HOT void SH7095::OnChipRegWrite(uint32 A, uint32 V)
+
+static NO_INLINE MDFN_HOT void SH7095_OnChipRegWrite_u8(SH7095* z, uint32_t A, uint32_t V)
 {
  if(A & 0x100)
  {
-  if(sizeof(T) == 2)
-   A &= 0xFE;
-  else
-   A &= 0xFC;
+  A &= 0xFC;
 
-  if(sizeof(T) == 1)
-  {
-   SetPEX(PEX_CPUADDR);
-   V |= (uint8)V << 8;
-  }
+  SH7095_SetPEX(z, SH7095_PEX_CPUADDR);
+  V |= (uint8_t)V << 8;
 
   switch(A)
   {
@@ -1131,50 +1204,50 @@ NO_INLINE MDFN_HOT void SH7095::OnChipRegWrite(uint32 A, uint32 V)
 
    //
    // Division Unit registers
-   // 
+   //
    case 0x20:
    case 0x00:
-	DVSR = V;
+	z->DVSR = V;
 	break;
 
    case 0x24:
    case 0x04:
-	DVDNT = V;
-	DVDNTL = V;
-	DVDNTH = (int32)V >> 31;
-	DIVU_S32_S32();
+	z->DVDNT = V;
+	z->DVDNTL = V;
+	z->DVDNTH = (int32_t)V >> 31;
+	SH7095_DIVU_S32_S32(z);
 	break;
 
    case 0x28:
    case 0x08:
-	DVCR = V & 0x3;
+	z->DVCR = V & 0x3;
 	break;
 
    case 0x2C:
    case 0x0C:
-	VCRDIV = V;
+	z->VCRDIV = V;
 	break;
 
    case 0x30:
    case 0x10:
-	DVDNTH = V;
+	z->DVDNTH = V;
 	break;
 
    case 0x34:
    case 0x14:
-	DVDNTL = V;
-	DIVU_S64_S32();
+	z->DVDNTL = V;
+	SH7095_DIVU_S64_S32(z);
 	break;
 
    // ?
    case 0x38:
    case 0x18:
-	DVDNTH_Shadow = V;
+	z->DVDNTH_Shadow = V;
 	break;
 
    case 0x3C:
    case 0x1C:
-	DVDNTL_Shadow = V;
+	z->DVDNTL_Shadow = V;
 	break;
    //
    //
@@ -1185,94 +1258,66 @@ NO_INLINE MDFN_HOT void SH7095::OnChipRegWrite(uint32 A, uint32 V)
    //
    case 0x80:
    case 0x90:
-	DMACH[(A >> 4) & 1].SAR = V;
+	z->DMACH[(A >> 4) & 1].SAR = V;
 	break;
 
    case 0x84:
    case 0x94:
-	DMACH[(A >> 4) & 1].DAR = V;
+	z->DMACH[(A >> 4) & 1].DAR = V;
 	break;
 
    case 0x88:
    case 0x98:
-	DMACH[(A >> 4) & 1].TCR = V & 0xFFFFFF;
+	z->DMACH[(A >> 4) & 1].TCR = V & 0xFFFFFF;
 	break;
 
    case 0x8C:
    case 0x9C:
-	DMA_Update(SH7095_mem_timestamp);
+	SH7095_DMA_Update(z, SH7095_mem_timestamp);
 	{
 	 const unsigned ch = (A >> 4) & 1;
 
-	 DMACH[ch].CHCR = (V & ~2) | (DMACH[ch].CHCR & (V | DMACH[ch].CHCRM) & 2);
+	 z->DMACH[ch].CHCR = (V & ~2) | (z->DMACH[ch].CHCR & (V | z->DMACH[ch].CHCRM) & 2);
 	}
-	DMA_RecalcRunning();
-	DMA_StartSG();
-	RecalcPendingIntPEX();
+	SH7095_DMA_RecalcRunning(z);
+	SH7095_DMA_StartSG(z);
+	SH7095_RecalcPendingIntPEX(z);
 	break;
 
    case 0xA0:
    case 0xA8:
-	DMACH[(A >> 3) & 1].VCR = V;
+	z->DMACH[(A >> 3) & 1].VCR = V;
 	break;
 
    case 0xB0:
-	DMA_Update(SH7095_mem_timestamp);
-	DMAOR = (V & 0x9) | (DMAOR & (V | DMAORM) & 0x6);
-	DMA_RecalcRunning();
-	DMA_StartSG();
+	SH7095_DMA_Update(z, SH7095_mem_timestamp);
+	z->DMAOR = (V & 0x9) | (z->DMAOR & (V | z->DMAORM) & 0x6);
+	SH7095_DMA_RecalcRunning(z);
+	SH7095_DMA_StartSG(z);
 	break;
 
    //
-   // BSC registers
+   // z->BSC registers
    //
    case 0xE0:	// BCR1
-	if(sizeof(T) == 4 && (V & 0xFFFF0000) == 0xA55A0000)
-	{
- 	 BSC.BCR1 = (BSC.BCR1 & 0x8000) | (V & 0x1FF7);
-	}
 	break;
 
    case 0xE4:	// BCR2
-	if(sizeof(T) == 4 && (V & 0xFFFF0000) == 0xA55A0000)
-	{
- 	 BSC.BCR2 = V & 0xFC;
-	}
 	break;
 
    case 0xE8:	// WCR
-	if(sizeof(T) == 4 && (V & 0xFFFF0000) == 0xA55A0000)
-	{
- 	 BSC.WCR = V & 0xFFFF;
-	}
 	break;
 
    case 0xEC:	// MCR
-	if(sizeof(T) == 4 && (V & 0xFFFF0000) == 0xA55A0000)
-	{
- 	 BSC.MCR = V & 0xFEFC;
-	}
 	break;
 
    case 0xF0:	// RTCSR
-	if(sizeof(T) == 4 && (V & 0xFFFF0000) == 0xA55A0000)
-	{
- 	 BSC.RTCSR = (V & 0x78) | (BSC.RTCSR & 0x80 & (V | ~BSC.RTCSRM));
-	}
 	break;
 
    case 0xF4:	// RTCNT
-	if(sizeof(T) == 4 && (V & 0xFFFF0000) == 0xA55A0000)
-	{
- 	 BSC.RTCNT = V & 0xFF;
-	}
 	break;
 
    case 0xF8: // RTCOR
-	if(sizeof(T) == 4 && (V & 0xFFFF0000) == 0xA55A0000)
-	{
- 	 BSC.RTCOR = V & 0xFF;
-	}
 	break;
   }
  }
@@ -1281,17 +1326,8 @@ NO_INLINE MDFN_HOT void SH7095::OnChipRegWrite(uint32 A, uint32 V)
   unsigned mask = 0xFFFF;
   unsigned shift = 0;
 
-  if(sizeof(T) != 2)
-  {
-   shift = ((A & 1) ^ 1) << 3;
-   mask = 0xFF << shift;
-
-   if(sizeof(T) == 4)
-    shift ^= 8;
-  }
-
-  if(sizeof(T) == 4)
-   SetPEX(PEX_CPUADDR);
+  shift = ((A & 1) ^ 1) << 3;
+  mask = 0xFF << shift;
 
   switch(A & 0xFF)
   {
@@ -1304,66 +1340,66 @@ NO_INLINE MDFN_HOT void SH7095::OnChipRegWrite(uint32 A, uint32 V)
    //
    // TIER
    case 0x10:
-	FRT_WDT_Update();
+	SH7095_FRT_WDT_Update(z);
 	//
-	FRT.TIER = V;
-	RecalcPendingIntPEX();
+	z->FRT.TIER = V;
+	SH7095_RecalcPendingIntPEX(z);
 	break;
 
    // FTCSR
    case 0x11:
-	FRT_WDT_Update();
+	SH7095_FRT_WDT_Update(z);
 	//
-	FRT.FTCSR = (FRT.FTCSR & (FRT.FTCSRM | V) & 0x8E) | (V & 0x01);
-	RecalcPendingIntPEX();
-	FRT_CheckOCR();
+	z->FRT.FTCSR = (z->FRT.FTCSR & (z->FRT.FTCSRM | V) & 0x8E) | (V & 0x01);
+	SH7095_RecalcPendingIntPEX(z);
+	SH7095_FRT_CheckOCR(z);
 	break;
 
    // FRCH
    case 0x12:
-	FRT.RW_Temp = V;
+	z->FRT.RW_Temp = V;
 	break;
 
    // FRCL
    case 0x13:
-	FRT_WDT_Update();
+	SH7095_FRT_WDT_Update(z);
 	//
-	FRT.FRC = (FRT.RW_Temp << 8) | (V & 0xFF);
-	FRT_CheckOCR();
-	FRT_WDT_Recalc_NET();
+	z->FRT.FRC = (z->FRT.RW_Temp << 8) | (V & 0xFF);
+	SH7095_FRT_CheckOCR(z);
+	SH7095_FRT_WDT_Recalc_NET(z);
 	break;
 
    // OCRA/B H
    case 0x14:
-	FRT.RW_Temp = V;
+	z->FRT.RW_Temp = V;
 	break;
 
    // OCRA/B L
    case 0x15:
-	FRT_WDT_Update();
+	SH7095_FRT_WDT_Update(z);
 	//
-	FRT.OCR[(FRT.TOCR >> 4) & 1] = (FRT.RW_Temp << 8) | V;
-	FRT_CheckOCR();
-	FRT_WDT_Recalc_NET();
+	z->FRT.OCR[(z->FRT.TOCR >> 4) & 1] = (z->FRT.RW_Temp << 8) | V;
+	SH7095_FRT_CheckOCR(z);
+	SH7095_FRT_WDT_Recalc_NET(z);
 	break;
 
    // TCR
    case 0x16:
 	{
-	 FRT_WDT_Update();
+	 SH7095_FRT_WDT_Update(z);
 	 //
-	 //const uint8 old_TCR = FRT.TCR;
- 	 FRT.TCR = V;
+	 //const uint8_t old_TCR = z->FRT.TCR;
+ 	 z->FRT.TCR = V;
 	 //
 	 //
 	 //
-	 FRT_WDT_Recalc_NET();
+	 SH7095_FRT_WDT_Recalc_NET(z);
 	}
 	break;
 
    // TOCR
    case 0x17:
-	FRT.TOCR = V & 0x1F;
+	z->FRT.TOCR = V & 0x1F;
 	break;
 
    //
@@ -1371,58 +1407,24 @@ NO_INLINE MDFN_HOT void SH7095::OnChipRegWrite(uint32 A, uint32 V)
    //
    case 0x71:
    case 0x72:
-	DMACH[(A & 1) ^ 1].DRCR = V & 0x3;
+	z->DMACH[(A & 1) ^ 1].DRCR = V & 0x3;
 	break;
 
-
    //
-   // WDT registers
+   // z->WDT registers
    //
    case 0x80:
    case 0x88:
-	FRT_WDT_Update();
-	if(sizeof(T) == 2)
-	{
-	 if((V & 0xFF00) == 0x5A00)
-	 {
-	  if(WDT.WTCSR & 0x20)
-	   WDT.WTCNT = V;
-	 }
-	 else if((V & 0xFF00) == 0xA500)
-	 {
-	  WDT.WTCSR = (WDT.WTCSR & (WDT.WTCSRM | V) & 0x80) | (V & 0x67);
-
-	  if(WDT.WTCSR & 0x20)
-	   SBYCR &= 0x7F;
-	  else
-	  {
-	   WDT.WTCSR &= ~0x80;	// Seemingly undocumented...
-	   WDT.WTCNT = 0;
-	  }
-	 }
-	}
-	WDT.RSTCSRM = 0;
-	FRT_WDT_Recalc_NET();
-	RecalcPendingIntPEX();
+	SH7095_FRT_WDT_Update(z);
+	z->WDT.RSTCSRM = 0;
+	SH7095_FRT_WDT_Recalc_NET(z);
+	SH7095_RecalcPendingIntPEX(z);
 	break;
 
    case 0x82:
    case 0x8A:
-	FRT_WDT_Update();
-	if(sizeof(T) == 2)
-	{
-	 if(V == 0xA500)
-	 {
-	  // Clear OVF bit
-	  WDT.RSTCSR &= ~WDT.RSTCSRM;
-	 }
-	 else if((V & 0xFF00) == 0x5A00)
-	 {
-	  // Write RSTE and RSTS bits
-	  WDT.RSTCSR = (WDT.RSTCSR & 0x80) | (V & 0x60);
-	 }
-	}
-	WDT.RSTCSRM = 0;
+	SH7095_FRT_WDT_Update(z);
+	z->WDT.RSTCSRM = 0;
 	break;
 
    case 0x81:
@@ -1437,88 +1439,77 @@ NO_INLINE MDFN_HOT void SH7095::OnChipRegWrite(uint32 A, uint32 V)
    case 0x8D:
    case 0x8E:
    case 0x8F:
-	WDT.RSTCSRM = 0;
+	z->WDT.RSTCSRM = 0;
 	break;
 
    //
    //
    //
    case 0x91:
-	SBYCR = V;
+	z->SBYCR = V;
 
-	if(WDT.WTCSR & 0x20)
-	 SBYCR &= 0x7F;
+	if(z->WDT.WTCSR & 0x20)
+	 z->SBYCR &= 0x7F;
 
 	break;
 
    case 0x92:	// No 0x93...0x9F mirrors for writes.
-	SetCCR(V);
+	SH7095_SetCCR(z, V);
 	break;
    //
    //
    //
    case 0x60:
    case 0x61:
-	IPRB = (IPRB &~ mask) | ((V << shift) & mask & 0xFF00);
-	RecalcPendingIntPEX();
+	z->IPRB = (z->IPRB &~ mask) | ((V << shift) & mask & 0xFF00);
+	SH7095_RecalcPendingIntPEX(z);
 	break;
 
    case 0x62:
    case 0x63:
-	VCRA = (VCRA &~ mask) | ((V << shift) & mask & 0x7F7F);
+	z->VCRA = (z->VCRA &~ mask) | ((V << shift) & mask & 0x7F7F);
 	break;
 
    case 0x64:
    case 0x65:
-	VCRB = (VCRB &~ mask) | ((V << shift) & mask & 0x7F7F);
+	z->VCRB = (z->VCRB &~ mask) | ((V << shift) & mask & 0x7F7F);
 	break;
 
    case 0x66:
    case 0x67:
-	VCRC = (VCRC &~ mask) | ((V << shift) & mask & 0x7F7F);
+	z->VCRC = (z->VCRC &~ mask) | ((V << shift) & mask & 0x7F7F);
 	break;
 
    case 0x68:
    case 0x69:
-	VCRD = (VCRD &~ mask) | ((V << shift) & mask & 0x7F00);
+	z->VCRD = (z->VCRD &~ mask) | ((V << shift) & mask & 0x7F00);
 	break;
 
    case 0xE0:
    case 0xE1:
-	ICR = (ICR &~ mask) | ((V << shift) & mask & 0x0101);
-	RecalcPendingIntPEX();
+	z->ICR = (z->ICR &~ mask) | ((V << shift) & mask & 0x0101);
+	SH7095_RecalcPendingIntPEX(z);
 	break;
 
    case 0xE2:
    case 0xE3:
-	IPRA = (IPRA &~ mask) | ((V << shift) & mask & 0xFFF0);
-	RecalcPendingIntPEX();
+	z->IPRA = (z->IPRA &~ mask) | ((V << shift) & mask & 0xFFF0);
+	SH7095_RecalcPendingIntPEX(z);
 	break;
 
    case 0xE4:
    case 0xE5:
-	VCRWDT = (VCRWDT &~ mask) | ((V << shift) & mask & 0x7F7F);
+	z->VCRWDT = (z->VCRWDT &~ mask) | ((V << shift) & mask & 0x7F7F);
 	break;
   }
  }
 }
 
-template<typename T>
-INLINE T SH7095::OnChipRegRead_INLINE(uint32 A)
+static NO_INLINE MDFN_HOT void SH7095_OnChipRegWrite_u16(SH7095* z, uint32_t A, uint32_t V)
 {
  if(A & 0x100)
  {
-  uint32 ret = 0;
-
-  MA_until++;
-
-  if(sizeof(T) == 2)
-   A &= 0xFE;
-  else
-   A &= 0xFC;
-
-  if(sizeof(T) == 1)
-   SetPEX(PEX_CPUADDR);
+  A &= 0xFE;
 
   switch(A)
   {
@@ -1527,70 +1518,50 @@ INLINE T SH7095::OnChipRegRead_INLINE(uint32 A)
 
    //
    // Division Unit registers
-   // 
+   //
    case 0x20:
-   case 0x22:
    case 0x00:
-   case 0x02:
-	MA_until = std::max<sscpu_timestamp_t>(MA_until, divide_finish_timestamp);
-	ret = DVSR;
+	z->DVSR = V;
 	break;
 
    case 0x24:
-   case 0x26:
    case 0x04:
-   case 0x06:
-	MA_until = std::max<sscpu_timestamp_t>(MA_until, divide_finish_timestamp);
-	ret = DVDNT;
+	z->DVDNT = V;
+	z->DVDNTL = V;
+	z->DVDNTH = (int32_t)V >> 31;
+	SH7095_DIVU_S32_S32(z);
 	break;
 
    case 0x28:
-   case 0x2A:
    case 0x08:
-   case 0x0A:
-	MA_until = std::max<sscpu_timestamp_t>(MA_until, divide_finish_timestamp);
-	ret = DVCR;
+	z->DVCR = V & 0x3;
 	break;
 
    case 0x2C:
-   case 0x2E:
    case 0x0C:
-   case 0x0E:
-	MA_until = std::max<sscpu_timestamp_t>(MA_until, divide_finish_timestamp);
-	ret = VCRDIV;
+	z->VCRDIV = V;
 	break;
 
    case 0x30:
-   case 0x32:
    case 0x10:
-   case 0x12:
-	MA_until = std::max<sscpu_timestamp_t>(MA_until, divide_finish_timestamp);
-	ret = DVDNTH;
+	z->DVDNTH = V;
 	break;
 
    case 0x34:
-   case 0x36:
    case 0x14:
-   case 0x16:
-	MA_until = std::max<sscpu_timestamp_t>(MA_until, divide_finish_timestamp);
-	ret = DVDNTL;
+	z->DVDNTL = V;
+	SH7095_DIVU_S64_S32(z);
 	break;
 
    // ?
    case 0x38:
-   case 0x3A:
    case 0x18:
-   case 0x1A:
-	MA_until = std::max<sscpu_timestamp_t>(MA_until, divide_finish_timestamp);
-	ret = DVDNTH_Shadow;
+	z->DVDNTH_Shadow = V;
 	break;
 
    case 0x3C:
-   case 0x3E:
    case 0x1C:
-   case 0x1E:
-	MA_until = std::max<sscpu_timestamp_t>(MA_until, divide_finish_timestamp);
-	ret = DVDNTL_Shadow;
+	z->DVDNTL_Shadow = V;
 	break;
    //
    //
@@ -1601,156 +1572,145 @@ INLINE T SH7095::OnChipRegRead_INLINE(uint32 A)
    //
    case 0x80:
    case 0x90:
-	ret = DMACH[(A >> 4) & 1].SAR;
+	z->DMACH[(A >> 4) & 1].SAR = V;
 	break;
 
    case 0x84:
    case 0x94:
-	ret = DMACH[(A >> 4) & 1].DAR;
+	z->DMACH[(A >> 4) & 1].DAR = V;
 	break;
 
    case 0x88:
    case 0x98:
-	ret = DMACH[(A >> 4) & 1].TCR;
+	z->DMACH[(A >> 4) & 1].TCR = V & 0xFFFFFF;
 	break;
 
    case 0x8C:
    case 0x9C:
+	SH7095_DMA_Update(z, SH7095_mem_timestamp);
 	{
 	 const unsigned ch = (A >> 4) & 1;
 
-	 ret = DMACH[ch].CHCR;
-	 DMACH[ch].CHCRM = 0;
+	 z->DMACH[ch].CHCR = (V & ~2) | (z->DMACH[ch].CHCR & (V | z->DMACH[ch].CHCRM) & 2);
 	}
+	SH7095_DMA_RecalcRunning(z);
+	SH7095_DMA_StartSG(z);
+	SH7095_RecalcPendingIntPEX(z);
 	break;
 
    case 0xA0:
    case 0xA8:
-	ret = DMACH[(A >> 3) & 1].VCR;
+	z->DMACH[(A >> 3) & 1].VCR = V;
 	break;
 
    case 0xB0:
-	ret = DMAOR;
-	DMAORM = 0;
+	SH7095_DMA_Update(z, SH7095_mem_timestamp);
+	z->DMAOR = (V & 0x9) | (z->DMAOR & (V | z->DMAORM) & 0x6);
+	SH7095_DMA_RecalcRunning(z);
+	SH7095_DMA_StartSG(z);
 	break;
 
    //
-   // BSC registers
+   // z->BSC registers
    //
    case 0xE0:	// BCR1
-   case 0xE2:
-	ret = BSC.BCR1;
 	break;
 
    case 0xE4:	// BCR2
-   case 0xE6:
-	ret = BSC.BCR2;
 	break;
 
    case 0xE8:	// WCR
-   case 0xEA:
-	ret = BSC.WCR;
 	break;
 
    case 0xEC:	// MCR
-   case 0xEE:
-	ret = BSC.MCR;
 	break;
 
    case 0xF0:	// RTCSR
-   case 0xF2:
-	ret = BSC.RTCSR;
-	BSC.RTCSRM = BSC.RTCSR & 0x80;
-
 	break;
 
    case 0xF4:	// RTCNT
-   case 0xF6:
-	ret = BSC.RTCNT;
-
 	break;
 
-   case 0xF8:	// RTCOR
-   case 0xFA:
-	ret = BSC.RTCOR;
+   case 0xF8: // RTCOR
 	break;
   }
-
-  if(sizeof(T) == 1)
-   ret >>= ((A & 1) ^ 1) << 3;
-
-  return ret;
  }
  else
  {
-  const unsigned Am = (uint8)A;
-  const unsigned shift = ((sizeof(T) != 2) ? (((A & 1) ^ 1) << 3) : 0);
-  uint16 ret = 0;
+  unsigned mask = 0xFFFF;
+  unsigned shift = 0;
 
-  if(Am < 0x20)
-   MA_until = (MA_until + 11) &~ 1; // FIXME: not quite right. //3;
-  else if((Am >= 0x60 && Am < 0xA0) || Am >= 0xE0)
-   MA_until += 3;
-  else
-   MA_until += 1;
-
-  if(sizeof(T) == 4)
-   SetPEX(PEX_CPUADDR);
-
-  else switch(Am)
+  switch(A & 0xFF)
   {
    default:
 	break;
 
    //
-   // FRT registers.  Some weirdness with 16-bit reads duplicating the lower 8 bits in the upper 8-bits, but the upper 8-bits are masked
-   // with the last data written to the FRT area or something...not emulated here.
+   // Free-running timer registers.
    //
+   //
+   // TIER
    case 0x10:
-	ret = FRT.TIER | 1;
+	SH7095_FRT_WDT_Update(z);
+	//
+	z->FRT.TIER = V;
+	SH7095_RecalcPendingIntPEX(z);
 	break;
 
+   // FTCSR
    case 0x11:
-	FRT_WDT_Update();
+	SH7095_FRT_WDT_Update(z);
 	//
-	ret = FRT.FTCSR;
-	FRT.FTCSRM = 0x00;
+	z->FRT.FTCSR = (z->FRT.FTCSR & (z->FRT.FTCSRM | V) & 0x8E) | (V & 0x01);
+	SH7095_RecalcPendingIntPEX(z);
+	SH7095_FRT_CheckOCR(z);
 	break;
 
+   // FRCH
    case 0x12:
-	FRT_WDT_Update();
-	//
-	FRT.RW_Temp = FRT.FRC;
-	ret = FRT.FRC >> 8;
+	z->FRT.RW_Temp = V;
 	break;
 
+   // FRCL
    case 0x13:
-	ret = FRT.RW_Temp;
+	SH7095_FRT_WDT_Update(z);
+	//
+	z->FRT.FRC = (z->FRT.RW_Temp << 8) | (V & 0xFF);
+	SH7095_FRT_CheckOCR(z);
+	SH7095_FRT_WDT_Recalc_NET(z);
 	break;
 
+   // OCRA/B H
    case 0x14:
-	ret = FRT.OCR[(FRT.TOCR >> 4) & 1] >> 8;
+	z->FRT.RW_Temp = V;
 	break;
 
+   // OCRA/B L
    case 0x15:
-	ret = FRT.OCR[(FRT.TOCR >> 4) & 1] & 0xFF;
+	SH7095_FRT_WDT_Update(z);
+	//
+	z->FRT.OCR[(z->FRT.TOCR >> 4) & 1] = (z->FRT.RW_Temp << 8) | V;
+	SH7095_FRT_CheckOCR(z);
+	SH7095_FRT_WDT_Recalc_NET(z);
 	break;
 
+   // TCR
    case 0x16:
-	ret = FRT.TCR;
+	{
+	 SH7095_FRT_WDT_Update(z);
+	 //
+	 //const uint8_t old_TCR = z->FRT.TCR;
+ 	 z->FRT.TCR = V;
+	 //
+	 //
+	 //
+	 SH7095_FRT_WDT_Recalc_NET(z);
+	}
 	break;
 
+   // TOCR
    case 0x17:
-	ret = FRT.TOCR | 0xE0;
-	break;
-
-   case 0x18:
-	FRT.RW_Temp = FRT.FICR;
-	ret = FRT.FICR >> 8;
-	break;
-
-   case 0x19:
-	ret = FRT.RW_Temp;
+	z->FRT.TOCR = V & 0x1F;
 	break;
 
    //
@@ -1758,24 +1718,740 @@ INLINE T SH7095::OnChipRegRead_INLINE(uint32 A)
    //
    case 0x71:
    case 0x72:
-	ret = DMACH[(A & 1) ^ 1].DRCR;
+	z->DMACH[(A & 1) ^ 1].DRCR = V & 0x3;
 	break;
 
-
    //
-   // WDT registers
+   // z->WDT registers
    //
    case 0x80:
    case 0x88:
-	FRT_WDT_Update();
-	ret = WDT.WTCSR | 0x18;
-	WDT.WTCSRM = 0x00;
+	SH7095_FRT_WDT_Update(z);
+ if((V & 0xFF00) == 0x5A00)
+ {
+  if(z->WDT.WTCSR & 0x20)
+   z->WDT.WTCNT = V;
+ }
+ else if((V & 0xFF00) == 0xA500)
+ {
+  z->WDT.WTCSR = (z->WDT.WTCSR & (z->WDT.WTCSRM | V) & 0x80) | (V & 0x67);
+
+  if(z->WDT.WTCSR & 0x20)
+   z->SBYCR &= 0x7F;
+  else
+  {
+   z->WDT.WTCSR &= ~0x80;	// Seemingly undocumented...
+   z->WDT.WTCNT = 0;
+  }
+ }
+	z->WDT.RSTCSRM = 0;
+	SH7095_FRT_WDT_Recalc_NET(z);
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   case 0x82:
+   case 0x8A:
+	SH7095_FRT_WDT_Update(z);
+ if(V == 0xA500)
+ {
+  // Clear OVF bit
+  z->WDT.RSTCSR &= ~z->WDT.RSTCSRM;
+ }
+ else if((V & 0xFF00) == 0x5A00)
+ {
+  // Write RSTE and RSTS bits
+  z->WDT.RSTCSR = (z->WDT.RSTCSR & 0x80) | (V & 0x60);
+ }
+	z->WDT.RSTCSRM = 0;
+	break;
+
+   case 0x81:
+   case 0x83:
+   case 0x84:
+   case 0x85:
+   case 0x86:
+   case 0x87:
+   case 0x89:
+   case 0x8B:
+   case 0x8C:
+   case 0x8D:
+   case 0x8E:
+   case 0x8F:
+	z->WDT.RSTCSRM = 0;
+	break;
+
+   //
+   //
+   //
+   case 0x91:
+	z->SBYCR = V;
+
+	if(z->WDT.WTCSR & 0x20)
+	 z->SBYCR &= 0x7F;
+
+	break;
+
+   case 0x92:	// No 0x93...0x9F mirrors for writes.
+	SH7095_SetCCR(z, V);
+	break;
+   //
+   //
+   //
+   case 0x60:
+   case 0x61:
+	z->IPRB = (z->IPRB &~ mask) | ((V << shift) & mask & 0xFF00);
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   case 0x62:
+   case 0x63:
+	z->VCRA = (z->VCRA &~ mask) | ((V << shift) & mask & 0x7F7F);
+	break;
+
+   case 0x64:
+   case 0x65:
+	z->VCRB = (z->VCRB &~ mask) | ((V << shift) & mask & 0x7F7F);
+	break;
+
+   case 0x66:
+   case 0x67:
+	z->VCRC = (z->VCRC &~ mask) | ((V << shift) & mask & 0x7F7F);
+	break;
+
+   case 0x68:
+   case 0x69:
+	z->VCRD = (z->VCRD &~ mask) | ((V << shift) & mask & 0x7F00);
+	break;
+
+   case 0xE0:
+   case 0xE1:
+	z->ICR = (z->ICR &~ mask) | ((V << shift) & mask & 0x0101);
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   case 0xE2:
+   case 0xE3:
+	z->IPRA = (z->IPRA &~ mask) | ((V << shift) & mask & 0xFFF0);
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   case 0xE4:
+   case 0xE5:
+	z->VCRWDT = (z->VCRWDT &~ mask) | ((V << shift) & mask & 0x7F7F);
+	break;
+  }
+ }
+}
+
+static NO_INLINE MDFN_HOT void SH7095_OnChipRegWrite_u32(SH7095* z, uint32_t A, uint32_t V)
+{
+ if(A & 0x100)
+ {
+  A &= 0xFC;
+
+  switch(A)
+  {
+   default:
+	break;
+
+   //
+   // Division Unit registers
+   //
+   case 0x20:
+   case 0x00:
+	z->DVSR = V;
+	break;
+
+   case 0x24:
+   case 0x04:
+	z->DVDNT = V;
+	z->DVDNTL = V;
+	z->DVDNTH = (int32_t)V >> 31;
+	SH7095_DIVU_S32_S32(z);
+	break;
+
+   case 0x28:
+   case 0x08:
+	z->DVCR = V & 0x3;
+	break;
+
+   case 0x2C:
+   case 0x0C:
+	z->VCRDIV = V;
+	break;
+
+   case 0x30:
+   case 0x10:
+	z->DVDNTH = V;
+	break;
+
+   case 0x34:
+   case 0x14:
+	z->DVDNTL = V;
+	SH7095_DIVU_S64_S32(z);
+	break;
+
+   // ?
+   case 0x38:
+   case 0x18:
+	z->DVDNTH_Shadow = V;
+	break;
+
+   case 0x3C:
+   case 0x1C:
+	z->DVDNTL_Shadow = V;
+	break;
+   //
+   //
+   //
+
+   //
+   // DMA registers
+   //
+   case 0x80:
+   case 0x90:
+	z->DMACH[(A >> 4) & 1].SAR = V;
+	break;
+
+   case 0x84:
+   case 0x94:
+	z->DMACH[(A >> 4) & 1].DAR = V;
+	break;
+
+   case 0x88:
+   case 0x98:
+	z->DMACH[(A >> 4) & 1].TCR = V & 0xFFFFFF;
+	break;
+
+   case 0x8C:
+   case 0x9C:
+	SH7095_DMA_Update(z, SH7095_mem_timestamp);
+	{
+	 const unsigned ch = (A >> 4) & 1;
+
+	 z->DMACH[ch].CHCR = (V & ~2) | (z->DMACH[ch].CHCR & (V | z->DMACH[ch].CHCRM) & 2);
+	}
+	SH7095_DMA_RecalcRunning(z);
+	SH7095_DMA_StartSG(z);
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   case 0xA0:
+   case 0xA8:
+	z->DMACH[(A >> 3) & 1].VCR = V;
+	break;
+
+   case 0xB0:
+	SH7095_DMA_Update(z, SH7095_mem_timestamp);
+	z->DMAOR = (V & 0x9) | (z->DMAOR & (V | z->DMAORM) & 0x6);
+	SH7095_DMA_RecalcRunning(z);
+	SH7095_DMA_StartSG(z);
+	break;
+
+   //
+   // z->BSC registers
+   //
+   case 0xE0:	// BCR1
+	if((V & 0xFFFF0000) == 0xA55A0000)
+	{
+ 	 z->BSC.BCR1 = (z->BSC.BCR1 & 0x8000) | (V & 0x1FF7);
+	}
+	break;
+
+   case 0xE4:	// BCR2
+	if((V & 0xFFFF0000) == 0xA55A0000)
+	{
+ 	 z->BSC.BCR2 = V & 0xFC;
+	}
+	break;
+
+   case 0xE8:	// WCR
+	if((V & 0xFFFF0000) == 0xA55A0000)
+	{
+ 	 z->BSC.WCR = V & 0xFFFF;
+	}
+	break;
+
+   case 0xEC:	// MCR
+	if((V & 0xFFFF0000) == 0xA55A0000)
+	{
+ 	 z->BSC.MCR = V & 0xFEFC;
+	}
+	break;
+
+   case 0xF0:	// RTCSR
+	if((V & 0xFFFF0000) == 0xA55A0000)
+	{
+ 	 z->BSC.RTCSR = (V & 0x78) | (z->BSC.RTCSR & 0x80 & (V | ~z->BSC.RTCSRM));
+	}
+	break;
+
+   case 0xF4:	// RTCNT
+	if((V & 0xFFFF0000) == 0xA55A0000)
+	{
+ 	 z->BSC.RTCNT = V & 0xFF;
+	}
+	break;
+
+   case 0xF8: // RTCOR
+	if((V & 0xFFFF0000) == 0xA55A0000)
+	{
+ 	 z->BSC.RTCOR = V & 0xFF;
+	}
+	break;
+  }
+ }
+ else
+ {
+  unsigned mask = 0xFFFF;
+  unsigned shift = 0;
+
+  shift = ((A & 1) ^ 1) << 3;
+  mask = 0xFF << shift;
+
+  shift ^= 8;
+
+  SH7095_SetPEX(z, SH7095_PEX_CPUADDR);
+
+  switch(A & 0xFF)
+  {
+   default:
+	break;
+
+   //
+   // Free-running timer registers.
+   //
+   //
+   // TIER
+   case 0x10:
+	SH7095_FRT_WDT_Update(z);
+	//
+	z->FRT.TIER = V;
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   // FTCSR
+   case 0x11:
+	SH7095_FRT_WDT_Update(z);
+	//
+	z->FRT.FTCSR = (z->FRT.FTCSR & (z->FRT.FTCSRM | V) & 0x8E) | (V & 0x01);
+	SH7095_RecalcPendingIntPEX(z);
+	SH7095_FRT_CheckOCR(z);
+	break;
+
+   // FRCH
+   case 0x12:
+	z->FRT.RW_Temp = V;
+	break;
+
+   // FRCL
+   case 0x13:
+	SH7095_FRT_WDT_Update(z);
+	//
+	z->FRT.FRC = (z->FRT.RW_Temp << 8) | (V & 0xFF);
+	SH7095_FRT_CheckOCR(z);
+	SH7095_FRT_WDT_Recalc_NET(z);
+	break;
+
+   // OCRA/B H
+   case 0x14:
+	z->FRT.RW_Temp = V;
+	break;
+
+   // OCRA/B L
+   case 0x15:
+	SH7095_FRT_WDT_Update(z);
+	//
+	z->FRT.OCR[(z->FRT.TOCR >> 4) & 1] = (z->FRT.RW_Temp << 8) | V;
+	SH7095_FRT_CheckOCR(z);
+	SH7095_FRT_WDT_Recalc_NET(z);
+	break;
+
+   // TCR
+   case 0x16:
+	{
+	 SH7095_FRT_WDT_Update(z);
+	 //
+	 //const uint8_t old_TCR = z->FRT.TCR;
+ 	 z->FRT.TCR = V;
+	 //
+	 //
+	 //
+	 SH7095_FRT_WDT_Recalc_NET(z);
+	}
+	break;
+
+   // TOCR
+   case 0x17:
+	z->FRT.TOCR = V & 0x1F;
+	break;
+
+   //
+   //
+   //
+   case 0x71:
+   case 0x72:
+	z->DMACH[(A & 1) ^ 1].DRCR = V & 0x3;
+	break;
+
+   //
+   // z->WDT registers
+   //
+   case 0x80:
+   case 0x88:
+	SH7095_FRT_WDT_Update(z);
+	z->WDT.RSTCSRM = 0;
+	SH7095_FRT_WDT_Recalc_NET(z);
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   case 0x82:
+   case 0x8A:
+	SH7095_FRT_WDT_Update(z);
+	z->WDT.RSTCSRM = 0;
+	break;
+
+   case 0x81:
+   case 0x83:
+   case 0x84:
+   case 0x85:
+   case 0x86:
+   case 0x87:
+   case 0x89:
+   case 0x8B:
+   case 0x8C:
+   case 0x8D:
+   case 0x8E:
+   case 0x8F:
+	z->WDT.RSTCSRM = 0;
+	break;
+
+   //
+   //
+   //
+   case 0x91:
+	z->SBYCR = V;
+
+	if(z->WDT.WTCSR & 0x20)
+	 z->SBYCR &= 0x7F;
+
+	break;
+
+   case 0x92:	// No 0x93...0x9F mirrors for writes.
+	SH7095_SetCCR(z, V);
+	break;
+   //
+   //
+   //
+   case 0x60:
+   case 0x61:
+	z->IPRB = (z->IPRB &~ mask) | ((V << shift) & mask & 0xFF00);
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   case 0x62:
+   case 0x63:
+	z->VCRA = (z->VCRA &~ mask) | ((V << shift) & mask & 0x7F7F);
+	break;
+
+   case 0x64:
+   case 0x65:
+	z->VCRB = (z->VCRB &~ mask) | ((V << shift) & mask & 0x7F7F);
+	break;
+
+   case 0x66:
+   case 0x67:
+	z->VCRC = (z->VCRC &~ mask) | ((V << shift) & mask & 0x7F7F);
+	break;
+
+   case 0x68:
+   case 0x69:
+	z->VCRD = (z->VCRD &~ mask) | ((V << shift) & mask & 0x7F00);
+	break;
+
+   case 0xE0:
+   case 0xE1:
+	z->ICR = (z->ICR &~ mask) | ((V << shift) & mask & 0x0101);
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   case 0xE2:
+   case 0xE3:
+	z->IPRA = (z->IPRA &~ mask) | ((V << shift) & mask & 0xFFF0);
+	SH7095_RecalcPendingIntPEX(z);
+	break;
+
+   case 0xE4:
+   case 0xE5:
+	z->VCRWDT = (z->VCRWDT &~ mask) | ((V << shift) & mask & 0x7F7F);
+	break;
+  }
+ }
+}
+
+static INLINE uint8_t SH7095_OnChipRegRead_INLINE_u8(SH7095* z, uint32_t A)
+{
+ if(A & 0x100)
+ {
+  uint32_t ret = 0;
+
+  z->MA_until++;
+
+  A &= 0xFC;
+
+  SH7095_SetPEX(z, SH7095_PEX_CPUADDR);
+
+  switch(A)
+  {
+   default:
+	break;
+
+   //
+   // Division Unit registers
+   //
+   case 0x20:
+   case 0x22:
+   case 0x00:
+   case 0x02:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVSR;
+	break;
+
+   case 0x24:
+   case 0x26:
+   case 0x04:
+   case 0x06:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNT;
+	break;
+
+   case 0x28:
+   case 0x2A:
+   case 0x08:
+   case 0x0A:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVCR;
+	break;
+
+   case 0x2C:
+   case 0x2E:
+   case 0x0C:
+   case 0x0E:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->VCRDIV;
+	break;
+
+   case 0x30:
+   case 0x32:
+   case 0x10:
+   case 0x12:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTH;
+	break;
+
+   case 0x34:
+   case 0x36:
+   case 0x14:
+   case 0x16:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTL;
+	break;
+
+   // ?
+   case 0x38:
+   case 0x3A:
+   case 0x18:
+   case 0x1A:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTH_Shadow;
+	break;
+
+   case 0x3C:
+   case 0x3E:
+   case 0x1C:
+   case 0x1E:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTL_Shadow;
+	break;
+   //
+   //
+   //
+
+   //
+   // DMA registers
+   //
+   case 0x80:
+   case 0x90:
+	ret = z->DMACH[(A >> 4) & 1].SAR;
+	break;
+
+   case 0x84:
+   case 0x94:
+	ret = z->DMACH[(A >> 4) & 1].DAR;
+	break;
+
+   case 0x88:
+   case 0x98:
+	ret = z->DMACH[(A >> 4) & 1].TCR;
+	break;
+
+   case 0x8C:
+   case 0x9C:
+	{
+	 const unsigned ch = (A >> 4) & 1;
+
+	 ret = z->DMACH[ch].CHCR;
+	 z->DMACH[ch].CHCRM = 0;
+	}
+	break;
+
+   case 0xA0:
+   case 0xA8:
+	ret = z->DMACH[(A >> 3) & 1].VCR;
+	break;
+
+   case 0xB0:
+	ret = z->DMAOR;
+	z->DMAORM = 0;
+	break;
+
+   //
+   // z->BSC registers
+   //
+   case 0xE0:	// BCR1
+   case 0xE2:
+	ret = z->BSC.BCR1;
+	break;
+
+   case 0xE4:	// BCR2
+   case 0xE6:
+	ret = z->BSC.BCR2;
+	break;
+
+   case 0xE8:	// WCR
+   case 0xEA:
+	ret = z->BSC.WCR;
+	break;
+
+   case 0xEC:	// MCR
+   case 0xEE:
+	ret = z->BSC.MCR;
+	break;
+
+   case 0xF0:	// RTCSR
+   case 0xF2:
+	ret = z->BSC.RTCSR;
+	z->BSC.RTCSRM = z->BSC.RTCSR & 0x80;
+
+	break;
+
+   case 0xF4:	// RTCNT
+   case 0xF6:
+	ret = z->BSC.RTCNT;
+
+	break;
+
+   case 0xF8:	// RTCOR
+   case 0xFA:
+	ret = z->BSC.RTCOR;
+	break;
+  }
+
+  ret >>= ((A & 1) ^ 1) << 3;
+
+  return ret;
+ }
+ else
+ {
+  const unsigned Am = (uint8_t)A;
+  const unsigned shift = ((((A & 1) ^ 1) << 3));
+  uint16_t ret = 0;
+
+  if(Am < 0x20)
+   z->MA_until = (z->MA_until + 11) &~ 1; // FIXME: not quite right. //3;
+  else if((Am >= 0x60 && Am < 0xA0) || Am >= 0xE0)
+   z->MA_until += 3;
+  else
+   z->MA_until += 1;
+
+  switch(Am)
+  {
+   default:
+	break;
+
+   //
+   // z->FRT registers.  Some weirdness with 16-bit reads duplicating the lower 8 bits in the upper 8-bits, but the upper 8-bits are masked
+   // with the last data written to the z->FRT area or something...not emulated here.
+   //
+   case 0x10:
+	ret = z->FRT.TIER | 1;
+	break;
+
+   case 0x11:
+	SH7095_FRT_WDT_Update(z);
+	//
+	ret = z->FRT.FTCSR;
+	z->FRT.FTCSRM = 0x00;
+	break;
+
+   case 0x12:
+	SH7095_FRT_WDT_Update(z);
+	//
+	z->FRT.RW_Temp = z->FRT.FRC;
+	ret = z->FRT.FRC >> 8;
+	break;
+
+   case 0x13:
+	ret = z->FRT.RW_Temp;
+	break;
+
+   case 0x14:
+	ret = z->FRT.OCR[(z->FRT.TOCR >> 4) & 1] >> 8;
+	break;
+
+   case 0x15:
+	ret = z->FRT.OCR[(z->FRT.TOCR >> 4) & 1] & 0xFF;
+	break;
+
+   case 0x16:
+	ret = z->FRT.TCR;
+	break;
+
+   case 0x17:
+	ret = z->FRT.TOCR | 0xE0;
+	break;
+
+   case 0x18:
+	z->FRT.RW_Temp = z->FRT.FICR;
+	ret = z->FRT.FICR >> 8;
+	break;
+
+   case 0x19:
+	ret = z->FRT.RW_Temp;
+	break;
+
+   //
+   //
+   //
+   case 0x71:
+   case 0x72:
+	ret = z->DMACH[(A & 1) ^ 1].DRCR;
+	break;
+
+   //
+   // z->WDT registers
+   //
+   case 0x80:
+   case 0x88:
+	SH7095_FRT_WDT_Update(z);
+	ret = z->WDT.WTCSR | 0x18;
+	z->WDT.WTCSRM = 0x00;
 	break;
 
    case 0x81:
    case 0x89:
-	FRT_WDT_Update();
-	ret = WDT.WTCNT;
+	SH7095_FRT_WDT_Update(z);
+	ret = z->WDT.WTCNT;
 	break;
 
    case 0x82:
@@ -1791,12 +2467,12 @@ INLINE T SH7095::OnChipRegRead_INLINE(uint32 A)
 
    case 0x83:
    case 0x8B:
-	FRT_WDT_Update();
-	ret = WDT.RSTCSR | 0x1F;
-	WDT.RSTCSRM = (WDT.RSTCSR & 0x80);
+	SH7095_FRT_WDT_Update(z);
+	ret = z->WDT.RSTCSR | 0x1F;
+	z->WDT.RSTCSRM = (z->WDT.RSTCSR & 0x80);
 	break;
 
-   // FIXME: WDT open bus of a sort.
+   // FIXME: z->WDT open bus of a sort.
    // case 0x84:
    // case 0x8C:
 
@@ -1805,41 +2481,41 @@ INLINE T SH7095::OnChipRegRead_INLINE(uint32 A)
    //
 
    case 0x91:
-	ret = SBYCR;
+	ret = z->SBYCR;
 	break;
 
    case 0x92 ... 0x9F:
 	//
 	// TODO: Emulate jankiness of 16-bit reads from mirror addresses.
 	//
-	ret = CCR | (CCR << 8);
+	ret = z->CCR | (z->CCR << 8);
 	break;
    //
    //
    //
    case 0x60:
    case 0x61:
-	ret = IPRB >> shift;
+	ret = z->IPRB >> shift;
 	break;
 
    case 0x62:
    case 0x63:
-	ret = VCRA >> shift;
+	ret = z->VCRA >> shift;
 	break;
 
    case 0x64:
    case 0x65:
-	ret = VCRB >> shift;
+	ret = z->VCRB >> shift;
 	break;
 
    case 0x66:
    case 0x67:
-	ret = VCRC >> shift;
+	ret = z->VCRC >> shift;
 	break;
 
    case 0x68:
    case 0x69:
-	ret = VCRD >> shift;
+	ret = z->VCRD >> shift;
 	break;
 
    case 0x6A: case 0x6B: case 0x6C: case 0x6D: case 0x6E: case 0x6F:
@@ -1848,17 +2524,17 @@ INLINE T SH7095::OnChipRegRead_INLINE(uint32 A)
 
    case 0xE0:
    case 0xE1:
-	ret = (ICR | (NMILevel << 15)) >> shift;
+	ret = (z->ICR | (z->NMILevel << 15)) >> shift;
 	break;
 
    case 0xE2:
    case 0xE3:
-	ret = IPRA >> shift;
+	ret = z->IPRA >> shift;
 	break;
 
    case 0xE4:
    case 0xE5:
-	ret = VCRWDT >> shift;
+	ret = z->VCRWDT >> shift;
 	break;
 
    case 0xE6: case 0xE7:
@@ -1873,57 +2549,581 @@ INLINE T SH7095::OnChipRegRead_INLINE(uint32 A)
  }
 }
 
-template<typename T>
-void INLINE SH7095::BSC_BusWrite(uint32 A, T V, const bool BurstHax, int32* SH2DMAHax)
+static INLINE uint16_t SH7095_OnChipRegRead_INLINE_u16(SH7095* z, uint32_t A)
 {
- uint32 DB = SH7095_DB;
+ if(A & 0x100)
+ {
+  uint32_t ret = 0;
+
+  z->MA_until++;
+
+  A &= 0xFE;
+
+  switch(A)
+  {
+   default:
+	break;
+
+   //
+   // Division Unit registers
+   //
+   case 0x20:
+   case 0x22:
+   case 0x00:
+   case 0x02:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVSR;
+	break;
+
+   case 0x24:
+   case 0x26:
+   case 0x04:
+   case 0x06:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNT;
+	break;
+
+   case 0x28:
+   case 0x2A:
+   case 0x08:
+   case 0x0A:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVCR;
+	break;
+
+   case 0x2C:
+   case 0x2E:
+   case 0x0C:
+   case 0x0E:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->VCRDIV;
+	break;
+
+   case 0x30:
+   case 0x32:
+   case 0x10:
+   case 0x12:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTH;
+	break;
+
+   case 0x34:
+   case 0x36:
+   case 0x14:
+   case 0x16:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTL;
+	break;
+
+   // ?
+   case 0x38:
+   case 0x3A:
+   case 0x18:
+   case 0x1A:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTH_Shadow;
+	break;
+
+   case 0x3C:
+   case 0x3E:
+   case 0x1C:
+   case 0x1E:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTL_Shadow;
+	break;
+   //
+   //
+   //
+
+   //
+   // DMA registers
+   //
+   case 0x80:
+   case 0x90:
+	ret = z->DMACH[(A >> 4) & 1].SAR;
+	break;
+
+   case 0x84:
+   case 0x94:
+	ret = z->DMACH[(A >> 4) & 1].DAR;
+	break;
+
+   case 0x88:
+   case 0x98:
+	ret = z->DMACH[(A >> 4) & 1].TCR;
+	break;
+
+   case 0x8C:
+   case 0x9C:
+	{
+	 const unsigned ch = (A >> 4) & 1;
+
+	 ret = z->DMACH[ch].CHCR;
+	 z->DMACH[ch].CHCRM = 0;
+	}
+	break;
+
+   case 0xA0:
+   case 0xA8:
+	ret = z->DMACH[(A >> 3) & 1].VCR;
+	break;
+
+   case 0xB0:
+	ret = z->DMAOR;
+	z->DMAORM = 0;
+	break;
+
+   //
+   // z->BSC registers
+   //
+   case 0xE0:	// BCR1
+   case 0xE2:
+	ret = z->BSC.BCR1;
+	break;
+
+   case 0xE4:	// BCR2
+   case 0xE6:
+	ret = z->BSC.BCR2;
+	break;
+
+   case 0xE8:	// WCR
+   case 0xEA:
+	ret = z->BSC.WCR;
+	break;
+
+   case 0xEC:	// MCR
+   case 0xEE:
+	ret = z->BSC.MCR;
+	break;
+
+   case 0xF0:	// RTCSR
+   case 0xF2:
+	ret = z->BSC.RTCSR;
+	z->BSC.RTCSRM = z->BSC.RTCSR & 0x80;
+
+	break;
+
+   case 0xF4:	// RTCNT
+   case 0xF6:
+	ret = z->BSC.RTCNT;
+
+	break;
+
+   case 0xF8:	// RTCOR
+   case 0xFA:
+	ret = z->BSC.RTCOR;
+	break;
+  }
+
+  return ret;
+ }
+ else
+ {
+  const unsigned Am = (uint8_t)A;
+  const unsigned shift = (0);
+  uint16_t ret = 0;
+
+  if(Am < 0x20)
+   z->MA_until = (z->MA_until + 11) &~ 1; // FIXME: not quite right. //3;
+  else if((Am >= 0x60 && Am < 0xA0) || Am >= 0xE0)
+   z->MA_until += 3;
+  else
+   z->MA_until += 1;
+
+  switch(Am)
+  {
+   default:
+	break;
+
+   //
+   // z->FRT registers.  Some weirdness with 16-bit reads duplicating the lower 8 bits in the upper 8-bits, but the upper 8-bits are masked
+   // with the last data written to the z->FRT area or something...not emulated here.
+   //
+   case 0x10:
+	ret = z->FRT.TIER | 1;
+	break;
+
+   case 0x11:
+	SH7095_FRT_WDT_Update(z);
+	//
+	ret = z->FRT.FTCSR;
+	z->FRT.FTCSRM = 0x00;
+	break;
+
+   case 0x12:
+	SH7095_FRT_WDT_Update(z);
+	//
+	z->FRT.RW_Temp = z->FRT.FRC;
+	ret = z->FRT.FRC >> 8;
+	break;
+
+   case 0x13:
+	ret = z->FRT.RW_Temp;
+	break;
+
+   case 0x14:
+	ret = z->FRT.OCR[(z->FRT.TOCR >> 4) & 1] >> 8;
+	break;
+
+   case 0x15:
+	ret = z->FRT.OCR[(z->FRT.TOCR >> 4) & 1] & 0xFF;
+	break;
+
+   case 0x16:
+	ret = z->FRT.TCR;
+	break;
+
+   case 0x17:
+	ret = z->FRT.TOCR | 0xE0;
+	break;
+
+   case 0x18:
+	z->FRT.RW_Temp = z->FRT.FICR;
+	ret = z->FRT.FICR >> 8;
+	break;
+
+   case 0x19:
+	ret = z->FRT.RW_Temp;
+	break;
+
+   //
+   //
+   //
+   case 0x71:
+   case 0x72:
+	ret = z->DMACH[(A & 1) ^ 1].DRCR;
+	break;
+
+   //
+   // z->WDT registers
+   //
+   case 0x80:
+   case 0x88:
+	SH7095_FRT_WDT_Update(z);
+	ret = z->WDT.WTCSR | 0x18;
+	z->WDT.WTCSRM = 0x00;
+	break;
+
+   case 0x81:
+   case 0x89:
+	SH7095_FRT_WDT_Update(z);
+	ret = z->WDT.WTCNT;
+	break;
+
+   case 0x82:
+   case 0x85:
+   case 0x86:
+   case 0x87:
+   case 0x8A:
+   case 0x8D:
+   case 0x8E:
+   case 0x8F:
+	ret = 0xFF;
+	break;
+
+   case 0x83:
+   case 0x8B:
+	SH7095_FRT_WDT_Update(z);
+	ret = z->WDT.RSTCSR | 0x1F;
+	z->WDT.RSTCSRM = (z->WDT.RSTCSR & 0x80);
+	break;
+
+   // FIXME: z->WDT open bus of a sort.
+   // case 0x84:
+   // case 0x8C:
+
+   //
+   //
+   //
+
+   case 0x91:
+	ret = z->SBYCR;
+	break;
+
+   case 0x92 ... 0x9F:
+	//
+	// TODO: Emulate jankiness of 16-bit reads from mirror addresses.
+	//
+	ret = z->CCR | (z->CCR << 8);
+	break;
+   //
+   //
+   //
+   case 0x60:
+   case 0x61:
+	ret = z->IPRB >> shift;
+	break;
+
+   case 0x62:
+   case 0x63:
+	ret = z->VCRA >> shift;
+	break;
+
+   case 0x64:
+   case 0x65:
+	ret = z->VCRB >> shift;
+	break;
+
+   case 0x66:
+   case 0x67:
+	ret = z->VCRC >> shift;
+	break;
+
+   case 0x68:
+   case 0x69:
+	ret = z->VCRD >> shift;
+	break;
+
+   case 0x6A: case 0x6B: case 0x6C: case 0x6D: case 0x6E: case 0x6F:
+	ret = 0xFFFF >> shift;
+	break;
+
+   case 0xE0:
+   case 0xE1:
+	ret = (z->ICR | (z->NMILevel << 15)) >> shift;
+	break;
+
+   case 0xE2:
+   case 0xE3:
+	ret = z->IPRA >> shift;
+	break;
+
+   case 0xE4:
+   case 0xE5:
+	ret = z->VCRWDT >> shift;
+	break;
+
+   case 0xE6: case 0xE7:
+   case 0xE8: case 0xE9: case 0xEA: case 0xEB: case 0xEC: case 0xED: case 0xEE: case 0xEF:
+   case 0xF0: case 0xF1: case 0xF2: case 0xF3: case 0xF4: case 0xF5: case 0xF6: case 0xF7:
+   case 0xF8: case 0xF9: case 0xFA: case 0xFB: case 0xFC: case 0xFD: case 0xFE: case 0xFF:
+	ret = 0xFFFF >> shift;
+	break;
+  }
+
+  return ret;
+ }
+}
+
+static INLINE uint32_t SH7095_OnChipRegRead_INLINE_u32(SH7095* z, uint32_t A)
+{
+ if(A & 0x100)
+ {
+  uint32_t ret = 0;
+
+  z->MA_until++;
+
+  A &= 0xFC;
+
+  switch(A)
+  {
+   default:
+	break;
+
+   //
+   // Division Unit registers
+   //
+   case 0x20:
+   case 0x22:
+   case 0x00:
+   case 0x02:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVSR;
+	break;
+
+   case 0x24:
+   case 0x26:
+   case 0x04:
+   case 0x06:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNT;
+	break;
+
+   case 0x28:
+   case 0x2A:
+   case 0x08:
+   case 0x0A:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVCR;
+	break;
+
+   case 0x2C:
+   case 0x2E:
+   case 0x0C:
+   case 0x0E:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->VCRDIV;
+	break;
+
+   case 0x30:
+   case 0x32:
+   case 0x10:
+   case 0x12:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTH;
+	break;
+
+   case 0x34:
+   case 0x36:
+   case 0x14:
+   case 0x16:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTL;
+	break;
+
+   // ?
+   case 0x38:
+   case 0x3A:
+   case 0x18:
+   case 0x1A:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTH_Shadow;
+	break;
+
+   case 0x3C:
+   case 0x3E:
+   case 0x1C:
+   case 0x1E:
+	if((z->divide_finish_timestamp) > z->MA_until) z->MA_until = (z->divide_finish_timestamp);
+	ret = z->DVDNTL_Shadow;
+	break;
+   //
+   //
+   //
+
+   //
+   // DMA registers
+   //
+   case 0x80:
+   case 0x90:
+	ret = z->DMACH[(A >> 4) & 1].SAR;
+	break;
+
+   case 0x84:
+   case 0x94:
+	ret = z->DMACH[(A >> 4) & 1].DAR;
+	break;
+
+   case 0x88:
+   case 0x98:
+	ret = z->DMACH[(A >> 4) & 1].TCR;
+	break;
+
+   case 0x8C:
+   case 0x9C:
+	{
+	 const unsigned ch = (A >> 4) & 1;
+
+	 ret = z->DMACH[ch].CHCR;
+	 z->DMACH[ch].CHCRM = 0;
+	}
+	break;
+
+   case 0xA0:
+   case 0xA8:
+	ret = z->DMACH[(A >> 3) & 1].VCR;
+	break;
+
+   case 0xB0:
+	ret = z->DMAOR;
+	z->DMAORM = 0;
+	break;
+
+   //
+   // z->BSC registers
+   //
+   case 0xE0:	// BCR1
+   case 0xE2:
+	ret = z->BSC.BCR1;
+	break;
+
+   case 0xE4:	// BCR2
+   case 0xE6:
+	ret = z->BSC.BCR2;
+	break;
+
+   case 0xE8:	// WCR
+   case 0xEA:
+	ret = z->BSC.WCR;
+	break;
+
+   case 0xEC:	// MCR
+   case 0xEE:
+	ret = z->BSC.MCR;
+	break;
+
+   case 0xF0:	// RTCSR
+   case 0xF2:
+	ret = z->BSC.RTCSR;
+	z->BSC.RTCSRM = z->BSC.RTCSR & 0x80;
+
+	break;
+
+   case 0xF4:	// RTCNT
+   case 0xF6:
+	ret = z->BSC.RTCNT;
+
+	break;
+
+   case 0xF8:	// RTCOR
+   case 0xFA:
+	ret = z->BSC.RTCOR;
+	break;
+  }
+
+  return ret;
+ }
+ else
+ {
+  const unsigned Am = (uint8_t)A;
+  uint16_t ret = 0;
+
+  if(Am < 0x20)
+   z->MA_until = (z->MA_until + 11) &~ 1; // FIXME: not quite right. //3;
+  else if((Am >= 0x60 && Am < 0xA0) || Am >= 0xE0)
+   z->MA_until += 3;
+  else
+   z->MA_until += 1;
+
+  SH7095_SetPEX(z, SH7095_PEX_CPUADDR);
+
+  return ret;
+ }
+}
+
+static INLINE void SH7095_BSC_BusWrite_u8(SH7095* z, uint32_t A, uint8_t V, const bool BurstHax, int32_t* SH2DMAHax)
+{
+ uint32_t DB = SH7095_DB;
 
  if(!BurstHax)
-  SH7095_mem_timestamp += (SH7095_mem_timestamp == BSC.last_mem_time) & BSC.last_mem_type;
+  SH7095_mem_timestamp += (SH7095_mem_timestamp == z->BSC.last_mem_time) & z->BSC.last_mem_type;
 
  if(A < 0x02000000)	// CS0, configured as 16-bit
  {
-  if(sizeof(T) == 4)
-  {
-   // TODO/FIXME: Don't allow DMA transfers to occur between the two 16-bit accesses.
-   //if(!SH2DMAHax)
-   // SH7095_BusLock++;
+  /* sizeof(uint8_t) == 1: shift = ((A & 1) ^ 1) << 3,  mask = 0xFF << shift */
+  const uint32_t shift = ((A & 1) ^ 1) << 3;
+  const uint32_t mask = 0xFFu << shift;
 
-   DB = (DB & 0xFFFF0000) | (V >> 16);
-   BusRW_DB_CS0<uint16, true>(A, DB, BurstHax, SH2DMAHax);
-
-   DB = (DB & 0xFFFF0000) | (uint16)V;
-   BusRW_DB_CS0<uint16, true>(A | 2, DB, BurstHax, SH2DMAHax);
-
-   //if(!SH2DMAHax)
-   // SH7095_BusLock--;
-  }
-  else
-  {
-   const uint32 shift = ((A & 1) ^ (2 - sizeof(T))) << 3;
-   const uint32 mask = (0xFFFF >> ((2 - sizeof(T)) * 8)) << shift;
-
-   DB = (DB & ~mask) | (V << shift);
-   BusRW_DB_CS0<T, true>(A, DB, BurstHax, SH2DMAHax);
-  }
+  DB = (DB & ~mask) | ((uint32_t)V << shift);
+  BusRW_DB_CS0_u8_W1(A, &DB, SH2DMAHax);
  }
  else if(A >= 0x06000000)	// CS3; 32-bit
  {
-  const uint32 shift = ((A & 3) ^ (4 - sizeof(T))) << 3;
-  const uint32 mask = (0xFFFFFFFF >> ((4 - sizeof(T)) * 8)) << shift;
+  const uint32_t shift = ((A & 3) ^ 3) << 3;
+  const uint32_t mask = 0xFFu << shift;
 
-  DB = (DB & ~mask) | (V << shift);
-  BusRW_DB_CS3<T, true>(A, DB, BurstHax, SH2DMAHax);
+  DB = (DB & ~mask) | ((uint32_t)V << shift);
+  BusRW_DB_CS3_u8_W1(A, &DB);
 
   if(!BurstHax)
   {
    if(!SH2DMAHax)
    {
-    if(SH7095_mem_timestamp < BSC.sdram_finish_time)
-     SH7095_mem_timestamp = BSC.sdram_finish_time;
+    if(SH7095_mem_timestamp < z->BSC.sdram_finish_time)
+     SH7095_mem_timestamp = z->BSC.sdram_finish_time;
 
     SH7095_mem_timestamp += 2;
-    BSC.sdram_finish_time = SH7095_mem_timestamp + 2;
+    z->BSC.sdram_finish_time = SH7095_mem_timestamp + 2;
    }
    else
     *SH2DMAHax += 3;
@@ -1931,72 +3131,162 @@ void INLINE SH7095::BSC_BusWrite(uint32 A, T V, const bool BurstHax, int32* SH2D
  }
  else	// CS1, CS2; 32-bit
  {
-  const uint32 shift = ((A & 3) ^ (4 - sizeof(T))) << 3;
-  const uint32 mask = (0xFFFFFFFF >> ((4 - sizeof(T)) * 8)) << shift;
+  const uint32_t shift = ((A & 3) ^ 3) << 3;
+  const uint32_t mask = 0xFFu << shift;
 
-  DB = (DB & ~mask) | (V << shift);
-  BusRW_DB_CS12<T, true>(A, DB, BurstHax, SH2DMAHax);
+  DB = (DB & ~mask) | ((uint32_t)V << shift);
+  BusRW_DB_CS12_u8_W1(A, &DB, SH2DMAHax);
  }
 
  SH7095_DB = DB;
 
  if(!BurstHax)
  {
-  BSC.last_mem_addr = A;
-  BSC.last_mem_type = 0;
-  BSC.last_mem_time = SH7095_mem_timestamp;
+  z->BSC.last_mem_addr = A;
+  z->BSC.last_mem_type = 0;
+  z->BSC.last_mem_time = SH7095_mem_timestamp;
  }
 }
 
-template<typename T>
-T INLINE SH7095::BSC_BusRead(uint32 A, const bool BurstHax, int32* SH2DMAHax)
+static INLINE void SH7095_BSC_BusWrite_u16(SH7095* z, uint32_t A, uint16_t V, const bool BurstHax, int32_t* SH2DMAHax)
 {
- //
- //
- //
- uint32 DB = SH7095_DB;
- T ret;
+ uint32_t DB = SH7095_DB;
 
  if(!BurstHax)
-  SH7095_mem_timestamp += (SH7095_mem_timestamp == BSC.last_mem_time) & (bool)((BSC.last_mem_addr ^ A) & 0x06000000);
+  SH7095_mem_timestamp += (SH7095_mem_timestamp == z->BSC.last_mem_time) & z->BSC.last_mem_type;
 
  if(A < 0x02000000)	// CS0, configured as 16-bit
  {
-  if(sizeof(T) == 4)
-  {
-   // TODO/FIXME: Don't allow DMA transfers to occur between the two 16-bit accesses.
-   //if(!SH2DMAHax)
-   // SH7095_BusLock++;
+  /* sizeof(uint16_t) == 2: shift = ((A & 1) ^ 0) << 3,  mask = 0xFFFF << shift */
+  const uint32_t shift = (A & 1) << 3;
+  const uint32_t mask = 0xFFFFu << shift;
 
-   BusRW_DB_CS0<uint16, false>(A, DB, BurstHax, SH2DMAHax);
-   ret = DB << 16;
-
-   BusRW_DB_CS0<uint16, false>(A | 2, DB, BurstHax, SH2DMAHax);
-   ret |= (uint16)DB;
-
-   //if(!SH2DMAHax)
-   // SH7095_BusLock--;
-  }
-  else
-  {
-   BusRW_DB_CS0<T, false>(A, DB, BurstHax, SH2DMAHax);
-   ret = DB >> (((A & 1) ^ (2 - sizeof(T))) << 3);
-  }
+  DB = (DB & ~mask) | ((uint32_t)V << shift);
+  BusRW_DB_CS0_u16_W1(A, &DB, SH2DMAHax);
  }
  else if(A >= 0x06000000)	// CS3; 32-bit
  {
-  BusRW_DB_CS3<T, false>(A, DB, BurstHax, SH2DMAHax);
-  ret = DB >> (((A & 3) ^ (4 - sizeof(T))) << 3);
+  const uint32_t shift = ((A & 3) ^ 2) << 3;
+  const uint32_t mask = 0xFFFFu << shift;
 
-  // SDRAM leaves data bus in a weird state after read...
-  // DB = 0;
+  DB = (DB & ~mask) | ((uint32_t)V << shift);
+  BusRW_DB_CS3_u16_W1(A, &DB);
 
   if(!BurstHax)
   {
    if(!SH2DMAHax)
    {
-    if(SH7095_mem_timestamp < BSC.sdram_finish_time)
-     SH7095_mem_timestamp = BSC.sdram_finish_time;
+    if(SH7095_mem_timestamp < z->BSC.sdram_finish_time)
+     SH7095_mem_timestamp = z->BSC.sdram_finish_time;
+
+    SH7095_mem_timestamp += 2;
+    z->BSC.sdram_finish_time = SH7095_mem_timestamp + 2;
+   }
+   else
+    *SH2DMAHax += 3;
+  }
+ }
+ else	// CS1, CS2; 32-bit
+ {
+  const uint32_t shift = ((A & 3) ^ 2) << 3;
+  const uint32_t mask = 0xFFFFu << shift;
+
+  DB = (DB & ~mask) | ((uint32_t)V << shift);
+  BusRW_DB_CS12_u16_W1(A, &DB, SH2DMAHax);
+ }
+
+ SH7095_DB = DB;
+
+ if(!BurstHax)
+ {
+  z->BSC.last_mem_addr = A;
+  z->BSC.last_mem_type = 0;
+  z->BSC.last_mem_time = SH7095_mem_timestamp;
+ }
+}
+
+static INLINE void SH7095_BSC_BusWrite_u32(SH7095* z, uint32_t A, uint32_t V, const bool BurstHax, int32_t* SH2DMAHax)
+{
+ uint32_t DB = SH7095_DB;
+
+ if(!BurstHax)
+  SH7095_mem_timestamp += (SH7095_mem_timestamp == z->BSC.last_mem_time) & z->BSC.last_mem_type;
+
+ if(A < 0x02000000)	// CS0, configured as 16-bit -- split into two 16-bit accesses
+ {
+  // TODO/FIXME: Don't allow DMA transfers to occur between the two 16-bit accesses.
+  //if(!SH2DMAHax)
+  // SH7095_BusLock++;
+
+  DB = (DB & 0xFFFF0000) | (V >> 16);
+  BusRW_DB_CS0_u16_W1(A, &DB, SH2DMAHax);
+
+  DB = (DB & 0xFFFF0000) | (uint16_t)V;
+  BusRW_DB_CS0_u16_W1(A | 2, &DB, SH2DMAHax);
+
+  //if(!SH2DMAHax)
+  // SH7095_BusLock--;
+ }
+ else if(A >= 0x06000000)	// CS3; 32-bit
+ {
+  /* sizeof(uint32_t) == 4: shift = 0, mask = 0xFFFFFFFFu */
+  DB = V;
+  BusRW_DB_CS3_u32_W1(A, &DB);
+
+  if(!BurstHax)
+  {
+   if(!SH2DMAHax)
+   {
+    if(SH7095_mem_timestamp < z->BSC.sdram_finish_time)
+     SH7095_mem_timestamp = z->BSC.sdram_finish_time;
+
+    SH7095_mem_timestamp += 2;
+    z->BSC.sdram_finish_time = SH7095_mem_timestamp + 2;
+   }
+   else
+    *SH2DMAHax += 3;
+  }
+ }
+ else	// CS1, CS2; 32-bit
+ {
+  DB = V;
+  BusRW_DB_CS12_u32_W1(A, &DB, SH2DMAHax);
+ }
+
+ SH7095_DB = DB;
+
+ if(!BurstHax)
+ {
+  z->BSC.last_mem_addr = A;
+  z->BSC.last_mem_type = 0;
+  z->BSC.last_mem_time = SH7095_mem_timestamp;
+ }
+}
+
+static INLINE uint8_t SH7095_BSC_BusRead_u8(SH7095* z, uint32_t A, const bool BurstHax, int32_t* SH2DMAHax)
+{
+ uint32_t DB = SH7095_DB;
+ uint8_t ret;
+
+ if(!BurstHax)
+  SH7095_mem_timestamp += (SH7095_mem_timestamp == z->BSC.last_mem_time) & (bool)((z->BSC.last_mem_addr ^ A) & 0x06000000);
+
+ if(A < 0x02000000)	// CS0, configured as 16-bit
+ {
+  BusRW_DB_CS0_u8_W0(A, &DB, SH2DMAHax);
+  ret = DB >> (((A & 1) ^ 1) << 3);
+ }
+ else if(A >= 0x06000000)	// CS3; 32-bit
+ {
+  BusRW_DB_CS3_u8_W0(A, &DB);
+  ret = DB >> (((A & 3) ^ 3) << 3);
+
+  if(!BurstHax)
+  {
+   if(!SH2DMAHax)
+   {
+    if(SH7095_mem_timestamp < z->BSC.sdram_finish_time)
+     SH7095_mem_timestamp = z->BSC.sdram_finish_time;
 
     SH7095_mem_timestamp += 7;
    }
@@ -2006,100 +3296,592 @@ T INLINE SH7095::BSC_BusRead(uint32 A, const bool BurstHax, int32* SH2DMAHax)
  }
  else	// CS1, CS2; 32-bit
  {
-  BusRW_DB_CS12<T, false>(A, DB, BurstHax, SH2DMAHax);
-  ret = DB >> (((A & 3) ^ (4 - sizeof(T))) << 3);
+  BusRW_DB_CS12_u8_W0(A, &DB, SH2DMAHax);
+  ret = DB >> (((A & 3) ^ 3) << 3);
  }
 
  SH7095_DB = DB;
 
  if(!BurstHax)
  {
-  BSC.last_mem_addr = A;
-  BSC.last_mem_type = 1;
-  BSC.last_mem_time = SH7095_mem_timestamp;
+  z->BSC.last_mem_addr = A;
+  z->BSC.last_mem_type = 1;
+  z->BSC.last_mem_time = SH7095_mem_timestamp;
  }
 
  return ret;
 }
 
-
-template<bool SlavePenalty, typename T, bool BurstHax>
-INLINE T SH7095::ExtBusRead_INLINE(uint32 A)
+static INLINE uint16_t SH7095_BSC_BusRead_u16(SH7095* z, uint32_t A, const bool BurstHax, int32_t* SH2DMAHax)
 {
- T ret;
+ uint32_t DB = SH7095_DB;
+ uint16_t ret;
 
- A &= (1U << 27) - 1;
+ if(!BurstHax)
+  SH7095_mem_timestamp += (SH7095_mem_timestamp == z->BSC.last_mem_time) & (bool)((z->BSC.last_mem_addr ^ A) & 0x06000000);
 
- if(timestamp > SH7095_mem_timestamp)
-  SH7095_mem_timestamp = timestamp;
+ if(A < 0x02000000)	// CS0, configured as 16-bit
+ {
+  BusRW_DB_CS0_u16_W0(A, &DB, SH2DMAHax);
+  ret = DB >> ((A & 1) << 3);
+ }
+ else if(A >= 0x06000000)	// CS3; 32-bit
+ {
+  BusRW_DB_CS3_u16_W0(A, &DB);
+  ret = DB >> (((A & 3) ^ 2) << 3);
 
- //
+  if(!BurstHax)
+  {
+   if(!SH2DMAHax)
+   {
+    if(SH7095_mem_timestamp < z->BSC.sdram_finish_time)
+     SH7095_mem_timestamp = z->BSC.sdram_finish_time;
+
+    SH7095_mem_timestamp += 7;
+   }
+   else
+    *SH2DMAHax += 6;
+  }
+ }
+ else	// CS1, CS2; 32-bit
+ {
+  BusRW_DB_CS12_u16_W0(A, &DB, SH2DMAHax);
+  ret = DB >> (((A & 3) ^ 2) << 3);
+ }
+
+ SH7095_DB = DB;
+
  if(!BurstHax)
  {
-  DMA_PenaltyKludgeAccum += DMA_PenaltyKludgeAmount;
- }
- //
- if(SlavePenalty && !BurstHax)
- {
-  if(SH7095_mem_timestamp > (BSC.last_mem_time + 1))
-   SH7095_mem_timestamp += 2;
-  else
-   SH7095_mem_timestamp++;
- }
-
- ret = BSC_BusRead<T>(A, BurstHax, NULL);
-
- if(SlavePenalty && !BurstHax)
- {
-  SH7095_mem_timestamp++;
+  z->BSC.last_mem_addr = A;
+  z->BSC.last_mem_type = 1;
+  z->BSC.last_mem_time = SH7095_mem_timestamp;
  }
 
  return ret;
 }
 
-template<bool SlavePenalty, typename T>
-INLINE void SH7095::ExtBusWrite_INLINE(uint32 A, T V)
+static INLINE uint32_t SH7095_BSC_BusRead_u32(SH7095* z, uint32_t A, const bool BurstHax, int32_t* SH2DMAHax)
+{
+ uint32_t DB = SH7095_DB;
+ uint32_t ret;
+
+ if(!BurstHax)
+  SH7095_mem_timestamp += (SH7095_mem_timestamp == z->BSC.last_mem_time) & (bool)((z->BSC.last_mem_addr ^ A) & 0x06000000);
+
+ if(A < 0x02000000)	// CS0, configured as 16-bit -- split into two 16-bit accesses
+ {
+  // TODO/FIXME: Don't allow DMA transfers to occur between the two 16-bit accesses.
+  //if(!SH2DMAHax)
+  // SH7095_BusLock++;
+
+  BusRW_DB_CS0_u16_W0(A, &DB, SH2DMAHax);
+  ret = DB << 16;
+
+  BusRW_DB_CS0_u16_W0(A | 2, &DB, SH2DMAHax);
+  ret |= (uint16_t)DB;
+
+  //if(!SH2DMAHax)
+  // SH7095_BusLock--;
+ }
+ else if(A >= 0x06000000)	// CS3; 32-bit
+ {
+  BusRW_DB_CS3_u32_W0(A, &DB);
+  ret = DB;	/* shift folds to 0 for sizeof(T)==4 */
+
+  if(!BurstHax)
+  {
+   if(!SH2DMAHax)
+   {
+    if(SH7095_mem_timestamp < z->BSC.sdram_finish_time)
+     SH7095_mem_timestamp = z->BSC.sdram_finish_time;
+
+    SH7095_mem_timestamp += 7;
+   }
+   else
+    *SH2DMAHax += 6;
+  }
+ }
+ else	// CS1, CS2; 32-bit
+ {
+  BusRW_DB_CS12_u32_W0(A, &DB, SH2DMAHax);
+  ret = DB;
+ }
+
+ SH7095_DB = DB;
+
+ if(!BurstHax)
+ {
+  z->BSC.last_mem_addr = A;
+  z->BSC.last_mem_type = 1;
+  z->BSC.last_mem_time = SH7095_mem_timestamp;
+ }
+
+ return ret;
+}
+
+/* === ExtBusRead_INLINE_SP*_u**_BH*  (12 variants) ===
+ * Body folded at source level per (SP, BH) tuple. */
+
+static INLINE uint8_t SH7095_ExtBusRead_INLINE_SP0_u8_BH0(SH7095* z, uint32_t A)
+{
+ uint8_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ ret = SH7095_BSC_BusRead_u8(z, A, false, NULL);
+
+ return ret;
+}
+
+static INLINE uint8_t SH7095_ExtBusRead_INLINE_SP0_u8_BH1(SH7095* z, uint32_t A)
+{
+ uint8_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ ret = SH7095_BSC_BusRead_u8(z, A, true, NULL);
+
+ return ret;
+}
+
+static INLINE uint16_t SH7095_ExtBusRead_INLINE_SP0_u16_BH0(SH7095* z, uint32_t A)
+{
+ uint16_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ ret = SH7095_BSC_BusRead_u16(z, A, false, NULL);
+
+ return ret;
+}
+
+static INLINE uint16_t SH7095_ExtBusRead_INLINE_SP0_u16_BH1(SH7095* z, uint32_t A)
+{
+ uint16_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ ret = SH7095_BSC_BusRead_u16(z, A, true, NULL);
+
+ return ret;
+}
+
+static INLINE uint32_t SH7095_ExtBusRead_INLINE_SP0_u32_BH0(SH7095* z, uint32_t A)
+{
+ uint32_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ ret = SH7095_BSC_BusRead_u32(z, A, false, NULL);
+
+ return ret;
+}
+
+static INLINE uint32_t SH7095_ExtBusRead_INLINE_SP0_u32_BH1(SH7095* z, uint32_t A)
+{
+ uint32_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ ret = SH7095_BSC_BusRead_u32(z, A, true, NULL);
+
+ return ret;
+}
+
+static INLINE uint8_t SH7095_ExtBusRead_INLINE_SP1_u8_BH0(SH7095* z, uint32_t A)
+{
+ uint8_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ if(SH7095_mem_timestamp > (z->BSC.last_mem_time + 1))
+  SH7095_mem_timestamp += 2;
+ else
+  SH7095_mem_timestamp++;
+
+ ret = SH7095_BSC_BusRead_u8(z, A, false, NULL);
+
+ SH7095_mem_timestamp++;
+
+ return ret;
+}
+
+static INLINE uint8_t SH7095_ExtBusRead_INLINE_SP1_u8_BH1(SH7095* z, uint32_t A)
+{
+ uint8_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ ret = SH7095_BSC_BusRead_u8(z, A, true, NULL);
+
+ return ret;
+}
+
+static INLINE uint16_t SH7095_ExtBusRead_INLINE_SP1_u16_BH0(SH7095* z, uint32_t A)
+{
+ uint16_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ if(SH7095_mem_timestamp > (z->BSC.last_mem_time + 1))
+  SH7095_mem_timestamp += 2;
+ else
+  SH7095_mem_timestamp++;
+
+ ret = SH7095_BSC_BusRead_u16(z, A, false, NULL);
+
+ SH7095_mem_timestamp++;
+
+ return ret;
+}
+
+static INLINE uint16_t SH7095_ExtBusRead_INLINE_SP1_u16_BH1(SH7095* z, uint32_t A)
+{
+ uint16_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ ret = SH7095_BSC_BusRead_u16(z, A, true, NULL);
+
+ return ret;
+}
+
+static INLINE uint32_t SH7095_ExtBusRead_INLINE_SP1_u32_BH0(SH7095* z, uint32_t A)
+{
+ uint32_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ if(SH7095_mem_timestamp > (z->BSC.last_mem_time + 1))
+  SH7095_mem_timestamp += 2;
+ else
+  SH7095_mem_timestamp++;
+
+ ret = SH7095_BSC_BusRead_u32(z, A, false, NULL);
+
+ SH7095_mem_timestamp++;
+
+ return ret;
+}
+
+static INLINE uint32_t SH7095_ExtBusRead_INLINE_SP1_u32_BH1(SH7095* z, uint32_t A)
+{
+ uint32_t ret;
+
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ ret = SH7095_BSC_BusRead_u32(z, A, true, NULL);
+
+ return ret;
+}
+
+/* === ExtBusWrite_INLINE_SP*_u**  (6 variants) === */
+
+static INLINE void SH7095_ExtBusWrite_INLINE_SP0_u8(SH7095* z, uint32_t A, uint8_t V)
 {
  A &= (1U << 27) - 1;
 
- if(timestamp > SH7095_mem_timestamp)
-  SH7095_mem_timestamp = timestamp;
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
 
- //
- DMA_PenaltyKludgeAccum += DMA_PenaltyKludgeAmount;
- //
- if(SlavePenalty)
-  SH7095_mem_timestamp++;
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
 
- BSC_BusWrite<T>(A, V, false, NULL);
+ SH7095_BSC_BusWrite_u8(z, A, V, false, NULL);
 
- if(SlavePenalty)
- {
-  if(SH7095_mem_timestamp < BSC.sdram_finish_time)
-   SH7095_mem_timestamp = BSC.sdram_finish_time;
-
-  SH7095_mem_timestamp++;
- }
-
- write_finish_timestamp = SH7095_mem_timestamp;
+ z->write_finish_timestamp = SH7095_mem_timestamp;
 }
 
-template<unsigned w, bool SlavePenalty, typename T, bool BurstHax>
-static NO_INLINE MDFN_HOT T ExtBusRead_NI(uint32 A)
+static INLINE void SH7095_ExtBusWrite_INLINE_SP0_u16(SH7095* z, uint32_t A, uint16_t V)
 {
- return CPU[w].ExtBusRead_INLINE<SlavePenalty, T, BurstHax>(A);
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ SH7095_BSC_BusWrite_u16(z, A, V, false, NULL);
+
+ z->write_finish_timestamp = SH7095_mem_timestamp;
 }
 
-template<unsigned w, bool SlavePenalty, typename T>
-static NO_INLINE MDFN_HOT void ExtBusWrite_NI(uint32 A, T V)
+static INLINE void SH7095_ExtBusWrite_INLINE_SP0_u32(SH7095* z, uint32_t A, uint32_t V)
 {
- CPU[w].ExtBusWrite_INLINE<SlavePenalty, T>(A, V);
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ SH7095_BSC_BusWrite_u32(z, A, V, false, NULL);
+
+ z->write_finish_timestamp = SH7095_mem_timestamp;
 }
 
-template<unsigned w, typename T>
-static NO_INLINE MDFN_HOT T OnChipRegRead_NI(uint32 A)
+static INLINE void SH7095_ExtBusWrite_INLINE_SP1_u8(SH7095* z, uint32_t A, uint8_t V)
 {
- return CPU[w].OnChipRegRead_INLINE<T>(A);
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ SH7095_mem_timestamp++;
+
+ SH7095_BSC_BusWrite_u8(z, A, V, false, NULL);
+
+ if(SH7095_mem_timestamp < z->BSC.sdram_finish_time)
+  SH7095_mem_timestamp = z->BSC.sdram_finish_time;
+ SH7095_mem_timestamp++;
+
+ z->write_finish_timestamp = SH7095_mem_timestamp;
+}
+
+static INLINE void SH7095_ExtBusWrite_INLINE_SP1_u16(SH7095* z, uint32_t A, uint16_t V)
+{
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ SH7095_mem_timestamp++;
+
+ SH7095_BSC_BusWrite_u16(z, A, V, false, NULL);
+
+ if(SH7095_mem_timestamp < z->BSC.sdram_finish_time)
+  SH7095_mem_timestamp = z->BSC.sdram_finish_time;
+ SH7095_mem_timestamp++;
+
+ z->write_finish_timestamp = SH7095_mem_timestamp;
+}
+
+static INLINE void SH7095_ExtBusWrite_INLINE_SP1_u32(SH7095* z, uint32_t A, uint32_t V)
+{
+ A &= (1U << 27) - 1;
+
+ if(z->timestamp > SH7095_mem_timestamp)
+  SH7095_mem_timestamp = z->timestamp;
+
+ z->DMA_PenaltyKludgeAccum += z->DMA_PenaltyKludgeAmount;
+
+ SH7095_mem_timestamp++;
+
+ SH7095_BSC_BusWrite_u32(z, A, V, false, NULL);
+
+ if(SH7095_mem_timestamp < z->BSC.sdram_finish_time)
+  SH7095_mem_timestamp = z->BSC.sdram_finish_time;
+ SH7095_mem_timestamp++;
+
+ z->write_finish_timestamp = SH7095_mem_timestamp;
+}
+
+/* === ExtBusRead_NI_w*_SP*_u**_BH*  (18 variants) ===
+ * Generated only for (w, SP) tuples actually invoked by the
+ * three #define macro contexts. */
+
+static NO_INLINE MDFN_HOT uint8_t ExtBusRead_NI_w0_SP0_u8_BH0(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u8_BH0(&CPU[0], A);
+}
+
+static NO_INLINE MDFN_HOT uint8_t ExtBusRead_NI_w0_SP0_u8_BH1(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u8_BH1(&CPU[0], A);
+}
+
+static NO_INLINE MDFN_HOT uint16_t ExtBusRead_NI_w0_SP0_u16_BH0(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u16_BH0(&CPU[0], A);
+}
+
+static NO_INLINE MDFN_HOT uint16_t ExtBusRead_NI_w0_SP0_u16_BH1(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u16_BH1(&CPU[0], A);
+}
+
+static NO_INLINE MDFN_HOT uint32_t ExtBusRead_NI_w0_SP0_u32_BH0(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u32_BH0(&CPU[0], A);
+}
+
+static NO_INLINE MDFN_HOT uint32_t ExtBusRead_NI_w0_SP0_u32_BH1(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u32_BH1(&CPU[0], A);
+}
+
+static NO_INLINE MDFN_HOT uint8_t ExtBusRead_NI_w1_SP0_u8_BH0(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u8_BH0(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint8_t ExtBusRead_NI_w1_SP0_u8_BH1(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u8_BH1(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint16_t ExtBusRead_NI_w1_SP0_u16_BH0(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u16_BH0(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint16_t ExtBusRead_NI_w1_SP0_u16_BH1(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u16_BH1(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint32_t ExtBusRead_NI_w1_SP0_u32_BH0(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u32_BH0(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint32_t ExtBusRead_NI_w1_SP0_u32_BH1(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP0_u32_BH1(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint8_t ExtBusRead_NI_w1_SP1_u8_BH0(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP1_u8_BH0(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint8_t ExtBusRead_NI_w1_SP1_u8_BH1(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP1_u8_BH1(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint16_t ExtBusRead_NI_w1_SP1_u16_BH0(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP1_u16_BH0(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint16_t ExtBusRead_NI_w1_SP1_u16_BH1(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP1_u16_BH1(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint32_t ExtBusRead_NI_w1_SP1_u32_BH0(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP1_u32_BH0(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint32_t ExtBusRead_NI_w1_SP1_u32_BH1(uint32_t A)
+{
+ return SH7095_ExtBusRead_INLINE_SP1_u32_BH1(&CPU[1], A);
+}
+
+/* === ExtBusWrite_NI_w*_SP*_u**  (9 variants) === */
+
+static NO_INLINE MDFN_HOT void ExtBusWrite_NI_w0_SP0_u8(uint32_t A, uint8_t V)
+{
+ SH7095_ExtBusWrite_INLINE_SP0_u8(&CPU[0], A, V);
+}
+
+static NO_INLINE MDFN_HOT void ExtBusWrite_NI_w0_SP0_u16(uint32_t A, uint16_t V)
+{
+ SH7095_ExtBusWrite_INLINE_SP0_u16(&CPU[0], A, V);
+}
+
+static NO_INLINE MDFN_HOT void ExtBusWrite_NI_w0_SP0_u32(uint32_t A, uint32_t V)
+{
+ SH7095_ExtBusWrite_INLINE_SP0_u32(&CPU[0], A, V);
+}
+
+static NO_INLINE MDFN_HOT void ExtBusWrite_NI_w1_SP0_u8(uint32_t A, uint8_t V)
+{
+ SH7095_ExtBusWrite_INLINE_SP0_u8(&CPU[1], A, V);
+}
+
+static NO_INLINE MDFN_HOT void ExtBusWrite_NI_w1_SP0_u16(uint32_t A, uint16_t V)
+{
+ SH7095_ExtBusWrite_INLINE_SP0_u16(&CPU[1], A, V);
+}
+
+static NO_INLINE MDFN_HOT void ExtBusWrite_NI_w1_SP0_u32(uint32_t A, uint32_t V)
+{
+ SH7095_ExtBusWrite_INLINE_SP0_u32(&CPU[1], A, V);
+}
+
+static NO_INLINE MDFN_HOT void ExtBusWrite_NI_w1_SP1_u8(uint32_t A, uint8_t V)
+{
+ SH7095_ExtBusWrite_INLINE_SP1_u8(&CPU[1], A, V);
+}
+
+static NO_INLINE MDFN_HOT void ExtBusWrite_NI_w1_SP1_u16(uint32_t A, uint16_t V)
+{
+ SH7095_ExtBusWrite_INLINE_SP1_u16(&CPU[1], A, V);
+}
+
+static NO_INLINE MDFN_HOT void ExtBusWrite_NI_w1_SP1_u32(uint32_t A, uint32_t V)
+{
+ SH7095_ExtBusWrite_INLINE_SP1_u32(&CPU[1], A, V);
+}
+
+static NO_INLINE MDFN_HOT uint8_t OnChipRegRead_NI_u8(uint32_t A)
+{
+ return SH7095_OnChipRegRead_INLINE_u8(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint16_t OnChipRegRead_NI_u16(uint32_t A)
+{
+ return SH7095_OnChipRegRead_INLINE_u16(&CPU[1], A);
+}
+
+static NO_INLINE MDFN_HOT uint32_t OnChipRegRead_NI_u32(uint32_t A)
+{
+ return SH7095_OnChipRegRead_INLINE_u32(&CPU[1], A);
 }
 
 //
@@ -2107,8 +3889,8 @@ static NO_INLINE MDFN_HOT T OnChipRegRead_NI(uint32 A)
 //
 static const struct
 {
- uint8 AND;
- uint8 OR;
+ uint8_t AND;
+ uint8_t OR;
 } LRU_Update_Tab[4] =
 {
  { (1 << 2) | (1 << 1) | (1 << 0), /**/ (0 << 5) | (0 << 4) | (0 << 3) },	// Way 0
@@ -2117,7 +3899,7 @@ static const struct
  { (1 << 5) | (1 << 4) | (1 << 2), /**/ (1 << 3) | (1 << 1) | (1 << 0) },	// Way 3
 };
 
-static const int8 LRU_Replace_Tab[0x40] =
+static const int8_t LRU_Replace_Tab[0x40] =
 {
  /* 0x00 */ 0x03, 0x02,   -1, 0x02, 0x03,   -1, 0x01, 0x01,   -1, 0x02,   -1, 0x02,   -1,   -1, 0x01, 0x01,
  /* 0x10 */ 0x03,   -1,   -1,   -1, 0x03,   -1, 0x01, 0x01,   -1,   -1,   -1,   -1,   -1,   -1, 0x01, 0x01,
@@ -2125,7 +3907,7 @@ static const int8 LRU_Replace_Tab[0x40] =
  /* 0x30 */ 0x03,   -1,   -1,   -1, 0x03,   -1,   -1,   -1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-static INLINE uint32 cmov_eq_thing(const uint32 reg_compval, const uint32 mem_compval, uint32 var, const uint32 repl_var)
+static INLINE uint32_t cmov_eq_thing(const uint32_t reg_compval, const uint32_t mem_compval, uint32_t var, const uint32_t repl_var)
 {
 #if defined(__i386__) || defined(__x86_64__) || defined(_M_X64) || defined(i386) || defined(__i386) || defined(_M_IX86)
  asm(	"cmpl %1, %2\n\t"
@@ -2142,101 +3924,171 @@ static INLINE uint32 cmov_eq_thing(const uint32 reg_compval, const uint32 mem_co
  return var;
 }
 
-INLINE void SH7095::Cache_AssocPurge(const uint32 A)
+static INLINE void SH7095_Cache_AssocPurge(SH7095* z, const uint32_t A)
 {
- const uint32 ATM = A & (0x7FFFF << 10);
- auto* cent = &Cache[(A >> 4) & 0x3F];
+ const uint32_t ATM = A & (0x7FFFF << 10);
+ uint32_t* const tags = z->CacheTags[(A >> 4) & 0x3F];
 
- // Ignore two-way-mode bit in CCR here.
- cent->Tag[0] |= (ATM == cent->Tag[0]);	// Set invalid bit to 1.
- cent->Tag[1] |= (ATM == cent->Tag[1]);
- cent->Tag[2] |= (ATM == cent->Tag[2]);
- cent->Tag[3] |= (ATM == cent->Tag[3]);
+ // Ignore two-way-mode bit in z->CCR here.
+ tags[0] |= (ATM == tags[0]);	// Set invalid bit to 1.
+ tags[1] |= (ATM == tags[1]);
+ tags[2] |= (ATM == tags[2]);
+ tags[3] |= (ATM == tags[3]);
 }
 
-INLINE int SH7095::Cache_FindWay(CacheEntry* const cent, const uint32 ATM)
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+static INLINE int SH7095_Cache_FindWay(const uint32_t* const tags, const uint32_t ATM)
 {
-#if defined(HAVE_SSE2_INTRINSICS)
+#if defined(__SSE2__)
  __m128i atm = _mm_set1_epi32(ATM);
  __m128i v1234 = _mm_setr_epi32(1, 2, 3, 4);
  __m128i tmp;
 
- tmp = _mm_cmpeq_epi32(_mm_load_si128((__m128i*)cent->Tag), atm);
+ tmp = _mm_cmpeq_epi32(_mm_load_si128((const __m128i*)tags), atm);
  tmp = _mm_and_si128(tmp, v1234);
  tmp = _mm_max_epi16(tmp, _mm_shuffle_epi32(tmp, (3 << 0) | (2 << 2) | (1 << 4) | (0 << 6)));
  tmp = _mm_max_epi16(tmp, _mm_shuffle_epi32(tmp, (1 << 0) | (0 << 2)));
 
  return _mm_cvtsi128_si32(tmp) - 1;
+#elif defined(__aarch64__)
+ // 4-way tag match in 5 NEON ops, replacing 4 dependent csels via cmov_eq_thing.
+ // vmaxvq_u32 does horizontal max across the 128-bit register in one instruction.
+ const uint32x4_t atm   = vdupq_n_u32(ATM);
+ const uint32x4_t v1234 = { 1u, 2u, 3u, 4u };
+ const uint32x4_t tagv  = vld1q_u32(tags);
+ const uint32x4_t hits  = vandq_u32(vceqq_u32(tagv, atm), v1234);
+ return (int)vmaxvq_u32(hits) - 1;
 #else
  int way_match = -1;
 
- way_match = cmov_eq_thing(ATM, cent->Tag[0], way_match, 0);
- way_match = cmov_eq_thing(ATM, cent->Tag[1], way_match, 1);
- way_match = cmov_eq_thing(ATM, cent->Tag[2], way_match, 2);
- way_match = cmov_eq_thing(ATM, cent->Tag[3], way_match, 3);
+ way_match = cmov_eq_thing(ATM, tags[0], way_match, 0);
+ way_match = cmov_eq_thing(ATM, tags[1], way_match, 1);
+ way_match = cmov_eq_thing(ATM, tags[2], way_match, 2);
+ way_match = cmov_eq_thing(ATM, tags[3], way_match, 3);
 
  return way_match;
 #endif
 }
 
-template<typename T>
-INLINE void SH7095::Cache_WriteUpdate(uint32 A, T V)
+INLINE void SH7095_Cache_WriteUpdate_u8(SH7095* z, uint32_t A, uint8_t V)
 {
- const uint32 ATM = A & (0x7FFFF << 10);
+ const uint32_t ATM = A & (0x7FFFF << 10);
  const unsigned ena = (A >> 4) & 0x3F;
- CacheEntry* cent = &Cache[ena];
- const int way_match = Cache_FindWay(cent, ATM);
+ const int way_match = SH7095_Cache_FindWay(z->CacheTags[ena], ATM);
 
- if(MDFN_LIKELY(way_match >= 0)) // Cache hit!
+ if(MDFN_LIKELY(way_match >= 0))
  {
-  Cache_LRU[ena] = (Cache_LRU[ena] & LRU_Update_Tab[way_match].AND) | LRU_Update_Tab[way_match].OR;
-  MDFN_ennsb<T, true>(&cent->Data[way_match][NE32ASU8_IDX_ADJ(T, A & 0x0F)], V);	// Ignore CCR OD bit here.
+  z->Cache_LRU[ena] = (z->Cache_LRU[ena] & LRU_Update_Tab[way_match].AND) | LRU_Update_Tab[way_match].OR;
+  *(uint8_t*)&z->CacheData[ena][way_match][NE32ASU8_IDX_ADJ(uint8_t, A & 0x0F)] = V;
  }
 }
 
-template<typename T>
-INLINE void SH7095::Cache_WriteAddressArray(uint32 A, T V)
+static INLINE void SH7095_Cache_WriteUpdate_u16(SH7095* z, uint32_t A, uint16_t V)
 {
- const unsigned way = (CCR >> 6) & 0x3;
+ const uint32_t ATM = A & (0x7FFFF << 10);
  const unsigned ena = (A >> 4) & 0x3F;
+ const int way_match = SH7095_Cache_FindWay(z->CacheTags[ena], ATM);
 
- Cache[ena].Tag[way] = (A & (0x7FFFF << 10)) | (!(A & 0x4));
- Cache_LRU[ena] = (V >> 4) & 0x3F;
+ if(MDFN_LIKELY(way_match >= 0))
+ {
+  z->Cache_LRU[ena] = (z->Cache_LRU[ena] & LRU_Update_Tab[way_match].AND) | LRU_Update_Tab[way_match].OR;
+  *(uint16_t*)&z->CacheData[ena][way_match][NE32ASU8_IDX_ADJ(uint16_t, A & 0x0F)] = V;
+ }
 }
 
-template<typename T>
-INLINE void SH7095::Cache_WriteDataArray(uint32 A, T V)
+static INLINE void SH7095_Cache_WriteUpdate_u32(SH7095* z, uint32_t A, uint32_t V)
+{
+ const uint32_t ATM = A & (0x7FFFF << 10);
+ const unsigned ena = (A >> 4) & 0x3F;
+ const int way_match = SH7095_Cache_FindWay(z->CacheTags[ena], ATM);
+
+ if(MDFN_LIKELY(way_match >= 0))
+ {
+  z->Cache_LRU[ena] = (z->Cache_LRU[ena] & LRU_Update_Tab[way_match].AND) | LRU_Update_Tab[way_match].OR;
+  *(uint32_t*)&z->CacheData[ena][way_match][NE32ASU8_IDX_ADJ(uint32_t, A & 0x0F)] = V;
+ }
+}
+
+static INLINE void SH7095_Cache_WriteDataArray_u8(SH7095* z, uint32_t A, uint8_t V)
 {
  const unsigned way = (A >> 10) & 0x3;
  const unsigned ena = (A >> 4) & 0x3F;
 
- MDFN_ennsb<T, true>(&Cache[ena].Data[way][NE32ASU8_IDX_ADJ(T, A & 0x0F)], V);
+ *(uint8_t*)&z->CacheData[ena][way][NE32ASU8_IDX_ADJ(uint8_t, A & 0x0F)] = V;
 }
 
-template<typename T>
-INLINE T SH7095::Cache_ReadAddressArray(uint32 A)
-{
- const unsigned way = (CCR >> 6) & 0x3;
- const unsigned ena = (A >> 4) & 0x3F;
-
- return (Cache[ena].Tag[way] & (0x7FFFF << 10)) | ((~Cache[ena].Tag[way] & 1) << 2) | (Cache_LRU[ena] << 4);
-}
-
-template<typename T>
-INLINE T SH7095::Cache_ReadDataArray(uint32 A)
+static INLINE void SH7095_Cache_WriteDataArray_u16(SH7095* z, uint32_t A, uint16_t V)
 {
  const unsigned way = (A >> 10) & 0x3;
  const unsigned ena = (A >> 4) & 0x3F;
 
- return MDFN_densb<T, true>(&Cache[ena].Data[way][NE32ASU8_IDX_ADJ(T, A & 0x0F)]);
+ *(uint16_t*)&z->CacheData[ena][way][NE32ASU8_IDX_ADJ(uint16_t, A & 0x0F)] = V;
 }
 
-template<typename T>
-INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, const uint32 A)
+static INLINE void SH7095_Cache_WriteDataArray_u32(SH7095* z, uint32_t A, uint32_t V)
 {
+ const unsigned way = (A >> 10) & 0x3;
+ const unsigned ena = (A >> 4) & 0x3F;
+
+ *(uint32_t*)&z->CacheData[ena][way][NE32ASU8_IDX_ADJ(uint32_t, A & 0x0F)] = V;
 }
 
-#define MemRead(IsInstr, T, region, CacheEnabled, A_, outval_, A, unmasked_A, cent, way_match)			\
+static INLINE uint8_t SH7095_Cache_ReadDataArray_u8(SH7095* z, uint32_t A)
+{
+ const unsigned way = (A >> 10) & 0x3;
+ const unsigned ena = (A >> 4) & 0x3F;
+ uint8_t tmp;
+
+ tmp = *(uint8_t*)&z->CacheData[ena][way][NE32ASU8_IDX_ADJ(uint8_t, A & 0x0F)];
+ return tmp;
+}
+
+static INLINE uint16_t SH7095_Cache_ReadDataArray_u16(SH7095* z, uint32_t A)
+{
+ const unsigned way = (A >> 10) & 0x3;
+ const unsigned ena = (A >> 4) & 0x3F;
+ uint16_t tmp;
+
+ tmp = *(uint16_t*)&z->CacheData[ena][way][NE32ASU8_IDX_ADJ(uint16_t, A & 0x0F)];
+ return tmp;
+}
+
+static INLINE uint32_t SH7095_Cache_ReadDataArray_u32(SH7095* z, uint32_t A)
+{
+ const unsigned way = (A >> 10) & 0x3;
+ const unsigned ena = (A >> 4) & 0x3F;
+ uint32_t tmp;
+
+ tmp = *(uint32_t*)&z->CacheData[ena][way][NE32ASU8_IDX_ADJ(uint32_t, A & 0x0F)];
+ return tmp;
+}
+
+/* detempleted -- body never used T. */
+static INLINE void SH7095_Cache_WriteAddressArray(SH7095* z, uint32_t A, uint32_t V)
+{
+ const unsigned way = (z->CCR >> 6) & 0x3;
+ const unsigned ena = (A >> 4) & 0x3F;
+
+ z->CacheTags[ena][way] = (A & (0x7FFFF << 10)) | (!(A & 0x4));
+ z->Cache_LRU[ena] = (V >> 4) & 0x3F;
+}
+
+/* detempleted -- body never used T; returns a 32-bit
+ * tag value, callers truncate via `retval = (T)...` assignment. */
+static INLINE uint32_t SH7095_Cache_ReadAddressArray(SH7095* z, uint32_t A)
+{
+ const unsigned way = (z->CCR >> 6) & 0x3;
+ const unsigned ena = (A >> 4) & 0x3F;
+
+ return (z->CacheTags[ena][way] & (0x7FFFF << 10)) | ((~z->CacheTags[ena][way] & 1) << 2) | (z->Cache_LRU[ena] << 4);
+}
+
+#define MemRead(IsInstr, T, region, CacheEnabled, A_, outval_, A, unmasked_A, cset, way_match)			\
 {														\
  __label__ EBRCase, MemReturn;											\
  T retval;													\
@@ -2249,14 +4101,14 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
   if(MDFN_UNLIKELY(A & (sizeof(T) - 1)))									\
   {														\
    A &= ~(sizeof(T) - 1);											\
-   SetPEX(PEX_CPUADDR);												\
+   SH7095_SetPEX(z, SH7095_PEX_CPUADDR);												\
   }														\
  }														\
 														\
  if(IsInstr <= 0)												\
-  MA_until = std::max<sscpu_timestamp_t>(MA_until, timestamp + 1);						\
+ { if((z->timestamp + 1) > z->MA_until) z->MA_until = (z->timestamp + 1); }						\
  else														\
-  timestamp = std::max<sscpu_timestamp_t>(MA_until, timestamp);							\
+  z->timestamp = ((sscpu_timestamp_t)(z->MA_until) > (sscpu_timestamp_t)(z->timestamp) ? (sscpu_timestamp_t)(z->MA_until) : (sscpu_timestamp_t)(z->timestamp));							\
 														\
 														\
  switch(region)													\
@@ -2264,16 +4116,16 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
   case 0:													\
 	if(MDFN_LIKELY(CacheEnabled))										\
 	{													\
-	 uint32 ATM;												\
+	 uint32_t ATM;												\
 														\
 	 ATM = A & (0x7FFFF << 10);										\
-	 cent = &Cache[(A >> 4) & 0x3F];									\
+	 cset = (A >> 4) & 0x3F;									\
 														\
-	 way_match = Cache_FindWay(cent, ATM);									\
+	 way_match = SH7095_Cache_FindWay(z->CacheTags[cset], ATM);									\
 														\
-	 if(MDFN_UNLIKELY(way_match < 0)) /* Cache miss! */							\
+	 if(MDFN_UNLIKELY(way_match < 0)) /* z->Cache miss! */							\
 	 {													\
-	  way_match = LRU_Replace_Tab[Cache_LRU[(A >> 4) & 0x3F] & CCRC_Replace_AND] | CCRC_Replace_OR[(bool)IsInstr];		\
+	  way_match = LRU_Replace_Tab[z->Cache_LRU[(A >> 4) & 0x3F] & z->CCRC_Replace_AND] | z->CCRC_Replace_OR[(bool)IsInstr];		\
 														\
 	  if(MDFN_UNLIKELY(way_match < 0))									\
 	   goto EBRCase;											\
@@ -2281,34 +4133,34 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
 	  /*                        */										\
 	  /* Load cache line.       */										\
 	  /*                        */										\
-	  cent->Tag[way_match] = ATM;										\
-	  /* Don't use ATM after this point. */									\
+	  z->CacheTags[cset][way_match] = ATM;										\
+	  /* Don't use ATM after z point. */									\
 	  CHECK_EXIT_RESUME();											\
 	  {													\
-	   unsigned di = (A + 4 + 0) & 0xC; MDFN_ennsb<uint32, true>(&cent->Data[way_match][di], ExtBusRead(uint32, false, (A &~ 0xF) + di));	\
+	   unsigned di = (A + 4 + 0) & 0xC; { uint32_t vtmp__ = ExtBusRead(uint32_t, false, (A &~ 0xF) + di); *(uint32_t*)&z->CacheData[cset][way_match][di] = vtmp__; }	\
 	  }													\
 	  for(unsigned i = 4; i < 16; i += 4)									\
 	  {													\
-	   unsigned di = (A + 4 + i) & 0xC; MDFN_ennsb<uint32, true>(&cent->Data[way_match][di], ExtBusRead(uint32,  true, (A &~ 0xF) + di));	\
+	   unsigned di = (A + 4 + i) & 0xC; { uint32_t vtmp__ = ExtBusRead(uint32_t,  true, (A &~ 0xF) + di); *(uint32_t*)&z->CacheData[cset][way_match][di] = vtmp__; }	\
 	  }													\
 	  if(IsInstr <= 0)											\
-	   MA_until = std::max<sscpu_timestamp_t>(MA_until, SH7095_mem_timestamp + 1);				\
+	  { if((SH7095_mem_timestamp + 1) > z->MA_until) z->MA_until = (SH7095_mem_timestamp + 1); }				\
 	  else													\
-	   timestamp = SH7095_mem_timestamp;									\
+	   z->timestamp = SH7095_mem_timestamp;									\
 	 }													\
 														\
-	 Cache_CheckReadIncoherency<T>(cent, way_match, A);							\
-														\
-	 Cache_LRU[(A >> 4) & 0x3F] = (Cache_LRU[(A >> 4) & 0x3F] & LRU_Update_Tab[way_match].AND) | LRU_Update_Tab[way_match].OR;	\
+	 									\
+											\
+	 z->Cache_LRU[(A >> 4) & 0x3F] = (z->Cache_LRU[(A >> 4) & 0x3F] & LRU_Update_Tab[way_match].AND) | LRU_Update_Tab[way_match].OR;	\
 														\
          /* Ugggghhhh.... */											\
-         if(CacheBypassHack && FMIsWriteable[A >> SH7095_EXT_MAP_GRAN_BITS])					\
+         if(CacheBypassHack && FMIsWriteable_get(A >> SH7095_EXT_MAP_GRAN_BITS))				\
 	 {													\
-          retval = ne16_rbo_be<T>(SH7095_FastMap[A >> SH7095_EXT_MAP_GRAN_BITS], A);				\
+          retval = SH7095_RBO_BE_T(T, SH7095_FastMap[A >> SH7095_EXT_MAP_GRAN_BITS], A);				\
 	  goto MemReturn;											\
 	 }													\
 														\
-  	 retval = MDFN_densb<T, true>(&cent->Data[way_match][NE32ASU8_IDX_ADJ(T, A & 0x0F)]);			\
+  	 retval = *(T*)&z->CacheData[cset][way_match][NE32ASU8_IDX_ADJ(T, A & 0x0F)];			\
 	 goto MemReturn;											\
 	}													\
 	/* Fall-through, no break here */									\
@@ -2319,11 +4171,11 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
 	 retval = ExtBusRead(T, false, A);								\
 														\
 	 if(IsInstr <= 0)											\
-	  MA_until = std::max<sscpu_timestamp_t>(MA_until, SH7095_mem_timestamp + 1);				\
+	 { if((SH7095_mem_timestamp + 1) > z->MA_until) z->MA_until = (SH7095_mem_timestamp + 1); }				\
 	 else													\
 	 {													\
-	  timestamp = SH7095_mem_timestamp;									\
-	  UCRead_IF_Kludge = true;										\
+	  z->timestamp = SH7095_mem_timestamp;									\
+	  z->UCRead_IF_Kludge = true;										\
 	 }													\
 														\
 	 goto MemReturn;											\
@@ -2334,7 +4186,7 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
 	/*								*/					\
 	/* Associative purge(apparently returns open bus of some sort)	*/					\
 	/*								*/					\
-	Cache_AssocPurge(A);											\
+	SH7095_Cache_AssocPurge(z, A);											\
 	retval = ~0;												\
 	goto MemReturn;												\
 														\
@@ -2345,7 +4197,7 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
 	/* Note: bits 0, 1, 3, 29, 30, 31 are some sort	*/							\
 	/*       of open-bus(unemulated). 		*/							\
 	/*				   		*/							\
-	retval = Cache_ReadAddressArray<T>(A);									\
+	retval = SH7095_Cache_ReadAddressArray(z, A);									\
 	goto MemReturn;												\
 														\
   case 4:													\
@@ -2353,7 +4205,9 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
 	/*			    */										\
 	/* Direct cache data access */										\
 	/*			    */										\
-	retval = Cache_ReadDataArray<T>(A);									\
+	if(sizeof(T) == 1) retval = SH7095_Cache_ReadDataArray_u8(z, A);							\
+	else if(sizeof(T) == 2) retval = SH7095_Cache_ReadDataArray_u16(z, A);						\
+	else retval = SH7095_Cache_ReadDataArray_u32(z, A);								\
 	goto MemReturn;												\
 														\
   case 7:													\
@@ -2372,20 +4226,24 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
  if(MDFN_UNLIKELY(A & (sizeof(T) - 1)))						\
  {										\
   A &= ~(sizeof(T) - 1);							\
-  SetPEX(PEX_CPUADDR);								\
+  SH7095_SetPEX(z, SH7095_PEX_CPUADDR);								\
  }										\
 										\
- MA_until = std::max<sscpu_timestamp_t>(MA_until, timestamp + 1);		\
+ if((z->timestamp + 1) > z->MA_until) z->MA_until = (z->timestamp + 1);		\
 										\
 										\
  switch(region)									\
  {										\
   case 0:									\
 	if(MDFN_LIKELY(CacheEnabled))						\
-	 Cache_WriteUpdate<T>(A, V);						\
+	{									\
+	 if(sizeof(T) == 1) SH7095_Cache_WriteUpdate_u8(z, A, V);		\
+	 else if(sizeof(T) == 2) SH7095_Cache_WriteUpdate_u16(z, A, V);		\
+	 else SH7095_Cache_WriteUpdate_u32(z, A, V);				\
+	}									\
 	/* Fall-through, no break */						\
   case 1:									\
-  	MA_until = std::max<sscpu_timestamp_t>(MA_until, write_finish_timestamp + 1);	\
+  	if((z->write_finish_timestamp + 1) > z->MA_until) z->MA_until = (z->write_finish_timestamp + 1);	\
 										\
 	if(!SH7095_BusLock) { CHECK_EXIT_RESUME(); }				\
 	ExtBusWrite(T, A, V);							\
@@ -2396,7 +4254,7 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
 	/*		      */						\
 	/* Associative purge. */						\
 	/*		      */						\
-	Cache_AssocPurge(A);							\
+	SH7095_Cache_AssocPurge(z, A);							\
 	break;									\
 										\
   case 3:									\
@@ -2404,10 +4262,10 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
 	/* Direct cache address/tag access */					\
 	/*				   */					\
 	/* TODO: Check non-32 bit access   */					\
-	timestamp++;								\
-	MA_until = std::max<sscpu_timestamp_t>(MA_until, timestamp + 1);	\
+	z->timestamp++;								\
+	if((z->timestamp + 1) > z->MA_until) z->MA_until = (z->timestamp + 1);	\
 										\
-	Cache_WriteAddressArray<T>(A, V);					\
+	SH7095_Cache_WriteAddressArray(z, A, V);					\
 	break;									\
 										\
   case 4:									\
@@ -2415,230 +4273,217 @@ INLINE void SH7095::Cache_CheckReadIncoherency(CacheEntry* cent, const int way, 
 	/*			    */						\
 	/* Direct cache data access */						\
 	/*			    */						\
-	Cache_WriteDataArray<T>(A, V);						\
+	if(sizeof(T) == 1) SH7095_Cache_WriteDataArray_u8(z, A, V);					\
+	else if(sizeof(T) == 2) SH7095_Cache_WriteDataArray_u16(z, A, V);					\
+	else SH7095_Cache_WriteDataArray_u32(z, A, V);							\
 	break;									\
 										\
   case 7:									\
-	OnChipRegWrite<T>(unmasked_A, V);					\
+	if(sizeof(T) == 1)      SH7095_OnChipRegWrite_u8(z, unmasked_A, V);	\
+	else if(sizeof(T) == 2) SH7095_OnChipRegWrite_u16(z, unmasked_A, V);	\
+	else                    SH7095_OnChipRegWrite_u32(z, unmasked_A, V);	\
 	break;									\
  }										\
 }
 
-#define CHECK_EXIT_RESUME() { if(NeedSlaveCall > 0) CPU[1].RunSlaveUntil(timestamp); if(NeedSlaveCall < 0) CPU[1].RunSlaveUntil_Debug(timestamp); }
-#define OnChipRegRead(T, A) OnChipRegRead_INLINE<T>(A)
-#define ExtBusRead(T, BurstHax, A) ExtBusRead_NI<which, false, T, BurstHax>(A)
-#define ExtBusWrite(T, A, V) ExtBusWrite_NI<which, false, T>(A, V)
-template<unsigned which, int NeedSlaveCall, bool CacheBypassHack, typename T, unsigned region, bool CacheEnabled, int32 IsInstr>
-INLINE T SH7095::MemReadRT(uint32 A)
-{
- static_assert(region < 0x8, "Wrong region argument.");
- static_assert(!NeedSlaveCall || (!which && region < 2), "Wrong arguments.");
- static_assert(IsInstr >= 0 || (CacheEnabled && region == 0x0), "Wrong arguments.");
- T ret;
- uint32 unmasked_A;
- CacheEntry* cent;
- int way_match;
+#define CHECK_EXIT_RESUME() { if(NeedSlaveCall > 0) SH7095_RunSlaveUntil(&CPU[1], z->timestamp); }
+#define OnChipRegRead(T, A)							\
+        ( (sizeof(T) == 1) ? (T)SH7095_OnChipRegRead_INLINE_u8(z, A)		\
+        : (sizeof(T) == 2) ? (T)SH7095_OnChipRegRead_INLINE_u16(z, A)		\
+                           : (T)SH7095_OnChipRegRead_INLINE_u32(z, A) )
+/* master-CPU dispatch.  `which` is the outer template arg
+ * (compile-time const, 0 or 1), sizeof(T) is concrete at macro
+ * expansion, BurstHax is a literal at every call site -- gcc -O2
+ * folds the ternary chain to a single direct call. */
+#define ExtBusRead(T, BurstHax, A)                                                                                            \
+          ( (sizeof(T) == 1) ? (T)((BurstHax) ? ((which) ? ExtBusRead_NI_w1_SP0_u8_BH1(A)  : ExtBusRead_NI_w0_SP0_u8_BH1(A))   \
+                                              : ((which) ? ExtBusRead_NI_w1_SP0_u8_BH0(A)  : ExtBusRead_NI_w0_SP0_u8_BH0(A)))  \
+          : (sizeof(T) == 2) ? (T)((BurstHax) ? ((which) ? ExtBusRead_NI_w1_SP0_u16_BH1(A) : ExtBusRead_NI_w0_SP0_u16_BH1(A))  \
+                                              : ((which) ? ExtBusRead_NI_w1_SP0_u16_BH0(A) : ExtBusRead_NI_w0_SP0_u16_BH0(A))) \
+                             : (T)((BurstHax) ? ((which) ? ExtBusRead_NI_w1_SP0_u32_BH1(A) : ExtBusRead_NI_w0_SP0_u32_BH1(A))  \
+                                              : ((which) ? ExtBusRead_NI_w1_SP0_u32_BH0(A) : ExtBusRead_NI_w0_SP0_u32_BH0(A))) )
+#define ExtBusWrite(T, A, V)                                                                                       \
+do {                                                                                                                \
+  if(sizeof(T) == 1)      { if(which) ExtBusWrite_NI_w1_SP0_u8 (A, V); else ExtBusWrite_NI_w0_SP0_u8 (A, V); }      \
+  else if(sizeof(T) == 2) { if(which) ExtBusWrite_NI_w1_SP0_u16(A, V); else ExtBusWrite_NI_w0_SP0_u16(A, V); }      \
+  else                    { if(which) ExtBusWrite_NI_w1_SP0_u32(A, V); else ExtBusWrite_NI_w0_SP0_u32(A, V); }      \
+} while(0)
+/* Phase-9 step 5 part 2: 196 named C functions replace the four
+ * mega-templates that used to live here.  Position matches the old
+ * defs -- MemRead / MemWrite / ExtBusRead / ExtBusWrite / OnChipRegRead /
+ * CHECK_EXIT_RESUME macros are all in scope at this point. */
+#include "sh7095_mem_dispatch.inc"
 
- MemRead(IsInstr, T, region, CacheEnabled, A, ret, A, unmasked_A, cent, way_match);
-
- return ret;
-}
-
-template<unsigned which, int NeedSlaveCall, typename T, unsigned region, bool CacheEnabled>
-INLINE void SH7095::MemWriteRT(uint32 A, T V)
-{
- static_assert(region < 0x8, "Wrong region argument.");
- static_assert(!NeedSlaveCall || (!which && region < 2), "Wrong arguments.");
- uint32 unmasked_A;
-
- MemWrite(T, region, CacheEnabled, A, V, A, unmasked_A, V);
-}
 #undef CHECK_EXIT_RESUME
 #undef OnChipRegRead
 #undef ExtBusRead
 #undef ExtBusWrite
 
-template<unsigned which, int NeedSlaveCall, bool CacheBypassHack, typename T, unsigned region, bool CacheEnabled, int32 IsInstr>
-static NO_INLINE MDFN_HOT MDFN_FASTCALL T C_MemReadRT(uint32 A)
+static INLINE void SH7095_SetCCR(SH7095* z, uint8_t V)
 {
- return CPU[which].MemReadRT<which, NeedSlaveCall, CacheBypassHack, T, region, CacheEnabled, IsInstr>(A);
-}
-
-template<unsigned which, int NeedSlaveCall, typename T, unsigned region, bool CacheEnabled>
-static NO_INLINE MDFN_HOT MDFN_FASTCALL void C_MemWriteRT(uint32 A, T V)
-{
- CPU[which].MemWriteRT<which, NeedSlaveCall, T, region, CacheEnabled>(A, V);
-}
-
-INLINE void SH7095::SetCCR(uint8 V)
-{
- if(V & CCR_CP)
+ if(V & SH7095_CCR_CP)
  {
   for(unsigned entry = 0; entry < 64; entry++)
   {
-   Cache_LRU[entry] = 0;
+   z->Cache_LRU[entry] = 0;
    for(unsigned way = 0; way < 4; way++)
-    Cache[entry].Tag[way] |= 1;	// Set invalid bit to 1.
+    z->CacheTags[entry][way] |= 1;	// Set invalid bit to 1.
   }
-  V &= ~CCR_CP;
+  V &= ~SH7095_CCR_CP;
  }
 
- //if(MDFN_LIKELY(CCR != V))
+ //if(MDFN_LIKELY(z->CCR != V))
  {
-  CCR = V;
+  z->CCR = V;
   //
   //
-  CCRC_Replace_AND = (CCR & CCR_TW) ? 0x1 : 0x3F;
-  CCRC_Replace_OR[0] = (CCR & CCR_OD) ? -1 : 0;
-  CCRC_Replace_OR[1] = (CCR & CCR_ID) ? -1 : 0;
+  z->CCRC_Replace_AND = (z->CCR & SH7095_CCR_TW) ? 0x1 : 0x3F;
+  z->CCRC_Replace_OR[0] = (z->CCR & SH7095_CCR_OD) ? -1 : 0;
+  z->CCRC_Replace_OR[1] = (z->CCR & SH7095_CCR_ID) ? -1 : 0;
 
-  RecalcMRWFP_0();
+  SH7095_RecalcMRWFP_0(z);
  }
 }
 
-
-
-
 /*
 
-
 */
-void NO_INLINE SH7095::Reset(bool power_on_reset, bool from_internal_wdt)
+NO_INLINE void SH7095_Reset(SH7095* z, bool power_on_reset, bool from_internal_wdt)
 {
- if(timestamp == SS_EVENT_DISABLED_TS)
+ if(z->timestamp == SS_EVENT_DISABLED_TS)
   return;
 
  if(power_on_reset)
  {
-  FRT.lastts = timestamp;
+  z->FRT.lastts = z->timestamp;
 
-  MA_until = timestamp;
-  MM_until = timestamp;
+  z->MA_until = z->timestamp;
+  z->MM_until = z->timestamp;
 
   for(unsigned i = 0; i < 16; i++)
-   WB_until[i] = timestamp;
+   z->WB_until[i] = z->timestamp;
 
-  UCRead_IF_Kludge = 0;
+  z->UCRead_IF_Kludge = 0;
 
-  write_finish_timestamp = timestamp;
-  divide_finish_timestamp = timestamp;
+  z->write_finish_timestamp = z->timestamp;
+  z->divide_finish_timestamp = z->timestamp;
 
-  DMA_Timestamp = timestamp;
-  DMA_SGEndTimestamp = timestamp;
+  z->DMA_Timestamp = z->timestamp;
+  z->DMA_SGEndTimestamp = z->timestamp;
  }
  //
- VBR = 0;
- SR |= 0xF << 4;
- SetCCR(0);
+ z->VBR = 0;
+ z->SR |= 0xF << 4;
+ SH7095_SetCCR(z, 0);
  //
  if(power_on_reset)
  {
-  BSC.BCR1 = (BSC.BCR1 & 0x8000) | 0x03F0;
-  BSC.BCR2 = 0xFC;
-  BSC.WCR = 0xAAFF;
-  BSC.MCR = 0x0000;
+  z->BSC.BCR1 = (z->BSC.BCR1 & 0x8000) | 0x03F0;
+  z->BSC.BCR2 = 0xFC;
+  z->BSC.WCR = 0xAAFF;
+  z->BSC.MCR = 0x0000;
 
-  BSC.sdram_finish_time = timestamp;
-  BSC.last_mem_time = timestamp;
-  BSC.last_mem_addr = 0;
-  BSC.last_mem_type = 0;
+  z->BSC.sdram_finish_time = z->timestamp;
+  z->BSC.last_mem_time = z->timestamp;
+  z->BSC.last_mem_addr = 0;
+  z->BSC.last_mem_type = 0;
 
-  BSC.RTCSR = 0x00;
-  BSC.RTCSRM = 0x00;
-  BSC.RTCNT = 0x00;
-  BSC.RTCOR = 0x00;
+  z->BSC.RTCSR = 0x00;
+  z->BSC.RTCSRM = 0x00;
+  z->BSC.RTCNT = 0x00;
+  z->BSC.RTCOR = 0x00;
  }
  //
 
  for(unsigned ch = 0; ch < 2; ch++)
  {
-  DMACH[ch].CHCR = 0x00;
-  DMACH[ch].CHCRM = 0x00;
-  DMACH[ch].DRCR = 0x00;
+  z->DMACH[ch].CHCR = 0x00;
+  z->DMACH[ch].CHCRM = 0x00;
+  z->DMACH[ch].DRCR = 0x00;
  }
- DMAOR = 0x00;
- DMA_RecalcRunning();
- RecalcPendingIntPEX();
+ z->DMAOR = 0x00;
+ SH7095_DMA_RecalcRunning(z);
+ SH7095_RecalcPendingIntPEX(z);
  //
- INTC_Reset();
+ SH7095_INTC_Reset(z);
  //
- DVCR = 0;
- RecalcPendingIntPEX();
+ z->DVCR = 0;
+ SH7095_RecalcPendingIntPEX(z);
  //
- FRT_Reset();
- WDT_Reset(from_internal_wdt);
+ SH7095_FRT_Reset(z);
+ SH7095_WDT_Reset(z, from_internal_wdt);
  //
- SCI_Reset();
+ SH7095_SCI_Reset(z);
  //
- SBYCR = 0;
- Standby = false;
+ z->SBYCR = 0;
+ z->Standby = false;
  //
  //
  //
- EPending = 0;
- SetPEX(power_on_reset ? PEX_POWERON : PEX_RESET);
- Pipe_ID = EPending;
- ResumePoint = nullptr;
+ z->EPending = 0;
+ SH7095_SetPEX(z, power_on_reset ? SH7095_PEX_POWERON : SH7095_PEX_RESET);
+ z->Pipe_ID = z->EPending;
+ z->resume_id = 0;
 }
 
-void NO_INLINE SH7095::INTC_Reset(void)
+static NO_INLINE void SH7095_INTC_Reset(SH7095* z)
 {
- IPRA = 0;
- IPRB = 0;
- VCRA = 0;
- VCRB = 0;
- VCRC = 0;
- VCRD = 0;
- VCRWDT = 0;
- ICR = 0;
+ z->IPRA = 0;
+ z->IPRB = 0;
+ z->VCRA = 0;
+ z->VCRB = 0;
+ z->VCRC = 0;
+ z->VCRD = 0;
+ z->VCRWDT = 0;
+ z->ICR = 0;
 
- RecalcPendingIntPEX();
+ SH7095_RecalcPendingIntPEX(z);
 }
 
-void SH7095::SetNMI(bool level)
+void SH7095_SetNMI(SH7095* z, bool level)
 {
- if(NMILevel != level && level == (bool)(ICR & 0x100))
+ if(z->NMILevel != level && level == (bool)(z->ICR & 0x100))
  {
-  SetPEX(PEX_NMI);
+  SH7095_SetPEX(z, SH7095_PEX_NMI);
 
-  if(Standby)
+  if(z->Standby)
   {
-   WDT.WTCSR |= 0x08;
-   FRT_WDT_Recalc_NET();
+   z->WDT.WTCSR |= 0x08;
+   SH7095_FRT_WDT_Recalc_NET(z);
   }
   else
   {
-   DMAOR |= 0x02;	// TODO: NMIF; set always, or only when DMA was active?
-   DMA_RecalcRunning();
+   z->DMAOR |= 0x02;	// TODO: NMIF; set always, or only when DMA was active?
+   SH7095_DMA_RecalcRunning(z);
   }
  }
- NMILevel = level;
+ z->NMILevel = level;
 }
 
-void SH7095::SetMD5(bool level)
+void SH7095_SetMD5(SH7095* z, bool level)
 {
- BSC.BCR1 = (BSC.BCR1 & 0x7FFF) | (level << 15);
+ z->BSC.BCR1 = (z->BSC.BCR1 & 0x7FFF) | (level << 15);
 }
 
-void SH7095::SetIRL(unsigned level)
+void SH7095_SetIRL(SH7095* z, unsigned level)
 {
  assert(level < 16);
 
- IRL = level;
- RecalcPendingIntPEX();
+ z->IRL = level;
+ SH7095_RecalcPendingIntPEX(z);
 }
 
-void SH7095::ForceInternalEventUpdates(void)
+void SH7095_ForceInternalEventUpdates(SH7095* z)
 {
- if(MDFN_UNLIKELY(timestamp == SS_EVENT_DISABLED_TS))
+ if(MDFN_UNLIKELY(z->timestamp == SS_EVENT_DISABLED_TS))
   return;
 
- FRT_WDT_Update();
- FRT_WDT_Recalc_NET();
+ SH7095_FRT_WDT_Update(z);
+ SH7095_FRT_WDT_Recalc_NET(z);
 }
 
 //
-// Default priority(for same ipr value), highest to lowest: 
+// Default priority(for same ipr value), highest to lowest:
 //  NMI
 //  User break
 //  IRL15
@@ -2647,52 +4492,52 @@ void SH7095::ForceInternalEventUpdates(void)
 //  DIVU
 //  DMAC0
 //  DMAC1
-//  WDT
+//  z->WDT
 //  REF
-//  SCI-ERI
-//  SCI-RXI
-//  SCI-TXI
-//  SCI-TEI
-//  FRT-ICI
-//  FRT-OCI
-//  FRT-OVI
+//  z->SCI-ERI
+//  z->SCI-RXI
+//  z->SCI-TXI
+//  z->SCI-TEI
+//  z->FRT-ICI
+//  z->FRT-OCI
+//  z->FRT-OVI
 //
 //
-uint8 INLINE SH7095::GetPendingInt(uint8* vecnum_out)
+static INLINE uint8_t SH7095_GetPendingInt(SH7095* z, uint8_t* vecnum_out)
 {
  unsigned ipr;
  unsigned vecnum;
  unsigned tmp_ipr;
 
- ipr = IRL;
- vecnum = (IRL >> 1) + VECNUM_INT_BASE;
+ ipr = z->IRL;
+ vecnum = (z->IRL >> 1) + SH7095_VECNUM_INT_BASE;
 
- if(vecnum_out && (ICR & 0x1) && IRL > 0) // External vec fetch has side effects, make sure to only do it if vecnum_out is non-NULL and ICR & 0x1, and if this is the interrupt being serviced.
+ if(vecnum_out && (z->ICR & 0x1) && z->IRL > 0) // External vec fetch has side effects, make sure to only do it if vecnum_out is non-NULL and z->ICR & 0x1, and if z is the interrupt being serviced.
   vecnum = ~0U;
 
  //
  //
  //
 
- if((DVCR & 0x3) == 0x3 && (tmp_ipr = ((IPRA >> 12) & 0xF)) > ipr)
+ if((z->DVCR & 0x3) == 0x3 && (tmp_ipr = ((z->IPRA >> 12) & 0xF)) > ipr)
  {
   ipr = tmp_ipr;
-  vecnum = (VCRDIV & 0x7F);
+  vecnum = (z->VCRDIV & 0x7F);
  }
 
  for(unsigned ch = 0; ch < 2; ch++)
  {
-  if((DMACH[ch].CHCR & 0x6) == 0x6 && (tmp_ipr = ((IPRA >> 8) & 0xF)) > ipr)
+  if((z->DMACH[ch].CHCR & 0x6) == 0x6 && (tmp_ipr = ((z->IPRA >> 8) & 0xF)) > ipr)
   {
    ipr = tmp_ipr;
-   vecnum = (DMACH[ch].VCR & 0x7F);
+   vecnum = (z->DMACH[ch].VCR & 0x7F);
   }
  }
 
- if((WDT.WTCSR & 0x80) && (tmp_ipr = ((IPRA >> 4) & 0xF)) > ipr)
+ if((z->WDT.WTCSR & 0x80) && (tmp_ipr = ((z->IPRA >> 4) & 0xF)) > ipr)
  {
   ipr = tmp_ipr;
-  vecnum = (VCRWDT >> 8) & 0x7F;
+  vecnum = (z->VCRWDT >> 8) & 0x7F;
  }
 
  //
@@ -2701,23 +4546,23 @@ uint8 INLINE SH7095::GetPendingInt(uint8* vecnum_out)
  //
  //
  //
- const uint32 frt_ip_tmp = (FRT.FTCSR & FRT.TIER & 0x8E);
- if(frt_ip_tmp && (tmp_ipr = ((IPRB >> 8) & 0xF)) > ipr)
+ const uint32_t frt_ip_tmp = (z->FRT.FTCSR & z->FRT.TIER & 0x8E);
+ if(frt_ip_tmp && (tmp_ipr = ((z->IPRB >> 8) & 0xF)) > ipr)
  {
   ipr = tmp_ipr;
 
   if(frt_ip_tmp & 0x80)	// ICI
-   vecnum = (VCRC >> 8) & 0x7F;
+   vecnum = (z->VCRC >> 8) & 0x7F;
   else if(frt_ip_tmp & 0x0C)	// OCIA+OCIB
-   vecnum = (VCRC >> 0) & 0x7F;
+   vecnum = (z->VCRC >> 0) & 0x7F;
   else 			// OVI
-   vecnum = (VCRD >> 8) & 0x7F;
+   vecnum = (z->VCRD >> 8) & 0x7F;
  }
 
  if(vecnum_out)
  {
   if(vecnum == ~0U)
-   vecnum = ExIVecFetch();
+   vecnum = z->ExIVecFetch();
 
   *vecnum_out = vecnum;
  }
@@ -2727,31 +4572,51 @@ uint8 INLINE SH7095::GetPendingInt(uint8* vecnum_out)
 
 //
 // Call after changes to:
-//	IRL
-//	SR
+//	z->IRL
+//	z->SR
 //
-//	IPRA
-//	IPRB
+//	z->IPRA
+//	z->IPRB
 //
-//	DMACH[*].CHCR
+//	z->DMACH[*].CHCR
 //
-//	DVCR
+//	z->DVCR
 //
-//	FRT.FTCSR
-//	FRT.TIER
+//	z->FRT.FTCSR
+//	z->FRT.TIER
 //
-void NO_INLINE SH7095::RecalcPendingIntPEX(void)
+static NO_INLINE void SH7095_RecalcPendingIntPEX(SH7095* z)
 {
- if(GetPendingInt(NULL) > ((SR >> 4) & 0xF))
-  SetPEX(PEX_INT);
+ if(SH7095_GetPendingInt(z, NULL) > ((z->SR >> 4) & 0xF))
+  SH7095_SetPEX(z, SH7095_PEX_INT);
  else
-  ClearPEX(PEX_INT);
+  SH7095_ClearPEX(z, SH7095_PEX_INT);
 }
 
-static const uint8 InstrDecodeTab[65536] =
-{
- #include "sh7095_idecodetab.inc"
-};
+/* Two-level compressed instruction decode table.  The flat 64KiB
+ * uint8[65536] form (sh7095_idecodetab.inc, still the source of truth)
+ * is losslessly compressed by tools/gen_idecodetab2.py into a 4KiB
+ * row-index array plus 48 distinct 16-entry rows (768 bytes) --
+ * 4864 bytes total, verified equivalent for all 65536 encodings at
+ * generation time.
+ *
+ * Rationale: the flat table is indexed by the raw instruction word, so
+ * its hot L1 dcache footprint scales with the diversity of executed
+ * code (one 64-byte line per 64 adjacent encodings), competing with
+ * the SH7095 struct, the dispatch tables, and the emulated I/D cache
+ * for L1 residency -- doubly so with two CPU instances interleaving at
+ * instruction granularity.  In the compressed form one RowIdx line
+ * covers a 1024-encoding span and the entire Rows array is 12 lines
+ * that stay pinned.  The cost is one extra dependent byte load, whose
+ * latency is hidden: the decoded op lands in the high byte of Pipe_ID
+ * and isn't consumed until the following Step's dispatch, a full
+ * emulated instruction later. */
+#include "sh7095_idecodetab2.inc"
+
+#define InstrDecodeTab_Lookup(instr_) \
+ ((uint32_t)InstrDecodeRows[InstrDecodeRowIdx[(uint32_t)(uint16_t)(instr_) >> 4]][(instr_) & 0xF])
+
+
 
 /*								*/
 /* TODO: Stop reading from memory when an exception is pending? */
@@ -2760,63 +4625,63 @@ static const uint8 InstrDecodeTab[65536] =
 {									\
  if(EmulateICache)							\
  {									\
-  Pipe_IF = (uint16)IBuffer;						\
+  z->Pipe_IF = (uint16_t)z->IBuffer;						\
 									\
-  if(!(PC & 0x2))							\
+  if(!(z->PC & 0x2))							\
   {									\
-   MemReadInstr(PC, IBuffer);						\
-   Pipe_IF = IBuffer >> 16;						\
+   MemReadInstr(z->PC, z->IBuffer);						\
+   z->Pipe_IF = z->IBuffer >> 16;						\
   }									\
  }									\
  else									\
  {									\
-  if(timestamp < (MA_until - ((int32)(PC & 0x2) << 28)))		\
-   timestamp = MA_until;						\
+  if(z->timestamp < (z->MA_until - ((int32_t)(z->PC & 0x2) << 28)))		\
+   z->timestamp = z->MA_until;						\
 									\
-  Pipe_IF = *(uint16*)(SH7095_FastMap[PC >> SH7095_EXT_MAP_GRAN_BITS] + PC);	\
+  z->Pipe_IF = *(uint16_t*)(SH7095_FastMap[z->PC >> SH7095_EXT_MAP_GRAN_BITS] + z->PC);	\
 									\
-  if(MDFN_UNLIKELY((int32)PC < 0))      /* Mr. Boooones */		\
-   Pipe_IF = Cache_ReadDataArray<uint16>(PC);				\
+  if(MDFN_UNLIKELY((int32_t)z->PC < 0))      /* Mr. Boooones */		\
+   z->Pipe_IF = SH7095_Cache_ReadDataArray_u16(z, z->PC);				\
  }									\
- timestamp++;								\
+ z->timestamp++;								\
 }
 
 #define FetchIF_ForceIBufferFill()					\
 {									\
  if(EmulateICache)							\
  {									\
-  MemReadInstr(PC &~ 2, IBuffer);					\
-  /*Pipe_IF = (uint16)(IBuffer >> (((PC & 2) ^ 2) << 3));*/		\
-  Pipe_IF = (uint16)IBuffer;						\
-  if(!(PC & 0x2))							\
-   Pipe_IF = IBuffer >> 16;						\
+  MemReadInstr(z->PC &~ 2, z->IBuffer);					\
+  /*z->Pipe_IF = (uint16_t)(z->IBuffer >> (((z->PC & 2) ^ 2) << 3));*/		\
+  z->Pipe_IF = (uint16_t)z->IBuffer;						\
+  if(!(z->PC & 0x2))							\
+   z->Pipe_IF = z->IBuffer >> 16;						\
  }									\
  else									\
  {									\
-  if(timestamp < MA_until)						\
-   timestamp = MA_until;						\
+  if(z->timestamp < z->MA_until)						\
+   z->timestamp = z->MA_until;						\
 									\
-  Pipe_IF = *(uint16*)(SH7095_FastMap[PC >> SH7095_EXT_MAP_GRAN_BITS] + PC);	\
+  z->Pipe_IF = *(uint16_t*)(SH7095_FastMap[z->PC >> SH7095_EXT_MAP_GRAN_BITS] + z->PC);	\
 									\
-  if(MDFN_UNLIKELY((int32)PC < 0))      /* Mr. Boooones */		\
-   Pipe_IF = Cache_ReadDataArray<uint16>(PC);				\
+  if(MDFN_UNLIKELY((int32_t)z->PC < 0))      /* Mr. Boooones */		\
+   z->Pipe_IF = SH7095_Cache_ReadDataArray_u16(z, z->PC);				\
  }									\
- timestamp++;								\
+ z->timestamp++;								\
 }
 
 #define DoID(IntPreventNext)						\
 {									\
- uint32 op = InstrDecodeTab[Pipe_IF];					\
- uint32 epo = EPending;							\
+ uint32_t op = InstrDecodeTab_Lookup(z->Pipe_IF);					\
+ uint32_t epo = z->EPending;							\
 									\
  if(IntPreventNext)							\
  {									\
-  epo &= ~(1U << (PEX_INT + EPENDING_PEXBITS_SHIFT));			\
-  if(!(epo & (0xFF << EPENDING_PEXBITS_SHIFT)))				\
+  epo &= ~(1U << (SH7095_PEX_INT + SH7095_EPENDING_PEXBITS_SHIFT));			\
+  if(!(epo & (0xFF << SH7095_EPENDING_PEXBITS_SHIFT)))				\
    epo = 0;								\
  }									\
 									\
- Pipe_ID = Pipe_IF | (op << 24) | epo;					\
+ z->Pipe_ID = z->Pipe_IF | (op << 24) | epo;					\
 }
 
 #define DoIDIF_MACRO(IntPreventNext)					\
@@ -2831,47 +4696,47 @@ static const uint8 InstrDecodeTab[65536] =
 #define DelayBranch(target_)						\
 {									\
  {									\
-  const uint32 target = (target_);					\
-  PC = target;								\
+  const uint32_t target = (target_);					\
+  z->PC = target;								\
  }									\
 									\
  /* Redecode the opcode from the 16-bit instruction to makes sure */	\
  /* exceptions won't be taken in the delay slot(due to op field   */	\
- /* being forced to 0xFF by OR'ing with EPending in the previous  */ 	\
+ /* being forced to 0xFF by OR'ing with z->EPending in the previous  */ 	\
  /* call to DoID()), and forces usage of the second half of the   */	\
  /* opcode table so we can generate illegal slot instruction      */	\
  /* exceptions as appropriate. */					\
- Pipe_ID = (uint16)Pipe_ID;						\
- Pipe_ID |= (InstrDecodeTab[Pipe_ID] | 0x80) << 24;			\
+ z->Pipe_ID = (uint16_t)z->Pipe_ID;						\
+ z->Pipe_ID |= (InstrDecodeTab_Lookup(z->Pipe_ID) | 0x80) << 24;			\
 									\
- if(MDFN_UNLIKELY(PC & 1))						\
+ if(MDFN_UNLIKELY(z->PC & 1))						\
  {									\
   /* Pending for the instruction after the delay slot instruction. */	\
-  SetPEX(PEX_CPUADDR);							\
+  SH7095_SetPEX(z, SH7095_PEX_CPUADDR);							\
  }									\
  else									\
  {									\
   /* This discards the previously-fetched instruction after the */	\
   /* delay slot instruction.  Poor, poor instruction. */		\
   if(EmulateICache)							\
-   UCRead_IF_Kludge = false;						\
+   z->UCRead_IF_Kludge = false;						\
   FetchIF_ForceIBufferFill()						\
   if(EmulateICache)							\
-   timestamp -= (PC >> 1) & UCRead_IF_Kludge; /* WTFBBQ?! */		\
+   z->timestamp -= (z->PC >> 1) & z->UCRead_IF_Kludge; /* WTFBBQ?! */		\
  }									\
 }
 
 #define Branch(target_)					\
 {									\
  {									\
-  const uint32 target = (target_);					\
+  const uint32_t target = (target_);					\
 									\
-  PC = target;								\
+  z->PC = target;								\
  }									\
 									\
- if(MDFN_UNLIKELY(PC & 1))						\
+ if(MDFN_UNLIKELY(z->PC & 1))						\
  {									\
-  SetPEX(PEX_CPUADDR);							\
+  SH7095_SetPEX(z, SH7095_PEX_CPUADDR);							\
   DoID(false);								\
  }									\
  else									\
@@ -2879,29 +4744,28 @@ static const uint8 InstrDecodeTab[65536] =
   /* This sequence discards the previously-fetched two instructions */	\
   /* after the branch instruction. */					\
   if(EmulateICache)							\
-   UCRead_IF_Kludge = false;						\
+   z->UCRead_IF_Kludge = false;						\
   FetchIF_ForceIBufferFill();						\
   if(EmulateICache)							\
-   timestamp -= (PC >> 1) & UCRead_IF_Kludge; /* WTFBBQ?! */		\
-  PC += 2;								\
+   z->timestamp -= (z->PC >> 1) & z->UCRead_IF_Kludge; /* WTFBBQ?! */		\
+  z->PC += 2;								\
   DoIDIF(false);							\
  }									\
 }
 
-
 /* Remember to use with BEGIN_OP_DLYIDIF instead of BEGIN_OP */
 #define UCDelayBranch(target)						\
 {									\
- PC = target;								\
+ z->PC = target;								\
 									\
- Pipe_ID = Pipe_IF | ((InstrDecodeTab[Pipe_IF] | 0x80) << 24);		\
+ z->Pipe_ID = z->Pipe_IF | ((InstrDecodeTab_Lookup(z->Pipe_IF) | 0x80) << 24);		\
 									\
- timestamp++;								\
+ z->timestamp++;								\
 									\
- if(MDFN_UNLIKELY(PC & 1))						\
+ if(MDFN_UNLIKELY(z->PC & 1))						\
  {									\
   /* Pending for the instruction after the delay slot instruction. */	\
-  SetPEX(PEX_CPUADDR);							\
+  SH7095_SetPEX(z, SH7095_PEX_CPUADDR);							\
  }									\
  else									\
  {									\
@@ -2910,122 +4774,395 @@ static const uint8 InstrDecodeTab[65536] =
 }
 
 /* Remember to use with BEGIN_OP_DLYIDIF instead of BEGIN_OP */
-#define UCRelDelayBranch(disp) UCDelayBranch(PC + (disp))
+#define UCRelDelayBranch(disp) UCDelayBranch(z->PC + (disp))
 
 #define CondRelBranch(cond, disp)	\
 {					\
  if(cond)				\
-  Branch(PC + (disp));	\
+  Branch(z->PC + (disp));	\
 }
 
 #define CondRelDelayBranch(cond, disp)	\
 {					\
  if(cond)				\
-  DelayBranch(PC + (disp));		\
+  DelayBranch(z->PC + (disp));		\
 }
 
-/* Reset/Poweron exception handling. */
+/* SH7095_Reset_TBD_/Poweron exception handling. */
 #define Exception_ResPow(vecnum, new_PC)				\
 {									\
- timestamp += 2;							\
- timestamp = std::max<sscpu_timestamp_t>(MA_until, timestamp);		\
+ z->timestamp += 2;							\
+ z->timestamp = ((sscpu_timestamp_t)(z->MA_until) > (sscpu_timestamp_t)(z->timestamp) ? (sscpu_timestamp_t)(z->MA_until) : (sscpu_timestamp_t)(z->timestamp));		\
 									\
  MemRead32(((vecnum) + 0) << 2, new_PC);				\
- MemRead32(((vecnum) + 1) << 2, R[15]);					\
+ MemRead32(((vecnum) + 1) << 2, z->R[15]);					\
 }
 
 #define Exception(vecnum, new_PC)				\
 {									\
- timestamp += 2;							\
- timestamp = std::max<sscpu_timestamp_t>(MA_until, timestamp);		\
+ z->timestamp += 2;							\
+ z->timestamp = ((sscpu_timestamp_t)(z->MA_until) > (sscpu_timestamp_t)(z->timestamp) ? (sscpu_timestamp_t)(z->MA_until) : (sscpu_timestamp_t)(z->timestamp));		\
 									\
- /* Save SR to stack */							\
- /* Save PC to stack */							\
+ /* Save z->SR to stack */							\
+ /* Save z->PC to stack */							\
  /* Read exception vector table */					\
- R[15] -= 4;								\
- MemWrite32(R[15], SR);							\
- timestamp++;								\
- R[15] -= 4;								\
- MemWrite32(R[15], PC);							\
- timestamp++;								\
- timestamp++;								\
- MemRead32(VBR + ((vecnum) << 2), new_PC);				\
- timestamp++;								\
+ z->R[15] -= 4;								\
+ MemWrite32(z->R[15], z->SR);							\
+ z->timestamp++;								\
+ z->R[15] -= 4;								\
+ MemWrite32(z->R[15], z->PC);							\
+ z->timestamp++;								\
+ z->timestamp++;								\
+ MemRead32(z->VBR + ((vecnum) << 2), new_PC);				\
+ z->timestamp++;								\
 									\
 }
 
-
 /*
- PC == 0
+ z->PC == 0
  instr = [?]
  ID = [?]
  IF = [0]
 
- PC == 2
+ z->PC == 2
  instr = [?]
  ID = [0]
  IF = [2]
 
- PC == 4
+ z->PC == 4
  instr = [0]
  ID = [2]
  IF = [4]
 
 */
 
-#define DoIDIF(IntPreventNext) DoIDIF_NI<which, EmulateICache, IntPreventNext>()
+/* DoIDIF macro dispatches to one of 4 named
+ * NO_INLINE variants based on (EmulateICache, IntPreventNext).
+ * Both bools are compile-time at macro expansion (EmulateICache
+ * is the enclosing Step/RunLoop template arg, IntPreventNext
+ * is a macro arg passed as a literal at every callsite), so
+ * gcc -O2 folds the 4-way if-chain to a single call. */
+#define DoIDIF(IntPreventNext)							\
+do {										\
+ if(EmulateICache)								\
+ {										\
+  if(IntPreventNext) SH7095_DoIDIF_NI_C1_I1(z);						\
+  else               SH7095_DoIDIF_NI_C1_I0(z);						\
+ }										\
+ else										\
+ {										\
+  if(IntPreventNext) SH7095_DoIDIF_NI_C0_I1(z);						\
+  else               SH7095_DoIDIF_NI_C0_I0(z);						\
+ }										\
+} while(0)
 
-#define OnChipRegRead(T, A) OnChipRegRead_INLINE<T>(A)
-#define ExtBusRead(T, BurstHax, A) ExtBusRead_NI<which, false, T, BurstHax>(A)
-#define ExtBusWrite(T, A, V) ExtBusWrite_NI<which, false, T>(A, V)
+#define OnChipRegRead(T, A)							\
+        ( (sizeof(T) == 1) ? (T)SH7095_OnChipRegRead_INLINE_u8(z, A)		\
+        : (sizeof(T) == 2) ? (T)SH7095_OnChipRegRead_INLINE_u16(z, A)		\
+                           : (T)SH7095_OnChipRegRead_INLINE_u32(z, A) )
+/* master-CPU dispatch.  `which` is the outer template arg
+ * (compile-time const, 0 or 1), sizeof(T) is concrete at macro
+ * expansion, BurstHax is a literal at every call site -- gcc -O2
+ * folds the ternary chain to a single direct call. */
+#define ExtBusRead(T, BurstHax, A)                                                                                            \
+          ( (sizeof(T) == 1) ? (T)((BurstHax) ? ((which) ? ExtBusRead_NI_w1_SP0_u8_BH1(A)  : ExtBusRead_NI_w0_SP0_u8_BH1(A))   \
+                                              : ((which) ? ExtBusRead_NI_w1_SP0_u8_BH0(A)  : ExtBusRead_NI_w0_SP0_u8_BH0(A)))  \
+          : (sizeof(T) == 2) ? (T)((BurstHax) ? ((which) ? ExtBusRead_NI_w1_SP0_u16_BH1(A) : ExtBusRead_NI_w0_SP0_u16_BH1(A))  \
+                                              : ((which) ? ExtBusRead_NI_w1_SP0_u16_BH0(A) : ExtBusRead_NI_w0_SP0_u16_BH0(A))) \
+                             : (T)((BurstHax) ? ((which) ? ExtBusRead_NI_w1_SP0_u32_BH1(A) : ExtBusRead_NI_w0_SP0_u32_BH1(A))  \
+                                              : ((which) ? ExtBusRead_NI_w1_SP0_u32_BH0(A) : ExtBusRead_NI_w0_SP0_u32_BH0(A))) )
+#define ExtBusWrite(T, A, V)                                                                                       \
+do {                                                                                                                \
+  if(sizeof(T) == 1)      { if(which) ExtBusWrite_NI_w1_SP0_u8 (A, V); else ExtBusWrite_NI_w0_SP0_u8 (A, V); }      \
+  else if(sizeof(T) == 2) { if(which) ExtBusWrite_NI_w1_SP0_u16(A, V); else ExtBusWrite_NI_w0_SP0_u16(A, V); }      \
+  else                    { if(which) ExtBusWrite_NI_w1_SP0_u32(A, V); else ExtBusWrite_NI_w0_SP0_u32(A, V); }      \
+} while(0)
 
-#define MemReadInstr(A, outval) { outval = (MRFPI[(A) >> 29](A)); }
-#define MemRead8(A, outval) { outval = (MRFP8[(A) >> 29](A)); }
-#define MemRead16(A, outval) { outval = (MRFP16[(A) >> 29](A)); }
-#define MemRead32(A, outval) { outval = (MRFP32[(A) >> 29](A)); }
-#define MemRead16_I(A, outval) { outval = (MRFP16_I[(A) >> 29](A)); }
-#define MemRead32_I(A, outval) { outval = (MRFP32_I[(A) >> 29](A)); }
+#define MemReadInstr(A, outval) { outval = (z->MRFPI[(A) >> 29](A)); }
+#define MemRead8(A, outval) { outval = (z->MRFP8[(A) >> 29](A)); }
+#define MemRead16(A, outval) { outval = (z->MRFP16[(A) >> 29](A)); }
+#define MemRead32(A, outval) { outval = (z->MRFP32[(A) >> 29](A)); }
+#define MemRead16_I(A, outval) { outval = (z->MRFP16_I[(A) >> 29](A)); }
+#define MemRead32_I(A, outval) { outval = (z->MRFP32_I[(A) >> 29](A)); }
 
-#define MemWrite8(A, V) MWFP8[(A) >> 29]((A), (V));
-#define MemWrite16(A, V) MWFP16[(A) >> 29]((A), (V));
-#define MemWrite32(A, V) MWFP32[(A) >> 29]((A), (V));
-#define CHECK_EXIT_RESUME() { if(EmulateICache && !which) { CPU[1].RunSlaveUntil(timestamp); } }
+#define MemWrite8(A, V) z->MWFP8[(A) >> 29]((A), (V));
+#define MemWrite16(A, V) z->MWFP16[(A) >> 29]((A), (V));
+#define MemWrite32(A, V) z->MWFP32[(A) >> 29]((A), (V));
+#define CHECK_EXIT_RESUME() { if(EmulateICache && !which) { SH7095_RunSlaveUntil(&CPU[1], z->timestamp); } }
 #define CONST_VAR(T, n) const T n
 #define RESUME_VAR(T, n) T n
 
-template<bool EmulateICache, bool IntPreventNext>
-INLINE void SH7095::DoIDIF_INLINE(void)
+static INLINE void SH7095_DoIDIF_INLINE_C0_I0(SH7095* z)
 {
- DoIDIF_MACRO(IntPreventNext);
+ const bool EmulateICache = false;
+ DoIDIF_MACRO(false);
 }
 
-template<unsigned which, bool EmulateICache, bool IntPreventNext>
-static NO_INLINE MDFN_HOT void DoIDIF_NI(void)
+static INLINE void SH7095_DoIDIF_INLINE_C0_I1(SH7095* z)
 {
- CPU[which].DoIDIF_INLINE<EmulateICache, IntPreventNext>();
+ const bool EmulateICache = false;
+ DoIDIF_MACRO(true);
 }
 
-template<unsigned which, bool EmulateICache>
-INLINE void SH7095::Step(void)
+static INLINE void SH7095_DoIDIF_INLINE_C1_I0(SH7095* z)
 {
+ const bool EmulateICache = true;
+ DoIDIF_MACRO(false);
+}
+
+static INLINE void SH7095_DoIDIF_INLINE_C1_I1(SH7095* z)
+{
+ const bool EmulateICache = true;
+ DoIDIF_MACRO(true);
+}
+
+MDFN_HIDE NO_INLINE MDFN_HOT void SH7095_DoIDIF_NI_C0_I0(SH7095* z)
+{
+ SH7095_DoIDIF_INLINE_C0_I0(z);
+}
+
+static NO_INLINE MDFN_HOT void SH7095_DoIDIF_NI_C0_I1(SH7095* z)
+{
+ SH7095_DoIDIF_INLINE_C0_I1(z);
+}
+
+static NO_INLINE MDFN_HOT void SH7095_DoIDIF_NI_C1_I0(SH7095* z)
+{
+ SH7095_DoIDIF_INLINE_C1_I0(z);
+}
+
+static NO_INLINE MDFN_HOT void SH7095_DoIDIF_NI_C1_I1(SH7095* z)
+{
+ SH7095_DoIDIF_INLINE_C1_I1(z);
+}
+
+FORCE_INLINE void SH7095_Step_w0_C0(SH7095* z)
+{
+ const unsigned which = 0;
+ const bool EmulateICache = false;
  //
- // Ideally, we would place SPEPRecover: after the FRT event check, but doing
+ // Ideally, we would place SPEPRecover: after the z->FRT event check, but doing
  // so causes gcc(multiple versions) to produce inconceivably awful code under certain conditions
  // (such as disabling all the SS_DBG stuff at compile-time) because it thinks it's an important loop
  // or something?(even with all our branch hinting!)
  //
  SPEPRecover:;
 
- if(MDFN_UNLIKELY(timestamp >= FRT_WDT_NextTS))
+ if(MDFN_UNLIKELY(z->timestamp >= z->FRT_WDT_NextTS))
  {
-  FRT_WDT_Update();
-  FRT_WDT_Recalc_NET();
+  SH7095_FRT_WDT_Update(z);
+  SH7095_FRT_WDT_Recalc_NET(z);
  }
 
- const uint32 instr = (uint16)Pipe_ID;
+ const uint32_t instr = (uint16_t)z->Pipe_ID;
  const unsigned instr_nyb1 = (instr >> 4) & 0xF;
  const unsigned instr_nyb2 = (instr >> 8) & 0xF;
 // asm volatile("":: "a"(instr_nyb1), "d"(instr_nyb2));
+ //
+ #include "sh7095_ops.inc"
+ //
+}
+
+/* Flat copy of the decoder for the JIT's inlined fetch: op id per
+ * 16-bit word, exactly InstrDecodeTab_Lookup. */
+MDFN_HIDE void SH7095_JIT_BuildOpIDTable(uint8_t* tab)
+{
+ unsigned i;
+ for(i = 0; i < 65536; i++)
+  tab[i] = (uint8_t)InstrDecodeTab_Lookup(i);
+}
+
+/* MAC.L / MAC.W arithmetic for the JIT, on the operands the handler has
+ * stored in the interpreter's own resume fields: the same statements as
+ * the op bodies after their two reads. */
+MDFN_HIDE void SH7095_JIT_MACL_Arith(SH7095* z)
+{
+ const int32_t m0 = z->Resume_MAC_L_m0, m1 = z->Resume_MAC_L_m1;
+ uint64_t a, b, sum;
+ a = SH7095_GetMAC64(z);
+ b = (int64_t)m0 * m1;
+ sum = a + b;
+ if(SH7095_GetS(z) && sum > 0x00007FFFFFFFFFFFULL && sum < 0xFFFF800000000000ULL)
+ {
+  if((int32_t)(m0 ^ m1) < 0)
+   sum = 0xFFFF800000000000ULL;
+  else
+   sum = 0x00007FFFFFFFFFFFULL;
+ }
+ SH7095_SetMAC64(z, sum);
+}
+
+MDFN_HIDE void SH7095_JIT_MACW_Arith(SH7095* z)
+{
+ const int16_t m0 = z->Resume_MAC_W_m0, m1 = z->Resume_MAC_W_m1;
+ if(SH7095_GetS(z))
+ {
+  int32_t b = (int32_t)m0 * m1;
+  uint64_t sum = (int64_t)(int32_t)z->MACL + b;
+  if(sum > 0x000000007FFFFFFFULL && sum < 0xFFFFFFFF80000000ULL)
+  {
+   z->MACH |= 1;
+   if(b < 0)
+    sum = 0x80000000ULL;
+   else
+    sum = 0x7FFFFFFFULL;
+  }
+  z->MACL = sum;
+ }
+ else
+  SH7095_SetMAC64(z, SH7095_GetMAC64(z) + (int64_t)m0 * m1);
+}
+
+/* Branch primitives for the JIT, the macros under the master /
+ * no-icache constants.  UCDelayBranch is for ops that do not prefetch
+ * (BEGIN_OP_DLYIDIF: BRA/BSR/JMP/JSR/RTS...), DelayBranch for ones that
+ * do (BF/S, BT/S), Branch for the non-delayed conditionals (BF, BT). */
+MDFN_HIDE void SH7095_JIT_UCDelayBranch_C0(SH7095* z, uint32_t target)
+{
+ const unsigned which = 0; const bool EmulateICache = false; (void)which;
+ UCDelayBranch(target);
+}
+/* (Parameter deliberately not named `target`: DelayBranch/Branch declare
+ * a local of that name from their argument.) */
+MDFN_HIDE void SH7095_JIT_DelayBranch_C0(SH7095* z, uint32_t tgt)
+{
+ const unsigned which = 0; const bool EmulateICache = false; (void)which;
+ DelayBranch(tgt);
+}
+MDFN_HIDE void SH7095_JIT_Branch_C0(SH7095* z, uint32_t tgt)
+{
+ const unsigned which = 0; const bool EmulateICache = false; (void)which;
+ Branch(tgt);
+}
+
+/* The tail of FUSE_COND_BRANCH for the JIT: called by a handler for a
+ * fusion-source op (TST, CMP/GT, DT, CMP/EQ #imm, TST #imm) once it has
+ * set T and found the next op byte to be BF or BT.  Same statements as
+ * the macro: consume the branch word, fetch the one after, branch. */
+MDFN_HIDE void SH7095_JIT_FusedCondBranch_C0(SH7095* z, bool cond)
+{
+ const unsigned which = 0;
+ const bool EmulateICache = false;
+ const uint16_t br_instr = (uint16_t)z->Pipe_ID;
+ (void)which;
+ z->PC += 2;
+ DoIDIF(false);
+ CondRelBranch(cond, (uint32_t)(int8_t)br_instr << 1);
+}
+
+/* Out-of-line copy of the master's no-icache step, for the JIT's
+ * fallback: the inline one stays in its own RunLoop untouched. */
+static NO_INLINE MDFN_HOT void SH7095_Step_w0_C0_NI(SH7095* z)
+{
+ SH7095_Step_w0_C0(z);
+}
+
+/* Master step with the instruction JIT (see sh7095_jit.h).  Same
+ * FRT/WDT check as the interpreter; an ordinary instruction (op byte
+ * < 0x80: not a delay slot, no exception pending) with a native
+ * handler runs it, everything else runs the interpreter's switch. */
+static FORCE_INLINE void SH7095_Step_JIT_w0_C0(SH7095* z)
+{
+ if(MDFN_UNLIKELY(z->timestamp >= z->FRT_WDT_NextTS))
+ {
+  SH7095_FRT_WDT_Update(z);
+  SH7095_FRT_WDT_Recalc_NET(z);
+ }
+ /* Dispatch when the op byte is the word's own decode, with or without
+  * the delay-slot flag: every word with a handler is a non-branch op
+  * whose delay-slot case shares the body verbatim.  Pseudo-ops and the
+  * exception pseudo-op carry other op bytes and go to the interpreter. */
+ { static int off = -1; if(off < 0) off = getenv("SH2JIT_OFF") != NULL; if(off) { SH7095_Step_w0_C0_NI(z); return; } }   /* control: measure the JIT loop with every step on the interpreter */
+ /* Slave powered off, ordinary instruction (no delay flag, no exception):
+  * run a compiled block; it exits at an interpreter-exact step boundary. */
+ if((z->Pipe_ID >> 24) == SH2JIT_OpID[z->Pipe_ID & 0xFFFF] && CPU[1].timestamp == SS_EVENT_DISABLED_TS && SH2JIT_RunBlock(z))
+  return;
+ if(MDFN_LIKELY(((z->Pipe_ID >> 24) & 0x7F) == SH2JIT_OpID[z->Pipe_ID & 0xFFFF]))
+ {
+  void (*h)(struct SH7095*) = SH2JIT_Table[z->Pipe_ID & 0xFFFF];
+  if(MDFN_UNLIKELY(!h))
+   h = SH2JIT_Handler(z->Pipe_ID & 0xFFFF);
+  if(MDFN_LIKELY(h != NULL))
+  {
+#ifndef SH2JIT_VERIFY
+   /* One or more instructions natively; the C loop's checks below are
+    * idempotent for whatever the chain already applied. */
+#ifdef SH2JIT_COUNT
+   SH2JIT_ChainCount++;
+#endif
+   SH2JIT_RunChain(z);
+   return;
+#else
+   /* Debug: run the handler on a copy and the interpreter on the real
+    * state, then compare.  Valid while no handler writes memory. */
+   {
+    static SH7095 tmp; static unsigned reported;
+    const uint32_t instr = z->Pipe_ID & 0xFFFF;
+    const unsigned opb = z->Pipe_ID >> 24;
+    if(!SH2JIT_Pure[instr]) { SH2JIT_SetSingleStep(true); SH2JIT_RunChain(z); return; }   /* memory ops can't be run twice */
+    memcpy(&tmp, z, sizeof tmp);
+    (void)h;
+    SH2JIT_SetSingleStep(true);
+    SH2JIT_RunChain(&tmp);
+    SH7095_Step_w0_C0_NI(z);
+    if(memcmp(&tmp, z, sizeof tmp) && reported < 8)
+    {
+     const unsigned char* a = (const unsigned char*)&tmp; const unsigned char* b = (const unsigned char*)z;
+     size_t i; reported++;
+     for(i = 0; i < sizeof tmp; i++) if(a[i] != b[i]) break;
+     fprintf(stderr, "SH2JIT mismatch instr=%04x opbyte=%02x first byte off=%zu (R=%zu PC=%zu SR=%zu ts=%zu MA=%zu WB=%zu Pipe_ID=%zu) jit=%08x interp=%08x\n",
+      instr, opb, i, offsetof(SH7095, R), offsetof(SH7095, PC), offsetof(SH7095, SR), offsetof(SH7095, timestamp), offsetof(SH7095, MA_until), offsetof(SH7095, WB_until), offsetof(SH7095, Pipe_ID),
+      *(const uint32_t*)(a + (i & ~3u)), *(const uint32_t*)(b + (i & ~3u)));
+    }
+    return;
+   }
+#endif
+   h(z);
+   return;
+  }
+ }
+ { static int tr = -1; if(tr < 0) tr = getenv("SH2JIT_TRACEFB") != NULL; if(tr) fprintf(stderr, "F %04x %02x\n", z->Pipe_ID & 0xFFFF, z->Pipe_ID >> 24); }
+ SH7095_Step_w0_C0_NI(z);
+#ifdef SH2JIT_COUNT
+ SH2JIT_FallbackCount++;
+#endif
+}
+
+FORCE_INLINE void SH7095_Step_w0_C1(SH7095* z)
+{
+ const unsigned which = 0;
+ const bool EmulateICache = true;
+ SPEPRecover:;
+
+ if(MDFN_UNLIKELY(z->timestamp >= z->FRT_WDT_NextTS))
+ {
+  SH7095_FRT_WDT_Update(z);
+  SH7095_FRT_WDT_Recalc_NET(z);
+ }
+
+ const uint32_t instr = (uint16_t)z->Pipe_ID;
+ const unsigned instr_nyb1 = (instr >> 4) & 0xF;
+ const unsigned instr_nyb2 = (instr >> 8) & 0xF;
+ //
+ #include "sh7095_ops.inc"
+ //
+}
+
+FORCE_INLINE void SH7095_Step_w1_C0(SH7095* z)
+{
+ const unsigned which = 1;
+ const bool EmulateICache = false;
+ SPEPRecover:;
+
+ if(MDFN_UNLIKELY(z->timestamp >= z->FRT_WDT_NextTS))
+ {
+  SH7095_FRT_WDT_Update(z);
+  SH7095_FRT_WDT_Recalc_NET(z);
+ }
+
+ const uint32_t instr = (uint16_t)z->Pipe_ID;
+ const unsigned instr_nyb1 = (instr >> 4) & 0xF;
+ const unsigned instr_nyb2 = (instr >> 8) & 0xF;
  //
  #include "sh7095_ops.inc"
  //
@@ -3059,26 +5196,38 @@ INLINE void SH7095::Step(void)
 
 #define DoIDIF(IntPreventNext) DoIDIF_MACRO(IntPreventNext)
 
-#define OnChipRegRead(T, A) OnChipRegRead_NI<1, T>(A)
-#define ExtBusRead(T, BurstHax, A) ExtBusRead_NI<1, true, T, BurstHax>(A)
-#define ExtBusWrite(T, A, V) ExtBusWrite_NI<1, true, T>(A, V)
+#define OnChipRegRead(T, A)							\
+        ( (sizeof(T) == 1) ? (T)OnChipRegRead_NI_u8(A)				\
+        : (sizeof(T) == 2) ? (T)OnChipRegRead_NI_u16(A)				\
+                           : (T)OnChipRegRead_NI_u32(A) )
+/* slave-CPU dispatch (w=1, SP=true fixed). */
+#define ExtBusRead(T, BurstHax, A)                                              \
+          ( (sizeof(T) == 1) ? (T)((BurstHax) ? ExtBusRead_NI_w1_SP1_u8_BH1(A)  : ExtBusRead_NI_w1_SP1_u8_BH0(A))   \
+          : (sizeof(T) == 2) ? (T)((BurstHax) ? ExtBusRead_NI_w1_SP1_u16_BH1(A) : ExtBusRead_NI_w1_SP1_u16_BH0(A))  \
+                             : (T)((BurstHax) ? ExtBusRead_NI_w1_SP1_u32_BH1(A) : ExtBusRead_NI_w1_SP1_u32_BH0(A))  )
+#define ExtBusWrite(T, A, V)                            \
+do {                                                    \
+  if(sizeof(T) == 1)      ExtBusWrite_NI_w1_SP1_u8 (A, V); \
+  else if(sizeof(T) == 2) ExtBusWrite_NI_w1_SP1_u16(A, V); \
+  else                    ExtBusWrite_NI_w1_SP1_u32(A, V); \
+} while(0)
 
-#define MemReadInstr(A, outval) MemRead(true,  uint32, ((A) >> 29), (CCR & CCR_CE), (A), outval, /**/ Resume_uint32_A, Resume_unmasked_A, Resume_cent, Resume_way_match)
-#define MemRead8(A, outval)	MemRead(false, uint8,  ((A) >> 29), (CCR & CCR_CE), (A), outval, /**/ Resume_uint8_A,  Resume_unmasked_A, Resume_cent, Resume_way_match)
-#define MemRead16(A, outval)	MemRead(false, uint16, ((A) >> 29), (CCR & CCR_CE), (A), outval, /**/ Resume_uint16_A, Resume_unmasked_A, Resume_cent, Resume_way_match)
-#define MemRead32(A, outval)	MemRead(false, uint32, ((A) >> 29), (CCR & CCR_CE), (A), outval, /**/ Resume_uint32_A, Resume_unmasked_A, Resume_cent, Resume_way_match)
-#define MemRead16_I(A, outval)	MemRead(-1,    uint16, ((A) >> 29), (CCR & CCR_CE), (A), outval, /**/ Resume_uint16_A, Resume_unmasked_A, Resume_cent, Resume_way_match)
-#define MemRead32_I(A, outval)	MemRead(-1,    uint32, ((A) >> 29), (CCR & CCR_CE), (A), outval, /**/ Resume_uint32_A, Resume_unmasked_A, Resume_cent, Resume_way_match)
+#define MemReadInstr(A, outval) MemRead(true,  uint32_t, ((A) >> 29), (z->CCR & SH7095_CCR_CE), (A), outval, /**/ z->Resume_uint32_A, z->Resume_unmasked_A, z->Resume_set, z->Resume_way_match)
+#define MemRead8(A, outval)	MemRead(false, uint8_t,  ((A) >> 29), (z->CCR & SH7095_CCR_CE), (A), outval, /**/ z->Resume_uint8_A,  z->Resume_unmasked_A, z->Resume_set, z->Resume_way_match)
+#define MemRead16(A, outval)	MemRead(false, uint16_t, ((A) >> 29), (z->CCR & SH7095_CCR_CE), (A), outval, /**/ z->Resume_uint16_A, z->Resume_unmasked_A, z->Resume_set, z->Resume_way_match)
+#define MemRead32(A, outval)	MemRead(false, uint32_t, ((A) >> 29), (z->CCR & SH7095_CCR_CE), (A), outval, /**/ z->Resume_uint32_A, z->Resume_unmasked_A, z->Resume_set, z->Resume_way_match)
+#define MemRead16_I(A, outval)	MemRead(-1,    uint16_t, ((A) >> 29), (z->CCR & SH7095_CCR_CE), (A), outval, /**/ z->Resume_uint16_A, z->Resume_unmasked_A, z->Resume_set, z->Resume_way_match)
+#define MemRead32_I(A, outval)	MemRead(-1,    uint32_t, ((A) >> 29), (z->CCR & SH7095_CCR_CE), (A), outval, /**/ z->Resume_uint32_A, z->Resume_unmasked_A, z->Resume_set, z->Resume_way_match)
 
-#define MemWrite8(A, V)  MemWrite(uint8,  ((A) >> 29), (CCR & CCR_CE), (A), (V), /**/ Resume_uint8_A,  Resume_unmasked_A, Resume_uint8_V)
-#define MemWrite16(A, V) MemWrite(uint16, ((A) >> 29), (CCR & CCR_CE), (A), (V), /**/ Resume_uint16_A, Resume_unmasked_A, Resume_uint16_V)
-#define MemWrite32(A, V) MemWrite(uint32, ((A) >> 29), (CCR & CCR_CE), (A), (V), /**/ Resume_uint32_A, Resume_unmasked_A, Resume_uint32_V)
+#define MemWrite8(A, V)  MemWrite(uint8_t,  ((A) >> 29), (z->CCR & SH7095_CCR_CE), (A), (V), /**/ z->Resume_uint8_A,  z->Resume_unmasked_A, z->Resume_uint8_V)
+#define MemWrite16(A, V) MemWrite(uint16_t, ((A) >> 29), (z->CCR & SH7095_CCR_CE), (A), (V), /**/ z->Resume_uint16_A, z->Resume_unmasked_A, z->Resume_uint16_V)
+#define MemWrite32(A, V) MemWrite(uint32_t, ((A) >> 29), (z->CCR & SH7095_CCR_CE), (A), (V), /**/ z->Resume_uint32_A, z->Resume_unmasked_A, z->Resume_uint32_V)
 
 #define CHECK_EXIT_RESUME__(n)		\
 	{					\
-	 if(timestamp >= bound_timestamp)	\
+	 if(z->timestamp >= bound_timestamp)	\
 	 {					\
-	  ResumePoint = &&Resume_ ## n;		\
+	  z->resume_id = (n);			\
 	  return;				\
 	 }					\
 	 Resume_ ## n:;				\
@@ -3087,41 +5236,61 @@ INLINE void SH7095::Step(void)
 #define CHECK_EXIT_RESUME_(n) CHECK_EXIT_RESUME__(n)
 #define CHECK_EXIT_RESUME() CHECK_EXIT_RESUME_(__COUNTER__)
 
-#define instr Resume_instr
+#define instr z->Resume_instr
 #define instr_nyb1 ((instr >> 4) & 0xF)
 #define instr_nyb2 ((instr >> 8) & 0xF)
-#define opexec_MAC_L_m0 Resume_MAC_L_m0
-#define opexec_MAC_L_m1 Resume_MAC_L_m1
-#define opexec_MAC_W_m0 Resume_MAC_W_m0
-#define opexec_MAC_W_m1 Resume_MAC_W_m1
-#define opexec_ea Resume_ea
-#define opexec_new_PC Resume_new_PC
-#define opexec_new_SR Resume_new_SR
-#define opexec_ipr Resume_ipr
-#define opexec_exnum Resume_exnum
-#define opexec_vecnum Resume_vecnum
+#define opexec_MAC_L_m0 z->Resume_MAC_L_m0
+#define opexec_MAC_L_m1 z->Resume_MAC_L_m1
+#define opexec_MAC_W_m0 z->Resume_MAC_W_m0
+#define opexec_MAC_W_m1 z->Resume_MAC_W_m1
+#define opexec_ea z->Resume_ea
+#define opexec_new_PC z->Resume_new_PC
+#define opexec_new_SR z->Resume_new_SR
+#define opexec_ipr z->Resume_ipr
+#define opexec_exnum z->Resume_exnum
+#define opexec_vecnum z->Resume_vecnum
 #define CONST_VAR(T, n) T n; n
-#define RESUME_VAR(T, n) static_assert(std::is_same<T,decltype(n)>::value, "Resume variable type mismatch.")
+/* RESUME_VAR(T, n) -- compile-time check that the declared type T
+ * matches the actual type of `n` (which is z->Resume_<something>
+ * once the opexec_* macros have expanded).  Three language paths:
+ *
+ *   C++  -- std::is_same<T, decltype(n)>::value
+ *           (decltype is 11, std::is_same lives in <type_traits>
+ *           which mednafen-types.h already pulls in for TUs).
+ *
+ *   C (GCC / clang) -- __builtin_types_compatible_p(T, __typeof__(n))
+ *           (both are GCC extensions, available since gcc 2.x, also
+ *           accepted by clang -- no C11 / C23 dependency).
+ *
+ *   C (other, e.g. MSVC) -- sizeof(T) == sizeof(n)
+ *           Partial fallback.  Catches size mismatches (int8 vs int32)
+ *           but not signedness or unrelated-types-with-same-size
+ *           mismatches.  Better than no check; preserves MSVC C89
+ *           buildability without dropping the assertion entirely on
+ *           GCC / clang where the real check is available.
+ *
+ * The condition expression is wrapped in an extra set of parens so
+ * the comma inside `std::is_same<T, decltype(n)>` / inside
+ * `__builtin_types_compatible_p(T, __typeof__(n))` is not seen by
+ * the preprocessor as a MDFN_STATIC_ASSERT argument separator.
+ * Either branch funnels through MDFN_STATIC_ASSERT, so the actual
+ * static_assert / _Static_assert / negative-array fallback choice
+ * is the macro's problem, not ours. */
+#ifdef __cplusplus
+ #define RESUME_VAR(T, n) MDFN_STATIC_ASSERT((std::is_same<T, decltype(n)>::value), "Resume variable type mismatch.")
+#elif defined(__GNUC__) || defined(__clang__)
+ #define RESUME_VAR(T, n) MDFN_STATIC_ASSERT((__builtin_types_compatible_p(T, __typeof__(n))), "Resume variable type mismatch.")
+#else
+ #define RESUME_VAR(T, n) MDFN_STATIC_ASSERT(sizeof(T) == sizeof(n), "Resume variable size mismatch (full type check unavailable on this compiler).")
+#endif
 #define SH7095_NEED_RESUME_TABLE_INIT 1
 
-
-#define SH7095_DEBUG_MODE 0
 #include "sh7095s_cnorm.inc"
-static_assert(__COUNTER__ == 5000, "Unexpected __COUNTER__ value.");
-NO_CLONE NO_INLINE MDFN_HOT void SH7095::RunSlaveUntil(const sscpu_timestamp_t bound_timestamp)
+MDFN_STATIC_ASSERT(__COUNTER__ == 5000, "Unexpected __COUNTER__ value.");
+NO_CLONE NO_INLINE MDFN_HOT void SH7095_RunSlaveUntil(SH7095* z, const sscpu_timestamp_t bound_timestamp)
 {
  #include "sh7095s_rsu.inc"
 }
-#undef SH7095_DEBUG_MODE
-
-#define SH7095_DEBUG_MODE 1
-#include "sh7095s_cnorm_dm.inc"
-static_assert(__COUNTER__ == 10000, "Unexpected __COUNTER__ value.");
-NO_CLONE NO_INLINE MDFN_COLD void SH7095::RunSlaveUntil_Debug(const sscpu_timestamp_t bound_timestamp)
-{
- #include "sh7095s_rsu.inc"
-}
-#undef SH7095_DEBUG_MODE
 
 #if defined(__GNUC__) && !defined(__clang__)
  #pragma GCC pop_options
@@ -3164,199 +5333,222 @@ NO_CLONE NO_INLINE MDFN_COLD void SH7095::RunSlaveUntil_Debug(const sscpu_timest
 //
 //
 //
-void SH7095::StateAction(StateMem* sm, const unsigned load, const bool data_only, const char* sname)
+void SH7095_StateAction(SH7095* z, StateMem* sm, const unsigned load, const bool data_only, const char* sname)
 {
+ /* Field-name strings below intentionally omit the "z->" prefix:
+  * they are persisted into savestate files, so they must match
+  * the pre-phase-9 (member-function StateAction) spelling. */
  SFORMAT StateRegs[] =
  {
-  SFVAR(R),
-  SFVAR(PC),
-  SFVAR(CtrlRegs),
+  SFPTR32N(&(z->R)[0], (sizeof(z->R) / sizeof(uint32_t)), "R"),
+  SFVARN(z->PC, "PC"),
+  SFPTR32N(&(z->CtrlRegs)[0], (sizeof(z->CtrlRegs) / sizeof(uint32_t)), "CtrlRegs"),
 
-  SFVAR(timestamp),
-  SFVAR(MA_until),
-  SFVAR(MM_until),
-  SFVAR(write_finish_timestamp),
-  SFVAR(WB_until),
-  SFVAR(UCRead_IF_Kludge),
-  SFVAR(SysRegs),
+  SFVARN(z->timestamp,              "timestamp"),
+  SFVARN(z->MA_until,               "MA_until"),
+  SFVARN(z->MM_until,               "MM_until"),
+  SFVARN(z->write_finish_timestamp, "write_finish_timestamp"),
+  SFPTR32N(&(z->WB_until)[0], (sizeof(z->WB_until) / sizeof(sscpu_timestamp_t)), "WB_until"),
+  SFVARN(z->UCRead_IF_Kludge, "UCRead_IF_Kludge"),
+  SFPTR32N(&(z->SysRegs)[0], (sizeof(z->SysRegs) / sizeof(uint32_t)), "SysRegs"),
 
-  SFVAR(EPending),
-  SFVAR(Pipe_ID),
-  SFVAR(Pipe_IF),
+  SFVARN(z->EPending, "EPending"),
+  SFVARN(z->Pipe_ID,  "Pipe_ID"),
+  SFVARN(z->Pipe_IF,  "Pipe_IF"),
 
-  SFVAR(IBuffer),
+  SFVARN(z->IBuffer,  "IBuffer"),
 
-  SFPTR32(Cache->Tag, 4, 64, sizeof(*Cache), Cache),
-  SFVARN(Cache_LRU, "Cache->LRU"),
-  SFPTR32((uint32*)Cache->Data, 16, 64, sizeof(*Cache), Cache),	// Cast because it's stored as native-endian 32-bit.
+  SFPTR32N(&z->CacheTags[0][0], 4 * 64, "Cache->Tag"),
+  SFPTR8N(&(z->Cache_LRU)[0], (sizeof(z->Cache_LRU) / sizeof(uint8_t)), "Cache->LRU"),
+  // Cast because it's stored as native-endian 32-bit.  SFPTR32N (explicit
+  // name) rather than SFPTR32 (auto #x name): the typedef rename changed the
+  // cast spelling from (uint32*) to (uint32_t*), and SFPTR32 would stringize
+  // that into a different savestate field name.  Pass the original name
+  // verbatim to keep savestates byte-compatible.
+  SFPTR32N((uint32_t*)z->CacheData, 16 * 64, "(uint32*)Cache->Data"),
 
-  SFVAR(CCR),
+  SFVARN(z->CCR, "CCR"),
 
-  SFVAR(NMILevel),
-  SFVAR(IRL),
+  SFVARN(z->NMILevel, "NMILevel"),
+  SFVARN(z->IRL,      "IRL"),
 
-  SFVAR(IPRA),
-  SFVAR(IPRB),
-  SFVAR(VCRWDT),
-  SFVAR(VCRA),
-  SFVAR(VCRB),
-  SFVAR(VCRC),
-  SFVAR(VCRD),
-  SFVAR(ICR),
+  SFVARN(z->IPRA,   "IPRA"),
+  SFVARN(z->IPRB,   "IPRB"),
+  SFVARN(z->VCRWDT, "VCRWDT"),
+  SFVARN(z->VCRA,   "VCRA"),
+  SFVARN(z->VCRB,   "VCRB"),
+  SFVARN(z->VCRC,   "VCRC"),
+  SFVARN(z->VCRD,   "VCRD"),
+  SFVARN(z->ICR,    "ICR"),
 
  //
  //
  //
-  SFVAR(BSC.BCR1),
-  SFVAR(BSC.BCR2),
-  SFVAR(BSC.WCR),
-  SFVAR(BSC.MCR),
-  SFVAR(BSC.RTCSR),
-  SFVAR(BSC.RTCSRM),
-  SFVAR(BSC.RTCNT),
-  SFVAR(BSC.RTCOR),
+  SFVARN(z->BSC.BCR1,   "BSC.BCR1"),
+  SFVARN(z->BSC.BCR2,   "BSC.BCR2"),
+  SFVARN(z->BSC.WCR,    "BSC.WCR"),
+  SFVARN(z->BSC.MCR,    "BSC.MCR"),
+  SFVARN(z->BSC.RTCSR,  "BSC.RTCSR"),
+  SFVARN(z->BSC.RTCSRM, "BSC.RTCSRM"),
+  SFVARN(z->BSC.RTCNT,  "BSC.RTCNT"),
+  SFVARN(z->BSC.RTCOR,  "BSC.RTCOR"),
 
-  SFVAR(BSC.sdram_finish_time),
-  SFVAR(BSC.last_mem_time),
-  SFVAR(BSC.last_mem_addr),
-  SFVAR(BSC.last_mem_type),
+  SFVARN(z->BSC.sdram_finish_time, "BSC.sdram_finish_time"),
+  SFVARN(z->BSC.last_mem_time,     "BSC.last_mem_time"),
+  SFVARN(z->BSC.last_mem_addr,     "BSC.last_mem_addr"),
+  SFVARN(z->BSC.last_mem_type,     "BSC.last_mem_type"),
 
-  SFVAR(SBYCR),
-  SFVAR(Standby),
+  SFVARN(z->SBYCR,   "SBYCR"),
+  SFVARN(z->Standby, "Standby"),
 
-  SFVAR(FRT.lastts),
-  SFVAR(FRT.FTI),
-  SFVAR(FRT.FTCI),
-  SFVAR(FRT.FRC),
-  SFVAR(FRT.OCR),
-  SFVAR(FRT.FICR),
-  SFVAR(FRT.TIER),
-  SFVAR(FRT.FTCSR),
-  SFVAR(FRT.FTCSRM),
-  SFVAR(FRT.TCR),
-  SFVAR(FRT.TOCR),
-  SFVAR(FRT.RW_Temp),
+  SFVARN(z->FRT.lastts, "FRT.lastts"),
+  SFVARN(z->FRT.FTI,    "FRT.FTI"),
+  SFVARN(z->FRT.FTCI,   "FRT.FTCI"),
+  SFVARN(z->FRT.FRC,    "FRT.FRC"),
+  SFPTR16N(&(z->FRT.OCR)[0], (sizeof(z->FRT.OCR) / sizeof(uint16_t)), "FRT.OCR"),
+  SFVARN(z->FRT.FICR,    "FRT.FICR"),
+  SFVARN(z->FRT.TIER,    "FRT.TIER"),
+  SFVARN(z->FRT.FTCSR,   "FRT.FTCSR"),
+  SFVARN(z->FRT.FTCSRM,  "FRT.FTCSRM"),
+  SFVARN(z->FRT.TCR,     "FRT.TCR"),
+  SFVARN(z->FRT.TOCR,    "FRT.TOCR"),
+  SFVARN(z->FRT.RW_Temp, "FRT.RW_Temp"),
 
-  SFVAR(FRT_WDT_ClockDivider),
+  SFVARN(z->FRT_WDT_ClockDivider, "FRT_WDT_ClockDivider"),
 
-  SFVAR(FRT_WDT_NextTS),
+  SFVARN(z->FRT_WDT_NextTS, "FRT_WDT_NextTS"),
 
-  SFVAR(WDT.WTCSR),
-  SFVAR(WDT.WTCSRM),
-  SFVAR(WDT.WTCNT),
-  SFVAR(WDT.RSTCSR),
-  SFVAR(WDT.RSTCSRM),
+  SFVARN(z->WDT.WTCSR,   "WDT.WTCSR"),
+  SFVARN(z->WDT.WTCSRM,  "WDT.WTCSRM"),
+  SFVARN(z->WDT.WTCNT,   "WDT.WTCNT"),
+  SFVARN(z->WDT.RSTCSR,  "WDT.RSTCSR"),
+  SFVARN(z->WDT.RSTCSRM, "WDT.RSTCSRM"),
 
  // SFVAR(DMA_ClockCounter),
  // SFVAR(DMA_SGCounter),
-  SFVAR(DMA_Timestamp),
-  SFVAR(DMA_SGEndTimestamp),
-  SFVAR(DMA_RoundRobinRockinBoppin),
+  SFVARN(z->DMA_Timestamp,             "DMA_Timestamp"),
+  SFVARN(z->DMA_SGEndTimestamp,        "DMA_SGEndTimestamp"),
+  SFVARN(z->DMA_RoundRobinRockinBoppin,"DMA_RoundRobinRockinBoppin"),
 
-  SFVAR(DMA_PenaltyKludgeAmount),
-  SFVAR(DMA_PenaltyKludgeAccum),
+  SFVARN(z->DMA_PenaltyKludgeAmount, "DMA_PenaltyKludgeAmount"),
+  SFVARN(z->DMA_PenaltyKludgeAccum,  "DMA_PenaltyKludgeAccum"),
 
-  SFVAR(DMACH->SAR, 2, sizeof(*DMACH), DMACH),
-  SFVAR(DMACH->DAR, 2, sizeof(*DMACH), DMACH),
-  SFVAR(DMACH->TCR, 2, sizeof(*DMACH), DMACH),
-  SFVAR(DMACH->CHCR, 2, sizeof(*DMACH), DMACH),
-  SFVAR(DMACH->CHCRM, 2, sizeof(*DMACH), DMACH),
-  SFVAR(DMACH->VCR, 2, sizeof(*DMACH), DMACH),
-  SFVAR(DMACH->DRCR, 2, sizeof(*DMACH), DMACH),
+  SFVARN(z->DMACH->SAR,   2, sizeof(*z->DMACH), z->DMACH, "DMACH->SAR"),
+  SFVARN(z->DMACH->DAR,   2, sizeof(*z->DMACH), z->DMACH, "DMACH->DAR"),
+  SFVARN(z->DMACH->TCR,   2, sizeof(*z->DMACH), z->DMACH, "DMACH->TCR"),
+  SFVARN(z->DMACH->CHCR,  2, sizeof(*z->DMACH), z->DMACH, "DMACH->CHCR"),
+  SFVARN(z->DMACH->CHCRM, 2, sizeof(*z->DMACH), z->DMACH, "DMACH->CHCRM"),
+  SFVARN(z->DMACH->VCR,   2, sizeof(*z->DMACH), z->DMACH, "DMACH->VCR"),
+  SFVARN(z->DMACH->DRCR,  2, sizeof(*z->DMACH), z->DMACH, "DMACH->DRCR"),
 
-  SFVAR(DMAOR),
-  SFVAR(DMAORM),
+  SFVARN(z->DMAOR,  "DMAOR"),
+  SFVARN(z->DMAORM, "DMAORM"),
 
-  SFVAR(divide_finish_timestamp),
-  SFVAR(DVSR),
-  SFVAR(DVDNT),
-  SFVAR(DVDNTH),
-  SFVAR(DVDNTL),
-  SFVAR(DVDNTH_Shadow),
-  SFVAR(DVDNTL_Shadow),
-  SFVAR(VCRDIV),
-  SFVAR(DVCR),
+  SFVARN(z->divide_finish_timestamp, "divide_finish_timestamp"),
+  SFVARN(z->DVSR,         "DVSR"),
+  SFVARN(z->DVDNT,        "DVDNT"),
+  SFVARN(z->DVDNTH,       "DVDNTH"),
+  SFVARN(z->DVDNTL,       "DVDNTL"),
+  SFVARN(z->DVDNTH_Shadow,"DVDNTH_Shadow"),
+  SFVARN(z->DVDNTL_Shadow,"DVDNTL_Shadow"),
+  SFVARN(z->VCRDIV,       "VCRDIV"),
+  SFVARN(z->DVCR,         "DVCR"),
 
-  SFVAR(SCI.SMR),
-  SFVAR(SCI.BRR),
-  SFVAR(SCI.SCR),
-  SFVAR(SCI.TDR),
-  SFVAR(SCI.SSR),
-  SFVAR(SCI.SSRM),
-  SFVAR(SCI.RDR),
+  SFVARN(z->SCI.SMR,  "SCI.SMR"),
+  SFVARN(z->SCI.BRR,  "SCI.BRR"),
+  SFVARN(z->SCI.SCR,  "SCI.SCR"),
+  SFVARN(z->SCI.TDR,  "SCI.TDR"),
+  SFVARN(z->SCI.SSR,  "SCI.SSR"),
+  SFVARN(z->SCI.SSRM, "SCI.SSRM"),
+  SFVARN(z->SCI.RDR,  "SCI.RDR"),
 
-  SFVAR(SCI.RSR),
-  SFVAR(SCI.TSR),
+  SFVARN(z->SCI.RSR, "SCI.RSR"),
+  SFVARN(z->SCI.TSR, "SCI.TSR"),
 
-  SFVAR(ExtHalt),
-  SFVAR(ExtHaltDMA),
+  SFVARN(z->ExtHalt,    "ExtHalt"),
+  SFVARN(z->ExtHaltDMA, "ExtHaltDMA"),
 
-  SFVAR(PC_IF),
-  SFVAR(PC_ID),
+  SFVARN(z->PC_IF, "PC_IF"),
+  SFVARN(z->PC_ID, "PC_ID"),
 
   SFEND
  };
 
  MDFNSS_StateAction(sm, load, data_only, StateRegs, sname, false);
 
- if(this == &CPU[1])
-  StateAction_SlaveResume(sm, load, data_only, "SH2-S-Resume");
+ if(z == &CPU[1])
+  SH7095_StateAction_SlaveResume(z, sm, load, data_only, "SH2-S-Resume");
 }
 
-void SH7095::StateAction_SlaveResume(StateMem* sm, const unsigned load, const bool data_only, const char* sname)
+static void SH7095_StateAction_SlaveResume(SH7095* z, StateMem* sm, const unsigned load, const bool data_only, const char* sname)
 {
- int32 ResumePointI = -1;
- uint32 Resume_cent_I = 0;
+ int32_t ResumePointI = -1;
+ uint32_t Resume_cent_I = 0;
+
+ /* Savestate format compatibility: the persisted field is still
+  * `ResumePointI` (int32_t), holding the 0..511 index that the
+  * pre-conversion code used as a lookup into the now-deleted
+  * `ResumeTable[512]` array.  The table mapped index N to label
+  * `&&Resume_(top - N)` where `top` is 5512 (non-debug) or 10512
+  * (debug).  Now that the resume mechanism stores an integer id
+  * directly (5001..5512 or 10001..10512), translate to/from the
+  * legacy index form on save/load:
+  *
+  *    ResumePointI = top - resume_id     (save)
+  *    resume_id    = top - ResumePointI  (load)
+  *
+  * with -1 / 0 standing in for "no resume pending".  Old saves
+  * load to the same instruction-handler resume point as before. */
+ /* DM_Setting was always false in this libretro core (the debug-mode
+  * dispatch path was Mednafen-standalone debugger UI legacy and has
+  * been removed); the savestate format only ever used the
+  * non-debug resume-id space (top == 5512). */
+ const uint16_t top = 5512;
 
  if(!load)
  {
-  if(ResumePoint)
-  {
-   for(uint32 i = 0; i < 512; i++)
-   {
-    if(ResumeTableP[DM_Setting][i] == ResumePoint)
-    {
-     ResumePointI = i;
-     break;
-    }
-   }
-   assert(ResumePointI >= 0);
-  }
+  if(z->resume_id)
+   ResumePointI = (int32_t)top - (int32_t)z->resume_id;
 
-  if(Resume_cent)
-  {
-   Resume_cent_I = Resume_cent - Cache;
-   assert(Resume_cent_I < 0x40);
-  }
+  /* Wire name/semantics unchanged from the pointer era: a NULL
+   * Resume_cent serialized as 0, indistinguishable from set 0, and
+   * load always rebuilt a non-NULL pointer -- so a plain index
+   * round-trips identically. */
+  Resume_cent_I = z->Resume_set;
+  assert(Resume_cent_I < 0x40);
  }
 
+ /* As in SH7095_StateAction, the persisted field-name strings
+  * must drop the "z->" prefix to remain savestate-compatible
+  * with the pre-phase-9 (member-function) spelling.  Pure
+  * locals (ResumePointI, Resume_cent_I) stringize cleanly. */
  SFORMAT StateRegs[] =
  {
   SFVAR(ResumePointI),
-  SFVAR(Resume_uint8_A),
-  SFVAR(Resume_uint16_A),
-  SFVAR(Resume_uint32_A),
-  SFVAR(Resume_unmasked_A),
+  SFVARN(z->Resume_uint8_A,    "Resume_uint8_A"),
+  SFVARN(z->Resume_uint16_A,   "Resume_uint16_A"),
+  SFVARN(z->Resume_uint32_A,   "Resume_uint32_A"),
+  SFVARN(z->Resume_unmasked_A, "Resume_unmasked_A"),
   SFVAR(Resume_cent_I),
-  SFVAR(Resume_way_match),
-  SFVAR(Resume_uint8_V),
-  SFVAR(Resume_uint16_V),
-  SFVAR(Resume_uint32_V),
-  SFVAR(Resume_instr),
+  SFVARN(z->Resume_way_match,  "Resume_way_match"),
+  SFVARN(z->Resume_uint8_V,    "Resume_uint8_V"),
+  SFVARN(z->Resume_uint16_V,   "Resume_uint16_V"),
+  SFVARN(z->Resume_uint32_V,   "Resume_uint32_V"),
+  SFVARN(z->Resume_instr,      "Resume_instr"),
 
-  SFVAR(Resume_MAC_L_m0),
-  SFVAR(Resume_MAC_L_m1),
+  SFVARN(z->Resume_MAC_L_m0,   "Resume_MAC_L_m0"),
+  SFVARN(z->Resume_MAC_L_m1,   "Resume_MAC_L_m1"),
 
-  SFVAR(Resume_MAC_W_m0),
-  SFVAR(Resume_MAC_W_m1),
+  SFVARN(z->Resume_MAC_W_m0,   "Resume_MAC_W_m0"),
+  SFVARN(z->Resume_MAC_W_m1,   "Resume_MAC_W_m1"),
 
-  SFVAR(Resume_ea),
-  SFVAR(Resume_new_PC),
-  SFVAR(Resume_new_SR),
+  SFVARN(z->Resume_ea,         "Resume_ea"),
+  SFVARN(z->Resume_new_PC,     "Resume_new_PC"),
+  SFVARN(z->Resume_new_SR,     "Resume_new_SR"),
 
-  SFVAR(Resume_ipr),
-  SFVAR(Resume_exnum),
-  SFVAR(Resume_vecnum),
+  SFVARN(z->Resume_ipr,        "Resume_ipr"),
+  SFVARN(z->Resume_exnum,      "Resume_exnum"),
+  SFVARN(z->Resume_vecnum,     "Resume_vecnum"),
 
   SFEND
  };
@@ -3365,48 +5557,42 @@ void SH7095::StateAction_SlaveResume(StateMem* sm, const unsigned load, const bo
 
  if(load)
  {
-  ResumePoint = nullptr;
-
-  if(ResumePointI >= 0)
-  {
-   ResumePoint = ResumeTableP[DM_Setting][ResumePointI & 511];
-   assert(ResumePoint != nullptr);
-  }
-  Resume_uint16_A &= ~1;
-  Resume_uint32_A &= ~3;
-  Resume_cent = &Cache[Resume_cent_I & 0x3F];
-  Resume_way_match = std::max<int>(-1, std::min<int>(3, Resume_way_match));
-  Resume_instr &= 0xFFFF;
+  z->resume_id = (ResumePointI >= 0)
+                 ? (uint16_t)((int32_t)top - (ResumePointI & 511))
+                 : 0;
+  z->Resume_uint16_A &= ~1;
+  z->Resume_uint32_A &= ~3;
+  z->Resume_set = Resume_cent_I & 0x3F;
+  z->Resume_way_match = ((int)(-1) > (int)(((int)(3) < (int)(z->Resume_way_match) ? (int)(3) : (int)(z->Resume_way_match))) ? (int)(-1) : (int)(((int)(3) < (int)(z->Resume_way_match) ? (int)(3) : (int)(z->Resume_way_match))));
+  z->Resume_instr &= 0xFFFF;
  }
 }
 
 //
 // Only call after all emulated devices variables and RAM have been loaded from the save state.
 //
-void SH7095::PostStateLoad(const unsigned state_version, const bool recorded_needicache, const bool needicache)
+void SH7095_PostStateLoad(SH7095* z, const unsigned state_version, const bool recorded_needicache, const bool needicache)
 {
  //
  // Fixup cache tags.
  //
  for(unsigned entry = 0; entry < 64; entry++)
  {
-  CacheEntry* const ce = &Cache[entry];
-
   for(unsigned way = 0; way < 4; way++)
   {
-   const uint32 ATM = ce->Tag[way] & (0x7FFFF << 10);
-   const bool invalid = ce->Tag[way] & ~(0x7FFFF << 10);	// Handles backwards compat when invalid was bit31 instead of bit0.
+   const uint32_t ATM = z->CacheTags[entry][way] & (0x7FFFF << 10);
+   const bool invalid = z->CacheTags[entry][way] & ~(0x7FFFF << 10);	// Handles backwards compat when invalid was bit31 instead of bit0.
 
-   ce->Tag[way] = ATM | invalid;
+   z->CacheTags[entry][way] = ATM | invalid;
   }
  }
  //
- SetCCR(CCR);
+ SH7095_SetCCR(z, z->CCR);
  //
  if(!recorded_needicache && state_version < 0x00102600)
  {
   for(unsigned i = 0; i < 16; i++)
-   WB_until[i] = timestamp - 100;
+   z->WB_until[i] = z->timestamp - 100;
  }
 
  if(needicache && !recorded_needicache)
@@ -3417,13 +5603,13 @@ void SH7095::PostStateLoad(const unsigned state_version, const bool recorded_nee
   // May not cover all cases, needs more testing.
   //
   //
-  //const uint32 old_IBuffer = IBuffer;
-  const uint32 A = (PC - 2) & ~3;
+  //const uint32_t old_IBuffer = z->IBuffer;
+  const uint32_t A = (z->PC - 2) & ~3;
 
-  if((int32)A < 0)
-   IBuffer = MDFN_densb<uint32, true>(&Cache[(A >> 4) & 0x3F].Data[(A >> 10) & 0x3][NE32ASU8_IDX_ADJ(uint32, A & 0x0F)]);
+  if((int32_t)A < 0)
+   z->IBuffer = *(uint32_t*)&z->CacheData[(A >> 4) & 0x3F][(A >> 10) & 0x3][NE32ASU8_IDX_ADJ(uint32_t, A & 0x0F)];
   else
-   IBuffer = ne16_rbo_be<uint32>(SH7095_FastMap[A >> SH7095_EXT_MAP_GRAN_BITS], A);
+   z->IBuffer = SH7095_RBO_BE_T(uint32_t, SH7095_FastMap[A >> SH7095_EXT_MAP_GRAN_BITS], A);
 
  }
  //
@@ -3431,46 +5617,50 @@ void SH7095::PostStateLoad(const unsigned state_version, const bool recorded_nee
  //
  if(state_version < 0x00102300)
  {
-  ExtHaltDMA = ExtHalt;
+  z->ExtHaltDMA = z->ExtHalt;
  }
 
- if(state_version < 0x00102600 && timestamp >= 0x40000000)
+ if(state_version < 0x00102600 && z->timestamp >= 0x40000000)
  {
-  timestamp = SS_EVENT_DISABLED_TS;
+  z->timestamp = SS_EVENT_DISABLED_TS;
  }
 
- if(timestamp != SS_EVENT_DISABLED_TS)
+ if(z->timestamp != SS_EVENT_DISABLED_TS)
  {
   if(state_version < 0x00102600)
   {
-   DMA_Timestamp = SH7095_mem_timestamp - 128;
-   DMA_SGEndTimestamp = SH7095_mem_timestamp + 192;
+   z->DMA_Timestamp = SH7095_mem_timestamp - 128;
+   z->DMA_SGEndTimestamp = SH7095_mem_timestamp + 192;
 
-   BSC.sdram_finish_time = SH7095_mem_timestamp - 100;
-   BSC.last_mem_time = SH7095_mem_timestamp - 100;
+   z->BSC.sdram_finish_time = SH7095_mem_timestamp - 100;
+   z->BSC.last_mem_time = SH7095_mem_timestamp - 100;
   }
 
-  clamp(&timestamp, -1000000, 1000000);
-  clamp(&FRT.lastts, -1000000, 1000000);
-  clamp(&DMA_Timestamp, -1000000, 1000000);
-  clamp(&DMA_SGEndTimestamp, -1000000, 1000000);
+  /* clamp() folded: each was clamp(&x, -1000000, 1000000) on an
+   * int32_t (sscpu_timestamp_t). Folded as a single ternary-assignment
+   * statement -- no if-statements -- so the unbraced for-loop body
+   * below cannot dangle. */
+  z->timestamp = (z->timestamp < -1000000) ? -1000000 : (z->timestamp > 1000000) ? 1000000 : z->timestamp;
+  z->FRT.lastts = (z->FRT.lastts < -1000000) ? -1000000 : (z->FRT.lastts > 1000000) ? 1000000 : z->FRT.lastts;
+  z->DMA_Timestamp = (z->DMA_Timestamp < -1000000) ? -1000000 : (z->DMA_Timestamp > 1000000) ? 1000000 : z->DMA_Timestamp;
+  z->DMA_SGEndTimestamp = (z->DMA_SGEndTimestamp < -1000000) ? -1000000 : (z->DMA_SGEndTimestamp > 1000000) ? 1000000 : z->DMA_SGEndTimestamp;
 
-  clamp(&MA_until, -1000000, 1000000);
-  clamp(&MM_until, -1000000, 1000000);
+  z->MA_until = (z->MA_until < -1000000) ? -1000000 : (z->MA_until > 1000000) ? 1000000 : z->MA_until;
+  z->MM_until = (z->MM_until < -1000000) ? -1000000 : (z->MM_until > 1000000) ? 1000000 : z->MM_until;
 
   for(unsigned i = 0; i < 16; i++)
-   clamp(&WB_until[i], -1000000, 1000000);
+   z->WB_until[i] = (z->WB_until[i] < -1000000) ? -1000000 : (z->WB_until[i] > 1000000) ? 1000000 : z->WB_until[i];
 
-  clamp(&write_finish_timestamp, -1000000, 1000000);
-  clamp(&divide_finish_timestamp, -1000000, 1000000);
+  z->write_finish_timestamp = (z->write_finish_timestamp < -1000000) ? -1000000 : (z->write_finish_timestamp > 1000000) ? 1000000 : z->write_finish_timestamp;
+  z->divide_finish_timestamp = (z->divide_finish_timestamp < -1000000) ? -1000000 : (z->divide_finish_timestamp > 1000000) ? 1000000 : z->divide_finish_timestamp;
 
-  clamp(&BSC.sdram_finish_time, -1000000, 1000000);
-  clamp(&BSC.last_mem_time, -1000000, 1000000);
+  z->BSC.sdram_finish_time = (z->BSC.sdram_finish_time < -1000000) ? -1000000 : (z->BSC.sdram_finish_time > 1000000) ? 1000000 : z->BSC.sdram_finish_time;
+  z->BSC.last_mem_time = (z->BSC.last_mem_time < -1000000) ? -1000000 : (z->BSC.last_mem_time > 1000000) ? 1000000 : z->BSC.last_mem_time;
  }
  //
  //
  //
- UCRead_IF_Kludge &= 1;
+ z->UCRead_IF_Kludge &= 1;
 }
 
 //
@@ -3482,518 +5672,166 @@ void SH7095::PostStateLoad(const unsigned state_version, const bool recorded_nee
 //
 //
 
-INLINE uint32 SH7095::GetRegister(const unsigned id, char* const special, const uint32 special_len)
+//
+//
+//
+//
+static INLINE void SH7095_CheckRWBreakpoints(const SH7095* z, void (*MRead)(unsigned len, uint32_t addr), void (*MWrite)(unsigned len, uint32_t addr))
 {
- uint32 ret = 0xDEADBEEF;
-
- switch(id)
- {
-  case GSREG_PC_ID:
-	ret = PC_ID;
-	break;
-
-  case GSREG_PC_IF:
-	ret = PC_IF;
-	break;
-
-  case GSREG_PID:
-	ret = Pipe_ID;
-	break;
-
-  case GSREG_PIF:
-	ret = Pipe_IF;
-	break;
-
-  case GSREG_EP:
-	ret = EPending;
-	break;
-
-  case GSREG_RPC:
-	ret = PC;
-	break;
-
-  case GSREG_R0: case GSREG_R1: case GSREG_R2: case GSREG_R3: case GSREG_R4: case GSREG_R5: case GSREG_R6: case GSREG_R7:
-  case GSREG_R8: case GSREG_R9: case GSREG_R10: case GSREG_R11: case GSREG_R12: case GSREG_R13: case GSREG_R14: case GSREG_R15:
-	ret = R[id - GSREG_R0];
-	break;
-
-  case GSREG_SR:
-	ret = SR;
-	break;
-
-  case GSREG_GBR:
-	ret = GBR;
-	break;
-
-  case GSREG_VBR:
-	ret = VBR;
-	break;
-
-  case GSREG_MACH:
-	ret = MACH;
-	break;
-
-  case GSREG_MACL:
-	ret = MACL;
-	break;
-
-  case GSREG_PR:
-	ret = PR;
-	break;
-
-  //
-  //
-  //
-  case GSREG_NMIL:
-	ret = NMILevel;
-	break;
-
-  case GSREG_IRL:
-	ret = IRL;
-	break;
-
-  case GSREG_IPRA:
-	ret = IPRA;
-	break;
-
-  case GSREG_IPRB:
-	ret = IPRB;
-	break;
-
-  case GSREG_VCRWDT:
-	ret = VCRWDT;
-	break;
-
-  case GSREG_VCRA:
-	ret = VCRA;
-	break;
-
-  case GSREG_VCRB:
-	ret = VCRB;
-	break;
-
-  case GSREG_VCRC:
-	ret = VCRC;
-	break;
-
-  case GSREG_VCRD:
-	ret = VCRD;
-	break;
-
-  case GSREG_ICR:
-	ret = ICR;
-	break;
-  //
-  //
-  //
-  case GSREG_DVSR:
-	ret = DVSR;
-	break;
-
-  case GSREG_DVDNT:
-	ret = DVDNT;
-	break;
-
-  case GSREG_DVDNTH:
-	ret = DVDNTH;
-	break;
-
-  case GSREG_DVDNTL:
-	ret = DVDNTL;
-	break;
-
-  case GSREG_DVDNTHS:
-	ret = DVDNTH_Shadow;
-	break;
-
-  case GSREG_DVDNTLS:
-	ret = DVDNTL_Shadow;
-	break;
-
-  case GSREG_VCRDIV:
-	ret = VCRDIV;
-	break;
-
-  case GSREG_DVCR:
-	ret = DVCR;
-	break;
-  //
-  //
-  //
-  case GSREG_WTCSR:
-	ret = WDT.WTCSR;
-	break;
-
-  case GSREG_WTCSRM:
-	ret = WDT.WTCSRM;
-	break;
-
-  case GSREG_WTCNT:
-	ret = WDT.WTCNT;
-	break;
-
-  case GSREG_RSTCSR:
-	ret = WDT.RSTCSR;
-	break;
-
-  case GSREG_RSTCSRM:
-	ret = WDT.RSTCSRM;
-	break;
-  //
-  //
-  //
-  case GSREG_DMAOR:
-	ret = DMAOR;
-	break;
-
-  case GSREG_DMAORM:
-	ret = DMAORM;
-	break;
-
-  case GSREG_DMA0_SAR:
-  case GSREG_DMA1_SAR:
-	ret = DMACH[id == GSREG_DMA1_SAR].SAR;
-	break;
-
-  case GSREG_DMA0_DAR:
-  case GSREG_DMA1_DAR:
-	ret = DMACH[id == GSREG_DMA1_DAR].DAR;
-	break;
-
-  case GSREG_DMA0_TCR:
-  case GSREG_DMA1_TCR:
-	ret = DMACH[id == GSREG_DMA1_TCR].TCR;
-	break;
-
-  case GSREG_DMA0_CHCR:
-  case GSREG_DMA1_CHCR:
-	ret = DMACH[id == GSREG_DMA1_CHCR].CHCR;
-	break;
-
-  case GSREG_DMA0_CHCRM:
-  case GSREG_DMA1_CHCRM:
-	ret = DMACH[id == GSREG_DMA1_CHCRM].CHCRM;
-	break;
-
-  case GSREG_DMA0_VCR:
-  case GSREG_DMA1_VCR:
-	ret = DMACH[id == GSREG_DMA1_VCR].VCR;
-	break;
-
-  case GSREG_DMA0_DRCR:
-  case GSREG_DMA1_DRCR:
-	ret = DMACH[id == GSREG_DMA1_DRCR].DRCR;
-	break;
-  //
-  //
-  //
-  case GSREG_FRC:
-	ret = FRT.FRC;
-	break;
-
-  case GSREG_OCR0:
-	ret = FRT.OCR[0];
-	break;
-
-  case GSREG_OCR1:
-	ret = FRT.OCR[1];
-	break;
-
-  case GSREG_FICR:
-	ret = FRT.FICR;
-	break;
-
-  case GSREG_TIER:
-	ret = FRT.TIER;
-	break;
-
-  case GSREG_FTCSR:
-	ret = FRT.FTCSR;
-	break;
-
-  case GSREG_FTCSRM:
-	ret = FRT.FTCSRM;
-	break;
-
-  case GSREG_TCR:
-	ret = FRT.TCR;
-	break;
-
-  case GSREG_TOCR:
-	ret = FRT.TOCR;
-	break;
-
-  case GSREG_RWT:
-	ret = FRT.RW_Temp;
-	break;
-  //
-  //
-  //
-  case GSREG_CCR:
-	ret = CCR;
-	break;
-
-  case GSREG_SBYCR:
-	ret = SBYCR;
-	break;
- }
-
- return ret;
-}
-
-void SH7095::SetRegister(const unsigned id, const uint32 value)
-{
- switch(id)
- {
-  //case GSREG_PC: break;
-
-  case GSREG_PID:
-	Pipe_ID = value;
-	break;
-
-  case GSREG_PIF:
-	Pipe_IF = value;
-	break;
-
-  //case GSREG_EP:
-  //	EPending = value;
-  //	break;
-
-  case GSREG_RPC:
-	PC = value;
-	break;
-
-  case GSREG_R0: case GSREG_R1: case GSREG_R2: case GSREG_R3: case GSREG_R4: case GSREG_R5: case GSREG_R6: case GSREG_R7:
-  case GSREG_R8: case GSREG_R9: case GSREG_R10: case GSREG_R11: case GSREG_R12: case GSREG_R13: case GSREG_R14: case GSREG_R15:
-	R[id - GSREG_R0] = value;
-	break;
-
-  case GSREG_SR:
-	SR = value & 0x3F3;
-	RecalcPendingIntPEX();
-	break;
-
-  case GSREG_GBR:
-	GBR = value;
-	break;
-
-  case GSREG_VBR:
-	VBR = value;
-	break;
-
-  case GSREG_MACH:
-	MACH = value;
-	break;
-
-  case GSREG_MACL:
-	MACL = value;
-	break;
-
-  case GSREG_PR:
-	PR = value;
-	break;
-
-  //
-  //
-  //
-  case GSREG_FTCSR:	
-	FRT.FTCSR = value & 0x8F;
-	RecalcPendingIntPEX();
-	FRT_CheckOCR();
-	break;
-
-  case GSREG_FTCSRM:	
-	FRT.FTCSRM = value & 0x8F;
-	break;
-/*
-  case GSREG_TCR:
-	FRT.TCR = value;
-	FRT_WDT_Recalc_NET();
-	break;
-*/
-  //
-  //
-  //
-  case GSREG_CCR:
-	SetCCR(value);
-	break;
- }
-}
-
-//
-//
-//
-//
-INLINE void SH7095::CheckRWBreakpoints(void (*MRead)(unsigned len, uint32 addr), void (*MWrite)(unsigned len, uint32 addr)) const
-{
- uint32 lpid = Pipe_ID;
+ uint32_t lpid = z->Pipe_ID;
  //
  //
  //
  //SPEPRecover:;
- const uint32 instr = (uint16)lpid;
+ const uint32_t instr = (uint16_t)lpid;
  const unsigned instr_nyb1 = (instr >> 4) & 0xF;
  const unsigned instr_nyb2 = (instr >> 8) & 0xF;
 
  switch(lpid >> 24)
  {
  #include "sh7095_opdefs.inc"
- #define BEGIN_BP_OP(x) OP_##x { 
+ #define BEGIN_BP_OP(x) OP_##x {
  #define END_BP_OP } break;
 
  //
- // MOV.W @(disp,PC),Rn
+ // MOV.W @(disp,z->PC),Rn
  //
  BEGIN_BP_OP(MOV_W_PCREL_REG)
 	const unsigned d = (instr >> 0) & 0xff;
-	const uint32 ea = PC + (d << 1);
+	const uint32_t ea = z->PC + (d << 1);
 
 	MRead(2, ea);
  END_BP_OP
 
-
  //
- // MOV.L @(disp,PC),Rn
+ // MOV.L @(disp,z->PC),Rn
  //
  BEGIN_BP_OP(MOV_L_PCREL_REG)
 	const unsigned d = (instr >> 0) & 0xff;
-	const uint32 ea = (PC &~ 0x3) + (d << 2);
+	const uint32_t ea = (z->PC &~ 0x3) + (d << 2);
 
 	MRead(4, ea);
  END_BP_OP
-
 
  //
  // MOV.B Rm,@Rn
  //
  BEGIN_BP_OP(MOV_B_REG_REGINDIR)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[n];
+	const uint32_t ea = z->R[n];
 
 	MWrite(1, ea);
  END_BP_OP
-
 
  //
  // MOV.W Rm,@Rn
  //
  BEGIN_BP_OP(MOV_W_REG_REGINDIR)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[n];
+	const uint32_t ea = z->R[n];
 
 	MWrite(2, ea);
  END_BP_OP
-
 
  //
  // MOV.L Rm,@Rn
  //
  BEGIN_BP_OP(MOV_L_REG_REGINDIR)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[n];
+	const uint32_t ea = z->R[n];
 
 	MWrite(4, ea);
  END_BP_OP
-
 
  //
  // MOV.B @Rm,Rn
  //
  BEGIN_BP_OP(MOV_B_REGINDIR_REG)
 	const unsigned m = instr_nyb1;
-	const uint32 ea = R[m];
+	const uint32_t ea = z->R[m];
 
 	MRead(1, ea);
  END_BP_OP
-
 
  //
  // MOV.W @Rm,Rn
  //
  BEGIN_BP_OP(MOV_W_REGINDIR_REG)
 	const unsigned m = instr_nyb1;
-	const uint32 ea = R[m];
+	const uint32_t ea = z->R[m];
 
 	MRead(2, ea);
  END_BP_OP
-
 
  //
  // MOV.L @Rm,Rn
  //
  BEGIN_BP_OP(MOV_L_REGINDIR_REG)
 	const unsigned m = instr_nyb1;
-	const uint32 ea = R[m];
+	const uint32_t ea = z->R[m];
 
 	MRead(4, ea);
  END_BP_OP
-
 
  //
  // MOV.B Rm,@-Rn
  //
  BEGIN_BP_OP(MOV_B_REG_REGINDIRPD)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[n] - 1;
+	const uint32_t ea = z->R[n] - 1;
 
 	MWrite(1, ea);
  END_BP_OP
-
 
  //
  // MOV.W Rm,@-Rn
  //
  BEGIN_BP_OP(MOV_W_REG_REGINDIRPD)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[n] - 2;
+	const uint32_t ea = z->R[n] - 2;
 
 	MWrite(2, ea);
  END_BP_OP
-
 
  //
  // MOV.L Rm,@-Rn
  //
  BEGIN_BP_OP(MOV_L_REG_REGINDIRPD)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[n] - 4;
+	const uint32_t ea = z->R[n] - 4;
 
 	MWrite(4, ea);
  END_BP_OP
-
 
  //
  // MOV.B @Rm+,Rn
  //
  BEGIN_BP_OP(MOV_B_REGINDIRPI_REG)
 	const unsigned m = instr_nyb1;
-	const uint32 ea = R[m];
+	const uint32_t ea = z->R[m];
 
 	MRead(1, ea);
  END_BP_OP
-
 
  //
  // MOV.W @Rm+,Rn
  //
  BEGIN_BP_OP(MOV_W_REGINDIRPI_REG)
 	const unsigned m = instr_nyb1;
-	const uint32 ea = R[m];
+	const uint32_t ea = z->R[m];
 
 	MRead(2, ea);
  END_BP_OP
-
 
  //
  // MOV.L @Rm+,Rn
  //
  BEGIN_BP_OP(MOV_L_REGINDIRPI_REG)
 	const unsigned m = instr_nyb1;
-	const uint32 ea = R[m];
+	const uint32_t ea = z->R[m];
 
 	MRead(4, ea);
  END_BP_OP
-
 
  //
  // MOV.B R0,@(disp,Rn)
@@ -4001,11 +5839,10 @@ INLINE void SH7095::CheckRWBreakpoints(void (*MRead)(unsigned len, uint32 addr),
  BEGIN_BP_OP(MOV_B_REG0_REGINDIRDISP)
 	const unsigned n = instr_nyb1;
 	const unsigned d = (instr >> 0) & 0xf;
-	const uint32 ea = R[n] + (d << 0);
+	const uint32_t ea = z->R[n] + (d << 0);
 
 	MWrite(1, ea);
  END_BP_OP
-
 
  //
  // MOV.W R0,@(disp,Rn)
@@ -4013,11 +5850,10 @@ INLINE void SH7095::CheckRWBreakpoints(void (*MRead)(unsigned len, uint32 addr),
  BEGIN_BP_OP(MOV_W_REG0_REGINDIRDISP)
 	const unsigned n = instr_nyb1;
 	const unsigned d = (instr >> 0) & 0xf;
-	const uint32 ea = R[n] + (d << 1);
+	const uint32_t ea = z->R[n] + (d << 1);
 
 	MWrite(2, ea);
  END_BP_OP
-
 
  //
  // MOV.L Rm,@(disp,Rn)
@@ -4025,11 +5861,10 @@ INLINE void SH7095::CheckRWBreakpoints(void (*MRead)(unsigned len, uint32 addr),
  BEGIN_BP_OP(MOV_L_REG_REGINDIRDISP)
 	const unsigned n = instr_nyb2;
 	const unsigned d = (instr >> 0) & 0xf;
-	const uint32 ea = R[n] + (d << 2);
+	const uint32_t ea = z->R[n] + (d << 2);
 
 	MWrite(4, ea);
  END_BP_OP
-
 
  //
  // MOV.B @(disp,Rm),R0
@@ -4037,11 +5872,10 @@ INLINE void SH7095::CheckRWBreakpoints(void (*MRead)(unsigned len, uint32 addr),
  BEGIN_BP_OP(MOV_B_REGINDIRDISP_REG0)
 	const unsigned m = instr_nyb1;
 	const unsigned d = (instr >> 0) & 0xf;
-	const uint32 ea = R[m] + (d << 0);
+	const uint32_t ea = z->R[m] + (d << 0);
 
 	MRead(1, ea);
  END_BP_OP
-
 
  //
  // MOV.W @(disp,Rm),R0
@@ -4049,11 +5883,10 @@ INLINE void SH7095::CheckRWBreakpoints(void (*MRead)(unsigned len, uint32 addr),
  BEGIN_BP_OP(MOV_W_REGINDIRDISP_REG0)
 	const unsigned m = instr_nyb1;
 	const unsigned d = (instr >> 0) & 0xf;
-	const uint32 ea = R[m] + (d << 1);
+	const uint32_t ea = z->R[m] + (d << 1);
 
 	MRead(2, ea);
  END_BP_OP
-
 
  //
  // MOV.L @(disp,Rm),Rn
@@ -4061,143 +5894,130 @@ INLINE void SH7095::CheckRWBreakpoints(void (*MRead)(unsigned len, uint32 addr),
  BEGIN_BP_OP(MOV_L_REGINDIRDISP_REG)
 	const unsigned m = instr_nyb1;
 	const unsigned d = (instr >> 0) & 0xf;
-	const uint32 ea = R[m] + (d << 2);
+	const uint32_t ea = z->R[m] + (d << 2);
 
 	MRead(4, ea);
  END_BP_OP
-
 
  //
  // MOV.B Rm,@(R0,Rn)
  //
  BEGIN_BP_OP(MOV_B_REG_IDXREGINDIR)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[0] + R[n];
+	const uint32_t ea = z->R[0] + z->R[n];
 
 	MWrite(1, ea);
  END_BP_OP
-
 
  //
  // MOV.W Rm,@(R0,Rn)
  //
  BEGIN_BP_OP(MOV_W_REG_IDXREGINDIR)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[0] + R[n];
+	const uint32_t ea = z->R[0] + z->R[n];
 
 	MWrite(2, ea);
  END_BP_OP
-
 
  //
  // MOV.L Rm,@(R0,Rn)
  //
  BEGIN_BP_OP(MOV_L_REG_IDXREGINDIR)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[0] + R[n];
+	const uint32_t ea = z->R[0] + z->R[n];
 
 	MWrite(4, ea);
  END_BP_OP
-
 
  //
  // MOV.B @(R0,Rm),Rn
  //
  BEGIN_BP_OP(MOV_B_IDXREGINDIR_REG)
 	const unsigned m = instr_nyb1;
-	const uint32 ea = R[0] + R[m];
+	const uint32_t ea = z->R[0] + z->R[m];
 
 	MRead(1, ea);
  END_BP_OP
-
 
  //
  // MOV.W @(R0,Rm),Rn
  //
  BEGIN_BP_OP(MOV_W_IDXREGINDIR_REG)
 	const unsigned m = instr_nyb1;
-	const uint32 ea = R[0] + R[m];
+	const uint32_t ea = z->R[0] + z->R[m];
 
 	MRead(2, ea);
  END_BP_OP
-
 
  //
  // MOV.L @(R0,Rm),Rn
  //
  BEGIN_BP_OP(MOV_L_IDXREGINDIR_REG)
 	const unsigned m = instr_nyb1;
-	const uint32 ea = R[0] + R[m];
+	const uint32_t ea = z->R[0] + z->R[m];
 
 	MRead(4, ea);
  END_BP_OP
 
-
  //
- // MOV.B R0,@(disp,GBR)
+ // MOV.B R0,@(disp,z->GBR)
  //
  BEGIN_BP_OP(MOV_B_REG0_GBRINDIRDISP)
 	const unsigned d = (instr >> 0) & 0xff;
-	const uint32 ea = GBR + (d << 0);
+	const uint32_t ea = z->GBR + (d << 0);
 
 	MWrite(1, ea);
  END_BP_OP
 
-
  //
- // MOV.W R0,@(disp,GBR)
+ // MOV.W R0,@(disp,z->GBR)
  //
  BEGIN_BP_OP(MOV_W_REG0_GBRINDIRDISP)
 	const unsigned d = (instr >> 0) & 0xff;
-	const uint32 ea = GBR + (d << 1);
+	const uint32_t ea = z->GBR + (d << 1);
 
 	MWrite(2, ea);
  END_BP_OP
 
-
  //
- // MOV.L R0,@(disp,GBR)
+ // MOV.L R0,@(disp,z->GBR)
  //
  BEGIN_BP_OP(MOV_L_REG0_GBRINDIRDISP)
 	const unsigned d = (instr >> 0) & 0xff;
-	const uint32 ea = GBR + (d << 2);
+	const uint32_t ea = z->GBR + (d << 2);
 
 	MWrite(4, ea);
  END_BP_OP
 
-
  //
- // MOV.B @(disp,GBR),R0
+ // MOV.B @(disp,z->GBR),R0
  //
  BEGIN_BP_OP(MOV_B_GBRINDIRDISP_REG0)
 	const unsigned d = (instr >> 0) & 0xff;
-	const uint32 ea = GBR + (d << 0);
+	const uint32_t ea = z->GBR + (d << 0);
 
 	MRead(1, ea);
  END_BP_OP
 
-
  //
- // MOV.W @(disp,GBR),R0
+ // MOV.W @(disp,z->GBR),R0
  //
  BEGIN_BP_OP(MOV_W_GBRINDIRDISP_REG0)
 	const unsigned d = (instr >> 0) & 0xff;
-	const uint32 ea = GBR + (d << 1);
+	const uint32_t ea = z->GBR + (d << 1);
 
 	MRead(2, ea);
  END_BP_OP
 
-
  //
- // MOV.L @(disp,GBR),R0
+ // MOV.L @(disp,z->GBR),R0
  //
  BEGIN_BP_OP(MOV_L_GBRINDIRDISP_REG0)
 	const unsigned d = (instr >> 0) & 0xff;
-	const uint32 ea = GBR + (d << 2);
+	const uint32_t ea = z->GBR + (d << 2);
 
 	MRead(4, ea);
  END_BP_OP
-
 
  //
  // MAC.L @Rm+,@Rn+
@@ -4206,10 +6026,9 @@ INLINE void SH7095::CheckRWBreakpoints(void (*MRead)(unsigned len, uint32 addr),
 	const unsigned n = instr_nyb2;
 	const unsigned m = instr_nyb1;
 
-	MRead(4, R[m]);
-        MRead(4, R[n] + ((m == n) << 2));
+	MRead(4, z->R[m]);
+        MRead(4, z->R[n] + ((m == n) << 2));
  END_BP_OP
-
 
  //
  // MAC.W @Rm+,@Rn+
@@ -4218,115 +6037,107 @@ INLINE void SH7095::CheckRWBreakpoints(void (*MRead)(unsigned len, uint32 addr),
 	const unsigned n = instr_nyb2;
 	const unsigned m = instr_nyb1;
 
-	MRead(2, R[m]);
-        MRead(2, R[n] + ((m == n) << 1));
+	MRead(2, z->R[m]);
+        MRead(2, z->R[n] + ((m == n) << 1));
  END_BP_OP
 
-
  //
- // AND.B #imm,@(R0,GBR)
+ // AND.B #imm,@(R0,z->GBR)
  //
  BEGIN_BP_OP(AND_B_IMM_IDXGBRINDIR)
-	const uint32 ea = R[0] + GBR;
+	const uint32_t ea = z->R[0] + z->GBR;
 
 	MRead(1, ea);
 	MWrite(1, ea);
  END_BP_OP
 
  //
- // OR.B #imm,@(R0,GBR)
+ // OR.B #imm,@(R0,z->GBR)
  //
  BEGIN_BP_OP(OR_B_IMM_IDXGBRINDIR)
-	const uint32 ea = R[0] + GBR;
+	const uint32_t ea = z->R[0] + z->GBR;
 
 	MRead(1, ea);
 	MWrite(1, ea);
  END_BP_OP
-
 
  //
  // TAS.B @Rn
  //
  BEGIN_BP_OP(TAS_B_REGINDIR)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[n];
+	const uint32_t ea = z->R[n];
 
 	MRead(1, ea);
 	MWrite(1, ea);
  END_BP_OP
 
-
  //
- // TST.B #imm,@(R0,GBR)
+ // TST.B #imm,@(R0,z->GBR)
  //
  BEGIN_BP_OP(TST_B_IMM_IDXGBRINDIR)
-	const uint32 ea = R[0] + GBR;
+	const uint32_t ea = z->R[0] + z->GBR;
 
 	MRead(1, ea);
  END_BP_OP
 
-
  //
- // XOR.B #imm,@(R0,GBR)
+ // XOR.B #imm,@(R0,z->GBR)
  //
  BEGIN_BP_OP(XOR_B_IMM_IDXGBRINDIR)
-	const uint32 ea = R[0] + GBR;
+	const uint32_t ea = z->R[0] + z->GBR;
 
 	MRead(1, ea);
 	MWrite(1, ea);
  END_BP_OP
 
-
  //
- // LDC.L 
+ // LDC.L
  //
  BEGIN_BP_OP(LDC_L)
 	const unsigned m = instr_nyb2;
-	const uint32 ea = R[m];
+	const uint32_t ea = z->R[m];
 
 	MRead(4, ea);
  END_BP_OP
 
-
  //
- // LDS.L 
+ // LDS.L
  //
  BEGIN_BP_OP(LDS_L)
 	const unsigned m = instr_nyb2;
-	const uint32 ea = R[m];
+	const uint32_t ea = z->R[m];
 
 	MRead(4, ea);
  END_BP_OP
 
-
  //
- // RTE 
+ // RTE
  //
  BEGIN_BP_OP(RTE)
-	MRead(4, R[15]);
-	MRead(4, 4 + R[15]);
+	MRead(4, z->R[15]);
+	MRead(4, 4 + z->R[15]);
  END_BP_OP
 
  //
- // STC.L 
+ // STC.L
  //
  BEGIN_BP_OP(STC_L)
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[n] - 4;
+	const uint32_t ea = z->R[n] - 4;
 
 	MWrite(4, ea);
  END_BP_OP
 
  //
- // STS.L 
+ // STS.L
  //
  BEGIN_BP_OP(STS_L)	// Pipeline same as ordinary store instruction
 	const unsigned n = instr_nyb2;
-	const uint32 ea = R[n] - 4;
+	const uint32_t ea = z->R[n] - 4;
 
 	MWrite(4, ea);
  END_BP_OP
-
 
  #undef BEGIN_BP_OP
  #undef END_BP_OP

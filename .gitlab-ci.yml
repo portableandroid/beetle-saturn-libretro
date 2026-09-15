@@ -10,6 +10,12 @@
     JNI_PATH: .
     CORENAME: mednafen_saturn
 
+# Windows MinGW builds currently hit a GCC LTO rendering regression.
+# Keep the shared libretro templates unchanged and only pass LTO= to make.
+.windows-no-lto:
+  variables:
+    MAKEFLAGS: "LTO="
+
 # Inclusion templates, required for the build to work
 include:
   ################################## DESKTOPS ################################
@@ -24,6 +30,10 @@ include:
   # Linux 64-bit
   - project: 'libretro-infrastructure/ci-templates'
     file: '/linux-x64.yml'
+
+  # Linux ARM 64-bit
+  - project: 'libretro-infrastructure/ci-templates'
+    file: '/linux-aarch64.yml'
 
   # Linux 32-bit
   - project: 'libretro-infrastructure/ci-templates'
@@ -56,6 +66,9 @@ include:
     file: '/tvos-arm64.yml'
 
   #################################### MISC ##################################
+  # webOS 32-bit (LGTV)
+  - project: 'libretro-infrastructure/ci-templates'
+    file: '/webos-make.yml'
 
 # Stages for building
 stages:
@@ -73,17 +86,25 @@ libretro-build-windows-x64:
   extends:
     - .libretro-windows-x64-mingw-make-default
     - .core-defs
+    - .windows-no-lto
     
 # Windows 32-bit
 libretro-build-windows-i686:
   extends:
     - .libretro-windows-i686-mingw-make-default
     - .core-defs
+    - .windows-no-lto
 
 # Linux 64-bit
 libretro-build-linux-x64:
   extends:
     - .libretro-linux-x64-make-default
+    - .core-defs
+
+# Linux ARM 64-bit
+libretro-build-linux-aarch64:
+  extends:
+    - .libretro-linux-aarch64-make-default
     - .core-defs
 
 # Linux 32-bit
@@ -145,4 +166,11 @@ libretro-build-ios9:
 libretro-build-tvos-arm64:
   extends:
     - .libretro-tvos-arm64-make-default
+    - .core-defs
+
+#################################### MISC ####################################
+# webOS 32-bit
+libretro-build-webos-armv7a:
+  extends:
+    - .libretro-webos-armv7a-make-default
     - .core-defs

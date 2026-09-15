@@ -22,6 +22,12 @@
 #ifndef __MDFN_SS_SCU_H
 #define __MDFN_SS_SCU_H
 
+#include <stdint.h>
+#include <boolean.h>
+#include "../mednafen-types.h"     /* MDFN_COLD attribute macro */
+#include "../state.h"              /* StateMem typedef for SCU_StateAction */
+
+/* SCU interrupt vectors.  Order matters -- savestate-visible. */
 enum
 {
  SCU_INT_VBIN = 0x00,
@@ -42,63 +48,40 @@ enum
 
  SCU_INT_VDP1,
 
- SCU_INT_EXT0	= 0x10,
- SCU_INT_EXTF	= 0x1F,
+ SCU_INT_EXT0 = 0x10,
+ SCU_INT_EXTF = 0x1F
 };
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 void SCU_Reset(bool powering_up) MDFN_COLD;
 
 void SCU_SetInt(unsigned which, bool active);
-int32 SCU_SetHBVB(int32 pclocks, bool hblank_in, bool vblank_in);
-
+int32_t SCU_SetHBVB(int32_t pclocks, bool hblank_in, bool vblank_in);
 bool SCU_CheckVDP1HaltKludge(void);
 
-sscpu_timestamp_t SCU_UpdateDMA(sscpu_timestamp_t timestamp);
-sscpu_timestamp_t SCU_UpdateDSP(sscpu_timestamp_t timestamp);
+/* int32_t in place of sscpu_timestamp_t (typedef'd to int32_t in
+ * ss.h) -- keeps the header self-contained for C consumers and
+ * matches the C-ABI convention used by vdp1.c / sound.h / smpc.h. */
+int32_t SCU_UpdateDMA(int32_t timestamp);
+int32_t SCU_UpdateDSP(int32_t timestamp);
 
-enum
-{
- SCU_GSREG_ILEVEL = 0,
- SCU_GSREG_IVEC,
- SCU_GSREG_ICLEARMASK,
+/* promoted from file-static so ss.c's
+ * LibRetro_StateAction can call it across the C / C++ boundary. */
+void SCU_StateAction(StateMem* sm, const unsigned load, const bool data_only) MDFN_COLD;
 
- SCU_GSREG_IASSERTED,
- SCU_GSREG_IPENDING,
- SCU_GSREG_IMASK,
+/* promoted from file-static so ss.c's Emulate
+ * can call it across the C / C++ boundary. */
+void SCU_AdjustTS(const int32_t delta);
 
- SCU_GSREG_D0MD,
- SCU_GSREG_D1MD,
- SCU_GSREG_D2MD,
+/* promoted from file-static so ss.c's InitCommon
+ * can call it across the C / C++ boundary. */
+void SCU_Init(void) MDFN_COLD;
 
- SCU_GSREG_ASR0_CS0,
- SCU_GSREG_ASR0_CS1,
- SCU_GSREG_ASR1_CS2,
- SCU_GSREG_ASR1_CSD,
-
- SCU_GSREG_AREF,
-
- SCU_GSREG_RSEL,
-
- SCU_GSREG_T0CNT,
- SCU_GSREG_T0CMP,
- SCU_GSREG_T0MET,
-
- SCU_GSREG_T1RLV,
- SCU_GSREG_T1CNT,
- SCU_GSREG_T1MOD,
- SCU_GSREG_T1MET,
-
- SCU_GSREG_TENBL,
- //
- //
- //
- SCU_GSREG_DSP_EXEC,
- SCU_GSREG_DSP_PAUSE,
- SCU_GSREG_DSP_PC,
- SCU_GSREG_DSP_END,
-};
-
-uint32 SCU_GetRegister(const unsigned id, char* const special, const uint32 special_len) MDFN_COLD;
-void SCU_SetRegister(const unsigned id, const uint32 value) MDFN_COLD;
+#ifdef __cplusplus
+}
+#endif
 
 #endif

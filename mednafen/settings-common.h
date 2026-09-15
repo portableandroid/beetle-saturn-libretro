@@ -2,6 +2,7 @@
 #define _MDFN_SETTINGS_COMMON_H
 
 #include <stdint.h>
+#include <boolean.h>
 
 typedef enum
 {
@@ -16,20 +17,6 @@ typedef enum
 
 #define MDFNSF_NOFLAGS		      0
 
-#define MDFNSF_CAT_INPUT         (1 << 8)
-#define MDFNSF_CAT_SOUND	      (1 << 9)
-#define MDFNSF_CAT_VIDEO	      (1 << 10)
-
-#define MDFNSF_EMU_STATE	      (1 << 17)
-#define MDFNSF_UNTRUSTED_SAFE	   (1 << 18)
-
-#define MDFNSF_SUPPRESS_DOC	   (1 << 19)
-#define MDFNSF_COMMON_TEMPLATE	(1 << 20)
-#define MDFNSF_NONPERSISTENT	(1 << 21) // Don't save setting in settings file.
-
-#define MDFNSF_REQUIRES_RELOAD	(1 << 24)
-#define MDFNSF_REQUIRES_RESTART	(1 << 25)
-
 typedef struct
 {
    const char *string;
@@ -41,7 +28,7 @@ typedef struct
 typedef struct
 {
    const char *name;
-   uint32 flags;
+   uint32_t flags;
    const char *description;
    const char *description_extra;
 

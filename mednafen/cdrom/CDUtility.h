@@ -1,6 +1,17 @@
 #ifndef __MDFN_CDROM_CDUTILITY_H
 #define __MDFN_CDROM_CDUTILITY_H
 
+#include <stdint.h>
+#include <string.h>
+#include <boolean.h>
+#include <retro_inline.h>
+
+#include "../mednafen-types.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
  // Call once at app startup before creating any threads that could potentially cause re-entrancy to these functions.
  // It will also be called automatically if needed for the first time a function in this namespace that requires
  // the initialization function to be called is called, for potential
@@ -49,45 +60,50 @@
   DISC_TYPE_CD_XA      = 0x20
  };
 
+ /* CD table-of-contents.  Plain POD struct as of the C
+  * conversion - previously had a default constructor that called
+  * Clear() and a FindTrackByLBA member function.  Callers now
+  * invoke TOC_Clear() explicitly after construction, and
+  * TOC_FindTrackByLBA() exists as a free function (though
+  * currently no caller uses it - kept for parity with upstream
+  * Mednafen / beetle-psx-libretro). */
  struct TOC
  {
-  INLINE TOC()
-  {
-   Clear();
-  }
-
-  INLINE void Clear(void)
-  {
-   first_track = last_track = 0;
-   disc_type = 0;
-
-   memset(tracks, 0, sizeof(tracks));	// FIXME if we change TOC_Track to non-POD type.
-  }
-
-  INLINE int FindTrackByLBA(uint32_t LBA) const
-  {
-   int32_t track;
-   int32_t lvt = 0;
-
-   for(track = 1; track <= 100; track++)
-   {
-      if(!tracks[track].valid)
-         continue;
-
-      if(LBA < tracks[track].lba)
-         break;
-
-      lvt = track;
-   }
-
-   return(lvt);
-  }
-
   uint8_t first_track;
   uint8_t last_track;
   uint8_t disc_type;
-  TOC_Track tracks[100 + 1];  // [0] is unused, [100] is for the leadout track.
+  struct TOC_Track tracks[100 + 1];  // [0] is unused, [100] is for the leadout track.
  };
+
+ typedef struct TOC TOC;
+ typedef struct TOC_Track TOC_Track;
+
+ static INLINE void TOC_Clear(TOC *toc)
+ {
+  toc->first_track = 0;
+  toc->last_track  = 0;
+  toc->disc_type   = 0;
+  memset(toc->tracks, 0, sizeof(toc->tracks));	// FIXME if we change TOC_Track to non-POD type.
+ }
+
+ static INLINE int TOC_FindTrackByLBA(const TOC *toc, uint32_t LBA)
+ {
+  int32_t track;
+  int32_t lvt = 0;
+
+  for(track = 1; track <= 100; track++)
+  {
+     if(!toc->tracks[track].valid)
+        continue;
+
+     if(LBA < toc->tracks[track].lba)
+        break;
+
+     lvt = track;
+  }
+
+  return lvt;
+ }
 
  //
  // Address conversion functions.
@@ -161,10 +177,15 @@
  // Sector data encoding functions(to full 2352 bytes raw sector).
  //
  //  sector_data must be able to contain at least 2352 bytes.
- void encode_mode0_sector(uint32_t aba, uint8_t *sector_data);
+ //
+ //  encode_mode0_sector is called only inside CDUtility.c (from
+ //  synth_udapp_sector_lba / synth_leadout_sector_lba); it stayed
+ //  as a file-static in CDUtility.c rather than crossing the TU
+ //  boundary.  The mode1 / mode2 / mode2-form2 variants are
+ //  consumed by CDAccess_Image.c and CDAccess_CHD.c, so those
+ //  remain public.
  void encode_mode1_sector(uint32_t aba, uint8_t *sector_data);	// 2048 bytes of user data at offset 16
  void encode_mode2_sector(uint32_t aba, uint8_t *sector_data);	// 2336 bytes of user data at offset 16 
- void encode_mode2_form1_sector(uint32_t aba, uint8_t *sector_data);	// 2048+8 bytes of user data at offset 16
  void encode_mode2_form2_sector(uint32_t aba, uint8_t *sector_data);	// 2324+8 bytes of user data at offset 16
 
 
@@ -172,14 +193,14 @@
  // out_buf must be able to contain 2352+96 bytes.
  // "mode" is not used if the area is to be encoded as audio.
  // pass 0xFF for "mode" for "don't know", and to make guess based on the TOC.
- void synth_udapp_sector_lba(uint8_t mode, const TOC& toc, const int32_t lba, int32_t lba_subq_relative_offs, uint8_t* out_buf);
- void subpw_synth_udapp_lba(const TOC& toc, const int32_t lba, const int32_t lba_subq_relative_offs, uint8_t* SubPWBuf);
+ void synth_udapp_sector_lba(uint8_t mode, const TOC *toc, const int32_t lba, int32_t lba_subq_relative_offs, uint8_t* out_buf);
+ void subpw_synth_udapp_lba(const TOC *toc, const int32_t lba, const int32_t lba_subq_relative_offs, uint8_t* SubPWBuf);
 
  // out_buf must be able to contain 2352+96 bytes.
  // "mode" is not used if the area is to be encoded as audio.
  // pass 0xFF for "mode" for "don't know", and to make guess based on the TOC.
- void synth_leadout_sector_lba(uint8_t mode, const TOC& toc, const int32_t lba, uint8_t* out_buf);
- void subpw_synth_leadout_lba(const TOC& toc, const int32_t lba, uint8_t* SubPWBuf);
+ void synth_leadout_sector_lba(uint8_t mode, const TOC *toc, const int32_t lba, uint8_t* out_buf);
+ void subpw_synth_leadout_lba(const TOC *toc, const int32_t lba, uint8_t* SubPWBuf);
 
 
  //
@@ -215,9 +236,6 @@
  // Deinterleaves 12 bytes of subchannel Q data from 96 bytes of interleaved subchannel PW data.
  void subq_deinterleave(const uint8_t *subpw_buf, uint8_t *subq_buf);
 
- // Deinterleaves 96 bytes of subchannel P-W data from 96 bytes of interleaved subchannel PW data.
- void subpw_deinterleave(const uint8_t *in_buf, uint8_t *out_buf);
-
  // Interleaves 96 bytes of subchannel P-W data from 96 bytes of uninterleaved subchannel PW data.
  void subpw_interleave(const uint8_t *in_buf, uint8_t *out_buf);
 
@@ -227,7 +245,8 @@
  // TODO
  //void subq_extrapolate(const uint8_t *subq_input, int32_t position_delta, uint8_t *subq_output);
 
- // (De)Scrambles data sector.
- void scrambleize_data_sector(uint8_t *sector_data);
+#ifdef __cplusplus
+}
+#endif
 
 #endif

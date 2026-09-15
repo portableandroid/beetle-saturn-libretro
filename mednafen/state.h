@@ -22,8 +22,10 @@
 #ifndef __MDFN_STATE_H
 #define __MDFN_STATE_H
 
+#include <stdint.h>
+#include <stddef.h>
 #include <retro_inline.h>
-#include <type_traits>
+#include <boolean.h>
 
 typedef struct
 {
@@ -33,19 +35,31 @@ typedef struct
    uint32_t len;
    uint32_t malloced;
    uint32_t initial_malloc; // A setting!
+   /* Sticky 'a previous smem_write hit OOM' flag.  Latched true by
+    * smem_write on grow-allocation failure; checked by MDFNSS_SaveSM
+    * at the end of a save pass to fail loudly instead of returning
+    * a half-written state buffer.  MDFNSS_SaveSM clears this at
+    * entry; the libretro.c callers (retro_serialize* /
+    * retro_get_memory_*) don't need to initialise it -- their
+    * StateMem instances are stack-locals reused only by SaveSM. */
+   bool write_failed;
 } StateMem;
 
-// Eh, we abuse the smem_* in-memory stream code
-// in a few other places. :)
-int32_t smem_read(StateMem *st, void *buffer, uint32_t len);
-int32_t smem_write(StateMem *st, void *buffer, uint32_t len);
-int32_t smem_putc(StateMem *st, int value);
-int32_t smem_seek(StateMem *st, uint32_t offset, int whence);
-int smem_write32le(StateMem *st, uint32_t b);
-int smem_read32le(StateMem *st, uint32_t *b);
+/* The external functions declared in this header keep C linkage so the
+   SS core can be a mix of C and C++ translation units while it is
+   converted. The static INLINE helpers further down are intentionally
+   NOT inside this extern "C" block: SF_FORCE_A* is an overload set in
+   C++, and overloading is incompatible with C linkage. */
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-int MDFNSS_SaveSM(void *st, uint32_t ver, const void*, const void*, const void*);
+int MDFNSS_SaveSM(void *st, uint32_t ver);
 int MDFNSS_LoadSM(void *st, uint32_t ver);
+
+#ifdef __cplusplus
+}
+#endif
 
 // Flag for a single, >= 1 byte native-endian variable
 #define MDFNSTATE_RLSB            0x80000000
@@ -61,132 +75,172 @@ int MDFNSS_LoadSM(void *st, uint32_t ver);
 
 #define MDFNSTATE_BOOL		  0x08000000
 
-struct SFORMAT
+typedef struct
 {
 	const char* name;	// Name;
 	void* data;		// Pointer to the variable/array
-	uint32 size;		// Length, in bytes, of the data to be saved EXCEPT:
+	uint32_t size;		// Length, in bytes, of the data to be saved EXCEPT:
 				//  In the case of 'bool' it is the number of bool elements to save(bool is not always 1-byte).
 				// If 0, the subchunk isn't saved.
-	uint32 type;		// Type/element size; 0(bool), 1, 2, 4, 8
-	uint32 repcount;
-	uint32 repstride;
-};
+	uint32_t type;		// Type/element size; 0(bool), 1, 2, 4, 8
+	uint32_t repcount;
+	uint32_t repstride;
+} SFORMAT;
 
-static INLINE int8* SF_FORCE_A8(int8* p) { return p; }
-static INLINE uint8* SF_FORCE_A8(uint8* p) { return p; }
+/* SF_FORCE_A{8,16,32,64}: identity functions whose only purpose is to
+   pin the argument to an exact pointer width at the call site, so a
+   mismatched pointer fails to compile. They generate no code.
 
-static INLINE int16* SF_FORCE_A16(int16* p) { return p; }
-static INLINE uint16* SF_FORCE_A16(uint16* p) { return p; }
+   In C++ they are overload sets (signed + unsigned per width). In C
+   they are _Generic selections that accept only the matching
+   signed/unsigned pointer pair and otherwise produce a compile error,
+   giving the C side the same width-checking the C++ overloads gave. */
+#ifdef __cplusplus
+static INLINE int8_t* SF_FORCE_A8(int8_t* p) { return p; }
+static INLINE uint8_t* SF_FORCE_A8(uint8_t* p) { return p; }
 
-static INLINE int32* SF_FORCE_A32(int32* p) { return p; }
-static INLINE uint32* SF_FORCE_A32(uint32* p) { return p; }
+static INLINE int16_t* SF_FORCE_A16(int16_t* p) { return p; }
+static INLINE uint16_t* SF_FORCE_A16(uint16_t* p) { return p; }
 
-static INLINE int64* SF_FORCE_A64(int64* p) { return p; }
-static INLINE uint64* SF_FORCE_A64(uint64* p) { return p; }
+static INLINE int32_t* SF_FORCE_A32(int32_t* p) { return p; }
+static INLINE uint32_t* SF_FORCE_A32(uint32_t* p) { return p; }
 
-template<typename T>
-static INLINE void SF_FORCE_ANY(typename std::enable_if<!std::is_enum<T>::value>::type* = nullptr)
+static INLINE int64_t* SF_FORCE_A64(int64_t* p) { return p; }
+static INLINE uint64_t* SF_FORCE_A64(uint64_t* p) { return p; }
+#else
+#define SF_FORCE_A8(p)  _Generic((p), int8_t*:  (p), uint8_t*:  (p))
+#define SF_FORCE_A16(p) _Generic((p), int16_t*: (p), uint16_t*: (p))
+#define SF_FORCE_A32(p) _Generic((p), int32_t*: (p), uint32_t*: (p))
+#define SF_FORCE_A64(p) _Generic((p), int64_t*: (p), uint64_t*: (p))
+#endif
+
+/* SFORMAT_BUILD_: the single, plain-C implementation that builds one
+   SFORMAT entry. Both the C and C++ macro front-ends forward to this.
+
+   elem_size and is_bool are the only pieces of per-type information the
+   old SFBASE_ template obtained from its template parameter; the macros
+   below now compute them lexically at the call site (sizeof, plus a
+   bool test), so this function needs no type information of its own.
+
+   Output layout is identical to the previous template SFBASE_:
+     bool   -> size = element count,        type = 0
+     other  -> size = sizeof(elem) * count, type = sizeof(elem)
+   and ret.data carries the same repbase-relative offset. */
+static INLINE SFORMAT SFORMAT_BUILD_(void* iv, uint32_t icount,
+      uint32_t totalcount, size_t repstride, void* repbase,
+      const char* name, size_t elem_size, int is_bool)
 {
- static_assert(	std::is_same<T, bool>::value ||
-		std::is_same<T, int8>::value || std::is_same<T, uint8>::value ||
-		std::is_same<T, int16>::value || std::is_same<T, uint16>::value ||
-		std::is_same<T, int32>::value || std::is_same<T, uint32>::value || std::is_same<T, float>::value ||
-		std::is_same<T, int64>::value || std::is_same<T, uint64>::value || std::is_same<T, double>::value, "Unsupported type");
+   SFORMAT ret;
+
+   ret.data      = iv ? (char*)repbase + ((char*)iv - (char*)repbase) : (void*)0;
+   ret.name      = name;
+   ret.repcount  = totalcount - 1;
+   ret.repstride = (uint32_t)repstride;
+
+   if(is_bool)
+   {
+      ret.size = icount;
+      ret.type = 0;
+   }
+   else
+   {
+      ret.size = (uint32_t)(elem_size * icount);
+      ret.type = (uint32_t)elem_size;
+   }
+
+   return ret;
 }
 
-template<typename T>
-static INLINE void SF_FORCE_ANY(typename std::enable_if<std::is_enum<T>::value>::type* = nullptr)
-{
- SF_FORCE_ANY<typename std::underlying_type<T>::type>();
-}
+/* SF_IS_BOOL_(x): 1 if the lvalue x has type bool, else 0. The
+   bool-ness of the element type is the one piece of information that
+   genuinely needs language-specific machinery; everything else is
+   plain C. In C++ it is std::is_same; in C it is _Generic. */
+#ifdef __cplusplus
+#include <type_traits>
+#define SF_IS_BOOL_(x) ((int)std::is_same<__typeof__(x), bool>::value)
+#else
+#define SF_IS_BOOL_(x) _Generic((x), bool: 1, default: 0)
+#endif
 
-template<typename IT>
-static INLINE SFORMAT SFBASE_(IT* const iv, uint32 icount, const uint32 totalcount, const size_t repstride, void* repbase, const char* const name)
-{
- typedef typename std::remove_all_extents<IT>::type T;
- uint32 count = icount * (sizeof(IT) / sizeof(T));
- SF_FORCE_ANY<T>();
- //
- //
- SFORMAT ret;
+/* SFEXP_*: helpers expand to the explicit-element-size SFORMAT_BUILD_
+   call. _S forms take a pointer whose pointee is the element (used by
+   SFVAR for scalars and by SFPTR* for arrays); the element size and
+   bool-ness come from *(p). */
+#define SFEXP_S6_(p, ic, tc, rs, rb, nm) \
+   SFORMAT_BUILD_((void*)(p), (ic), (tc), (rs), (void*)(rb), (nm), \
+                  sizeof(*(p)), SF_IS_BOOL_(*(p)))
 
- ret.data = iv ? (char*)repbase + ((char*)iv - (char*)repbase) : nullptr;
- ret.name = name;
- ret.repcount = totalcount - 1;
- ret.repstride = repstride;
- if(std::is_same<T, bool>::value)
- {
-  ret.size = count;
-  ret.type = 0;
- }
- else
- {
-  ret.size = sizeof(T) * count;
-  ret.type = sizeof(T);
- }
+#define SFEXP_S3_(p, ct, nm) \
+   SFORMAT_BUILD_((void*)(p), (ct), 1, 0, (void*)(p), (nm), \
+                  sizeof(*(p)), SF_IS_BOOL_(*(p)))
 
- return ret;
-}
+/* SFVARN(x, ...): x is a scalar lvalue. After the array-typed call
+   sites were migrated to the SFPTR*N forms, SFVAR/SFVARN only ever
+   receive scalars, so &(x) points at a single element and the count
+   is 1. The variadic tail is either just the name (1-arg SFVAR) or
+   totalcount/repstride/repbase + name (4-arg repeat form). */
+#define SFVARN(x, ...)	SFEXP_S6_DISPATCH_(&(x), __VA_ARGS__)
 
-/*
- Probably a bad idea unless we prevent derived classes.
-
-template<typename IT>
-static INLINE SFORMAT SFBASE_(std::array<IT, N>* iv, uint32 icount, const uint32 totalcount, const size_t repstride, void* repbase, const char* const name)
-{
- return SFBASE_(iv->data(), icount * N, totalcount, repstride, repbase, name);
-}
-*/
-
-template<typename T>
-static INLINE SFORMAT SFBASE_(T* const v, const uint32 count, const char* const name)
-{
- return SFBASE_(v, count, 1, 0, v, name);
-}
-
-#define SFVARN(x, ...)	SFBASE_(&(x), 1, __VA_ARGS__)
+/* dispatch on the SFVARN tail length:
+     SFVARN(x, "nm")               -> 1 trailing arg
+     SFVARN(x, tc, rs, rb, "nm")   -> 4 trailing args                  */
+#define SFEXP_S6_DISPATCH_(p, ...) \
+   SFEXP_S6_PICK_(__VA_ARGS__, SFEXP_S6_T4_, x, x, SFEXP_S6_T1_)(p, __VA_ARGS__)
+#define SFEXP_S6_PICK_(a, b, c, d, NAME, ...) NAME
+#define SFEXP_S6_T1_(p, nm)               SFEXP_S6_(p, 1, 1, 0, p, nm)
+#define SFEXP_S6_T4_(p, tc, rs, rb, nm)   SFEXP_S6_(p, 1, tc, rs, rb, nm)
 
 #define SFVAR1_(x)	   SFVARN((x), #x)
 #define SFVAR4_(x, tc, rs, rb) SFVARN((x), tc, rs, rb, #x)
 #define SFVAR_(a, b, c, d, e, ...)	e
 #define SFVAR(...) 	SFVAR_(__VA_ARGS__, SFVAR4_, SFVAR3_, SFVAR2_, SFVAR1_, SFVAR0_)(__VA_ARGS__)
 
-#define SFPTR8N(x, ...)		SFBASE_(SF_FORCE_A8(x), __VA_ARGS__)
-#define SFPTR8(x, ...)		SFBASE_(SF_FORCE_A8(x), __VA_ARGS__, #x)
+/* SFPTR*N / SFPTR*: x is a pointer to the (innermost) element. The
+   SF_FORCE_A* wrapper pins the pointer width; SFEXP_S3_/S6_ take the
+   element size and bool-ness from *(x). The N forms take an explicit
+   name; the non-N forms stringize x. The variadic tail is either
+   (count) / (count,"nm") or (count,tc,rs,rb) / (count,tc,rs,rb,"nm"). */
+#define SFPTRXN_(p, ...) \
+   SFEXP_SX_PICK_(__VA_ARGS__, SFEXP_S6_T5_, SFEXP_S6_T4N_, x, SFEXP_S3_2_, SFEXP_S3_1_)(p, __VA_ARGS__)
+#define SFEXP_SX_PICK_(a, b, c, d, e, NAME, ...) NAME
+#define SFEXP_S3_1_(p, ct)                  SFEXP_S3_(p, ct, #p)
+#define SFEXP_S3_2_(p, ct, nm)              SFEXP_S3_(p, ct, nm)
+#define SFEXP_S6_T4N_(p, ct, tc, rs, rb)    SFEXP_S6_(p, ct, tc, rs, rb, #p)
+#define SFEXP_S6_T5_(p, ct, tc, rs, rb, nm) SFEXP_S6_(p, ct, tc, rs, rb, nm)
 
-#define SFPTRBN(x, ...)		SFBASE_<bool>((x), __VA_ARGS__)
-#define SFPTRB(x, ...)		SFBASE_<bool>((x), __VA_ARGS__, #x)
+#define SFPTR8N(x, ...)		SFPTRXN_(SF_FORCE_A8(x), __VA_ARGS__)
+#define SFPTR8(x, ...)		SFPTRXN_(SF_FORCE_A8(x), __VA_ARGS__, #x)
 
-#define SFPTR16N(x, ...)	SFBASE_(SF_FORCE_A16(x), __VA_ARGS__)
-#define SFPTR16(x, ...)		SFBASE_(SF_FORCE_A16(x), __VA_ARGS__, #x)
+#define SFPTRBN(x, ...)		SFPTRXN_((x), __VA_ARGS__)
 
-#define SFPTR32N(x, ...)	SFBASE_(SF_FORCE_A32(x), __VA_ARGS__)
-#define SFPTR32(x, ...)		SFBASE_(SF_FORCE_A32(x), __VA_ARGS__, #x)
+#define SFPTR16N(x, ...)	SFPTRXN_(SF_FORCE_A16(x), __VA_ARGS__)
+#define SFPTR16(x, ...)		SFPTRXN_(SF_FORCE_A16(x), __VA_ARGS__, #x)
 
-#define SFPTR64N(x, ...)	SFBASE_(SF_FORCE_A64(x), __VA_ARGS__)
-#define SFPTR64(x, ...)		SFBASE_(SF_FORCE_A64(x), __VA_ARGS__, #x)
+#define SFPTR32N(x, ...)	SFPTRXN_(SF_FORCE_A32(x), __VA_ARGS__)
+#define SFPTR32(x, ...)		SFPTRXN_(SF_FORCE_A32(x), __VA_ARGS__, #x)
 
-#define SFPTRFN(x, ...)		SFBASE_<float>((x), __VA_ARGS__)
-#define SFPTRF(x, ...)		SFBASE_<float>((x), __VA_ARGS__, #x)
+#define SFPTR64N(x, ...)	SFPTRXN_(SF_FORCE_A64(x), __VA_ARGS__)
 
-#define SFPTRDN(x, ...)		SFBASE_<double>((x), __VA_ARGS__)
-#define SFPTRD(x, ...)		SFBASE_<double>((x), __VA_ARGS__, #x)
+#define SFLINK(x) { (const char*)0, (x), ~0U, 0, 0, 0 }
 
-#define SFLINK(x) { nullptr, (x), ~0U, 0, 0, 0 }
-
-#define SFEND { nullptr, nullptr, 0, 0, 0, 0 }
-
-#include <vector>
+#define SFEND { (const char*)0, (void*)0, 0, 0, 0, 0 }
 
 // State-Section Descriptor
-struct SSDescriptor
+typedef struct
 {
    SFORMAT *sf;
    const char *name;
    bool optional;
-};
+} SSDescriptor;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 int MDFNSS_StateAction(void *st, int load, int data_only, SFORMAT *sf, const char *name, bool optional);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

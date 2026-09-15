@@ -22,44 +22,107 @@
 #ifndef __MDFN_M68K_H
 #define __MDFN_M68K_H
 
-#include <mednafen/mednafen.h>
+#include "../../mednafen.h"
 
-class M68K
+/* M68K_BUS_INT_ACK_AUTO -- BusIntAck callback can return this to
+ * tell M68K to use automatic interrupt-acknowledge vectoring (auto-
+ * vector mode) instead of supplying an explicit vector number. */
+enum { M68K_BUS_INT_ACK_AUTO = -1 };
+
+/* C-compat typedef: in C the struct tag is not auto-aliased to a
+ * type name, so the bare `M68K*` spellings used in the data-
+ * member BusRMW function-pointer signature (inside this struct)
+ * and in the M68K_* free-function declarations (after this struct)
+ * fail to parse from a C TU.  Forward-declare the typedef up
+ * front; same pattern scsp.h uses for SS_SCSP_Slot / SS_SCSP_Timer
+ * / SS_SCSP / etc. */
+typedef struct M68K M68K;
+
+enum  /* XPENDING_MASK -- bits of M68K XPending */
 {
- public:
+ XPENDING_MASK_INT          = 0x0001,
+ XPENDING_MASK_NMI          = 0x0002,
+ XPENDING_MASK_RESET        = 0x0010,
+ XPENDING_MASK_ADDRESS      = 0x0020,
+ XPENDING_MASK_BUS          = 0x0040,
+ XPENDING_MASK_STOPPED      = 0x0100, /* via STOP instruction */
 
- M68K(const bool rev_e = false) MDFN_COLD;
- ~M68K() MDFN_COLD;
+ XPENDING_MASK_ERRORHALTED  = 0x0400, /* address/bus error during address/bus error handling */
 
- void Run(int32 run_until_time);
+ XPENDING_MASK_DTACKHALTED  = 0x0800,
+ XPENDING_MASK_EXTHALTED    = 0x1000,
 
- void Reset(bool powering_up) MDFN_COLD;
+ /* For save-state sanitising: */
+ XPENDING_MASK__VALID = XPENDING_MASK_INT | XPENDING_MASK_NMI | XPENDING_MASK_RESET | XPENDING_MASK_ADDRESS | XPENDING_MASK_BUS | XPENDING_MASK_STOPPED | XPENDING_MASK_ERRORHALTED | XPENDING_MASK_DTACKHALTED | XPENDING_MASK_EXTHALTED
+};
 
- void SetIPL(uint8 ipl_new);
- void SetExtHalted(bool state);
+enum AddressMode
+{
+ DATA_REG_DIR,
+ ADDR_REG_DIR,
 
+ ADDR_REG_INDIR,
+ ADDR_REG_INDIR_POST,
+ ADDR_REG_INDIR_PRE,
 
- //
- // SignalDTACKHalted() and SignalAddressError() should be called from the external
- // bus read/write handlers as appropriate, followed by a longjmp() to above
- // Run().
- //
- INLINE void SignalDTACKHalted(uint32 addr)
- {
-  XPending |= XPENDING_MASK_DTACKHALTED;
- }
+ ADDR_REG_INDIR_DISP,
 
- INLINE void SignalAddressError(uint32 addr, uint8 type)
- {
-  if(XPending & (XPENDING_MASK_ADDRESS | XPENDING_MASK_BUS | XPENDING_MASK_RESET))
-  {
-   XPending |= XPENDING_MASK_ERRORHALTED;
-  }
+ ADDR_REG_INDIR_INDX,
 
-  XPending |= XPENDING_MASK_ADDRESS;
- }
+ ABS_SHORT,
+ ABS_LONG,
 
- void StateAction(StateMem* sm, const unsigned load, const bool data_only, const char* sname);
+ PC_DISP,
+ PC_INDEX,
+
+ IMMEDIATE
+};
+
+enum  /* VECNUM -- vector numbers for Exception() */
+{
+ VECNUM_RESET_SSP     = 0,
+ VECNUM_RESET_PC      = 1,
+ VECNUM_BUS_ERROR     = 2,
+ VECNUM_ADDRESS_ERROR = 3,
+ VECNUM_ILLEGAL       = 4,
+ VECNUM_ZERO_DIVIDE   = 5,
+ VECNUM_CHK           = 6,
+ VECNUM_TRAPV         = 7,
+ VECNUM_PRIVILEGE     = 8,
+ VECNUM_TRACE         = 9,
+ VECNUM_LINEA         = 10,
+ VECNUM_LINEF         = 11,
+
+ VECNUM_UNINI_INT     = 15,
+
+ VECNUM_SPURIOUS_INT  = 24,
+ VECNUM_INT_BASE      = 24,
+
+ VECNUM_TRAP_BASE     = 32
+};
+
+enum  /* EXCEPTION class -- first arg to Exception() */
+{
+ EXCEPTION_RESET = 0,
+ EXCEPTION_BUS_ERROR,
+ EXCEPTION_ADDRESS_ERROR,
+ EXCEPTION_ILLEGAL,
+ EXCEPTION_ZERO_DIVIDE,
+ EXCEPTION_CHK,
+ EXCEPTION_TRAPV,
+ EXCEPTION_PRIVILEGE,
+ EXCEPTION_TRACE,
+
+ EXCEPTION_INT,
+ EXCEPTION_TRAP
+};
+
+/* Phase-9c: class -> struct.  See Phase-9a comment in scsp.h
+ * for rationale.  M68K already had `//private:` (commented out)
+ * markers, so all members were de facto public; this commit
+ * simply formalizes the access. */
+struct M68K
+{
 
  //
  //
@@ -71,369 +134,52 @@ class M68K
  //
  union
  {
-  uint32 DA[16];
+  uint32_t DA[16];
   struct
   {
-   uint32 D[8];
-   uint32 A[8];
+   uint32_t D[8];
+   uint32_t A[8];
   };
  };
- int32 timestamp;
+ int32_t timestamp;
 
- uint32 PC;
- uint8 SRHB;
- uint8 IPL;
+ uint32_t PC;
+ uint8_t SRHB;
+ uint8_t IPL;
 
  bool Flag_Z, Flag_N;
  bool Flag_X, Flag_C, Flag_V;
 
- uint32 SP_Inactive;
- uint32 XPending;
- enum
- {
-  XPENDING_MASK_INT 	= 0x0001,
-  XPENDING_MASK_NMI	= 0x0002,
-  XPENDING_MASK_RESET	= 0x0010,
-  XPENDING_MASK_ADDRESS = 0x0020,
-  XPENDING_MASK_BUS	= 0x0040,
-  XPENDING_MASK_STOPPED	= 0x0100,	// via STOP instruction
+ uint32_t SP_Inactive;
+ uint32_t XPending;
 
-  XPENDING_MASK_ERRORHALTED = 0x0400,	// address/bus error during address/bus error handling.
-
-  XPENDING_MASK_DTACKHALTED = 0x0800,
-  XPENDING_MASK_EXTHALTED   = 0x1000,
-
-  // For save state sanitizing:
-  XPENDING_MASK__VALID = XPENDING_MASK_INT | XPENDING_MASK_NMI | XPENDING_MASK_RESET | XPENDING_MASK_ADDRESS | XPENDING_MASK_BUS | XPENDING_MASK_STOPPED | XPENDING_MASK_ERRORHALTED | XPENDING_MASK_DTACKHALTED | XPENDING_MASK_EXTHALTED
- };
-
- const bool Revision_E;
-
- //private:
- void RecalcInt(void);
-
- template<typename T>
- T Read(uint32 addr);
-
- uint16 ReadOp(void);
-
- template<typename T, bool long_dec = false>
- void Write(uint32 addr, const T val);
-
- template<typename T>
- void Push(const T value);
-
- template<typename T>
- T Pull(void);
-
- enum AddressMode
- {
-  DATA_REG_DIR,
-  ADDR_REG_DIR,
-
-  ADDR_REG_INDIR,
-  ADDR_REG_INDIR_POST,
-  ADDR_REG_INDIR_PRE,
-
-  ADDR_REG_INDIR_DISP,
-
-  ADDR_REG_INDIR_INDX,
-
-  ABS_SHORT,
-  ABS_LONG,
-
-  PC_DISP,
-  PC_INDEX,
-
-  IMMEDIATE
- };
+ /* Set by M68K_Construct / M68K M68K from the `rev_e` parameter
+  * and never written again.  Was `const bool` -- contractual
+  * single-init via the ctor's member-initializer list.  Dropped
+  * the const so the free-function M68K_Construct can assign to
+  * it (C-style construction has no member-initializer-list
+  * syntax).  Set-once-at-construction is now preserved by
+  * convention, not by compiler-enforced const-correctness. */
+ bool Revision_E;
 
  //
- // MOVE byte and word: instructions, 2 cycle penalty for source predecrement only
- //  	2 cycle penalty for (d8, An, Xn) for both source and dest ams
- //  	2 cycle penalty for (d8, PC, Xn) for dest am
- //
 
- //
- // Careful on declaration order of HAM objects(needs to be source then dest).
- //
- template<typename T, M68K::AddressMode am>
- struct HAM;
-
- bool GetC(void);
- bool GetV(void);
- bool GetZ(void);
- bool GetN(void);
- bool GetX(void);
-
- void SetCX(bool val);
-
- template<typename T, bool Z_OnlyClear = false>
- void CalcZN(const T val);
-
- uint8 GetCCR(void);
- void SetCCR(uint8 val);
- uint16 GetSR(void);
- void SetSR(uint16 val);
-
- bool GetSVisor(void);
-
- //
- //
- //
- enum
- {
-  VECNUM_RESET_SSP = 0,
-  VECNUM_RESET_PC  = 1,
-  VECNUM_BUS_ERROR = 2,
-  VECNUM_ADDRESS_ERROR = 3,
-  VECNUM_ILLEGAL = 4,
-  VECNUM_ZERO_DIVIDE = 5,
-  VECNUM_CHK = 6,
-  VECNUM_TRAPV = 7,
-  VECNUM_PRIVILEGE = 8,
-  VECNUM_TRACE = 9,
-  VECNUM_LINEA = 10,
-  VECNUM_LINEF = 11,
-
-  VECNUM_UNINI_INT = 15,
-
-  VECNUM_SPURIOUS_INT = 24,
-  VECNUM_INT_BASE = 24,
-
-  VECNUM_TRAP_BASE = 32
- };
-
- enum
- {
-  EXCEPTION_RESET = 0,
-  EXCEPTION_BUS_ERROR,
-  EXCEPTION_ADDRESS_ERROR,
-  EXCEPTION_ILLEGAL,
-  EXCEPTION_ZERO_DIVIDE,
-  EXCEPTION_CHK,
-  EXCEPTION_TRAPV,
-  EXCEPTION_PRIVILEGE,
-  EXCEPTION_TRACE,
-
-  EXCEPTION_INT,
-  EXCEPTION_TRAP
- };
-
- void NO_INLINE Exception(unsigned which, unsigned vecnum);
-
- template<typename T, typename DT, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void ADD(HAM<T, SAM> &src, HAM<DT, DAM> &dst);
-
- template<typename T, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void ADDX(HAM<T, SAM> &src, HAM<T, DAM> &dst);
-
- template<bool X_form, typename T, typename DT, M68K::AddressMode SAM, M68K::AddressMode DAM>
- DT Subtract(HAM<T, SAM> &src, HAM<DT, DAM> &dst);
-
- template<typename T, typename DT, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void SUB(HAM<T, SAM> &src, HAM<DT, DAM> &dst);
-
- template<typename T, typename DT, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void SUBX(HAM<T, SAM> &src, HAM<DT, DAM> &dst);
-
- template<typename DT, M68K::AddressMode DAM>
- void NEG(HAM<DT, DAM> &dst);
-
- template<typename DT, M68K::AddressMode DAM>
- void NEGX(HAM<DT, DAM> &dst);
-
- template<typename T, typename DT, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void CMP(HAM<T, SAM> &src, HAM<DT, DAM> &dst);
-
- template<typename T, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void CHK(HAM<T, SAM> &src, HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void OR(HAM<T, SAM> &src, HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void EOR(HAM<T, SAM> &src, HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void AND(HAM<T, SAM> &src, HAM<T, DAM> &dst);
-
- void ORI_CCR(void);
- void ORI_SR(void);
- void ANDI_CCR(void);
- void ANDI_SR(void);
- void EORI_CCR(void);
- void EORI_SR(void);
-
- template<typename T, M68K::AddressMode SAM>
- void MULU(HAM<T, SAM> &src, const unsigned dr);
-
- template<typename T, M68K::AddressMode SAM>
- void MULS(HAM<T, SAM> &src, const unsigned dr);
-
- template<bool sdiv>
- void Divide(uint16 divisor, const unsigned dr);
-
- template<typename T, M68K::AddressMode SAM>
- void DIVU(HAM<T, SAM> &src, const unsigned dr);
-
- template<typename T, M68K::AddressMode SAM>
- void DIVS(HAM<T, SAM> &src, const unsigned dr);
-
- template<typename T, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void ABCD(HAM<T, SAM> &src, HAM<T, DAM> &dst);
-
- uint8 DecimalSubtractX(const uint8 src_data, const uint8 dst_data);
-
- template<typename T, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void SBCD(HAM<T, SAM> &src, HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode DAM>
- void NBCD(HAM<T, DAM> &dst);
-
- template<typename T, bool reg_to_mem>
- void MOVEP(const unsigned ar, const unsigned dr);
-
- template<typename T, M68K::AddressMode TAM>
- void BTST(HAM<T, TAM> &targ, unsigned wb);
-
- template<typename T, M68K::AddressMode TAM>
- void BCHG(HAM<T, TAM> &targ, unsigned wb);
-
- template<typename T, M68K::AddressMode TAM>
- void BCLR(HAM<T, TAM> &targ, unsigned wb);
-
- template<typename T, M68K::AddressMode TAM>
- void BSET(HAM<T, TAM> &targ, unsigned wb);
-
- template<typename T, M68K::AddressMode SAM, M68K::AddressMode DAM>
- void MOVE(HAM<T, SAM> &src, HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode SAM>
- void MOVEA(HAM<T, SAM> &src, const unsigned ar);
-
- template<bool pseudo_predec, typename T, M68K::AddressMode DAM>
- void MOVEM_to_MEM(const uint16 reglist, HAM<T, DAM> &dst);
-
- template<bool pseudo_postinc, typename T, M68K::AddressMode SAM>
- void MOVEM_to_REGS(HAM<T, SAM> &src, const uint16 reglist);
-
- template<typename T, M68K::AddressMode TAM, bool Arithmetic, bool ShiftLeft>
- void ShiftBase(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode TAM>
- void ASL(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode TAM>
- void ASR(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode TAM>
- void LSL(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode TAM>
- void LSR(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode TAM, bool X_Form, bool ShiftLeft>
- void RotateBase(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode TAM>
- void ROL(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode TAM>
- void ROR(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode TAM>
- void ROXL(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode TAM>
- void ROXR(HAM<T, TAM> &targ, unsigned count);
-
- template<typename T, M68K::AddressMode DAM>
- void TAS(HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode DAM>
- void TST(HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode DAM>
- void CLR(HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode DAM>
- void NOT(HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode DAM>
- void EXT(HAM<T, DAM> &dst);
-
- void SWAP(const unsigned dr);
-
- void EXG(uint32* a, uint32* b);
-
- template<unsigned cc>
- bool TestCond(void);
-
- template<unsigned cc>
- void Bxx(uint32 disp);
-
- template<unsigned cc>
- void DBcc(const unsigned dr);
-
- template<unsigned cc, typename T, M68K::AddressMode DAM>
- void Scc(HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode TAM>
- void JSR(HAM<T, TAM> &targ);
-
- template<typename T, M68K::AddressMode TAM>
- void JMP(HAM<T, TAM> &targ);
-
- template <typename T, M68K::AddressMode DAM>
- void MOVE_from_SR(HAM<T, DAM> &dst);
-
- template<typename T, M68K::AddressMode SAM>
- void MOVE_to_CCR(HAM<T, SAM> &src);
-
- template<typename T, M68K::AddressMode SAM>
- void MOVE_to_SR(HAM<T, SAM> &src);
-
- template<bool direction>
- void MOVE_USP(const unsigned ar);
-
- template<typename T, M68K::AddressMode SAM>
- void LEA(HAM<T, SAM> &src, const unsigned ar);
-
- template<typename T, M68K::AddressMode SAM>
- void PEA(HAM<T, SAM> &src);
- void UNLK(const unsigned ar);
- void LINK(const unsigned ar);
- void RTE(void);
- void RTR(void);
- void RTS(void);
- void TRAP(const unsigned vf);
- void TRAPV(void);
- void ILLEGAL(const uint16 instr);
- void LINEA(void);
- void LINEF(void);
- void NOP(void);
- void RESET(void);
- void STOP(void);
-
- bool CheckPrivilege(void);
  //
  //
  //
  //
  //
- // These externally-provided functions should add >= 4 to M68K::timestamp per call:
- enum { BUS_INT_ACK_AUTO = -1 };
+ // These externally-provided functions should add >= 4 to M68K timestamp per call:
 
- uint16 (MDFN_FASTCALL *BusReadInstr)(uint32 A);
- uint8 (MDFN_FASTCALL *BusRead8)(uint32 A);
- uint16 (MDFN_FASTCALL *BusRead16)(uint32 A);
- void (MDFN_FASTCALL *BusWrite8)(uint32 A, uint8 V);
- void (MDFN_FASTCALL *BusWrite16)(uint32 A, uint16 V);
+ uint16_t (MDFN_FASTCALL *BusReadInstr)(uint32_t A);
+ uint8_t (MDFN_FASTCALL *BusRead8)(uint32_t A);
+ uint16_t (MDFN_FASTCALL *BusRead16)(uint32_t A);
+ void (MDFN_FASTCALL *BusWrite8)(uint32_t A, uint8_t V);
+ void (MDFN_FASTCALL *BusWrite16)(uint32_t A, uint16_t V);
  //
  //
- void (MDFN_FASTCALL *BusRMW)(uint32 A, uint8 (MDFN_FASTCALL *cb)(M68K*, uint8));
- unsigned (MDFN_FASTCALL *BusIntAck)(uint8 level);
+ void (MDFN_FASTCALL *BusRMW)(uint32_t A, uint8_t (MDFN_FASTCALL *cb)(M68K*, uint8_t));
+ unsigned (MDFN_FASTCALL *BusIntAck)(uint8_t level);
  void (MDFN_FASTCALL *BusRESET)(bool state);	// Optional; Calling Reset(false) from this callback *is* permitted.
 
  //
@@ -442,35 +188,121 @@ class M68K
  //
  //
  //
- public:
- enum
- {
-  GSREG_D0 = 0,
-  GSREG_D1,
-  GSREG_D2,
-  GSREG_D3,
-  GSREG_D4,
-  GSREG_D5,
-  GSREG_D6,
-  GSREG_D7,
 
-  GSREG_A0 = 8,
-  GSREG_A1,
-  GSREG_A2,
-  GSREG_A3,
-  GSREG_A4,
-  GSREG_A5,
-  GSREG_A6,
-  GSREG_A7,
-
-  GSREG_PC = 16,
-  GSREG_SR,
-  GSREG_SSP,
-  GSREG_USP
  };
 
- uint32 GetRegister(unsigned which, char* special = nullptr, const uint32 special_len = 0);
- void SetRegister(unsigned which, uint32 value);
-};
+/* Free-function op declarations taking an explicit M68K* `z` first
+ * parameter.  Bodies are in m68k_private.h; the m68k_instr*.inc call
+ * sites use these via the macro-monomorphized HAM and op families. */
+
+void RecalcInt(M68K* z);
+uint8_t Read_u8(M68K* z, uint32_t addr);
+uint16_t Read_u16(M68K* z, uint32_t addr);
+uint32_t Read_u32(M68K* z, uint32_t addr);
+void Write_u8(M68K* z, uint32_t addr, const uint8_t val);
+void Write_u16(M68K* z, uint32_t addr, const uint16_t val);
+void Write_u32(M68K* z, uint32_t addr, const uint32_t val);
+void Write_u32_longdec(M68K* z, uint32_t addr, const uint32_t val);
+void Push_u16(M68K* z, const uint16_t value);
+void Push_u32(M68K* z, const uint32_t value);
+uint16_t Pull_u16(M68K* z);
+uint32_t Pull_u32(M68K* z);
+uint16_t ReadOp(M68K* z);
+bool GetC(M68K* z);
+bool GetV(M68K* z);
+bool GetZ(M68K* z);
+bool GetN(M68K* z);
+bool GetX(M68K* z);
+void SetCX(M68K* z, bool val);
+void CalcZN_u8(M68K* z, const uint8_t  val);
+void CalcZN_u8_clear(M68K* z, const uint8_t  val);
+void CalcZN_u16(M68K* z, const uint16_t val);
+void CalcZN_u16_clear(M68K* z, const uint16_t val);
+void CalcZN_u32(M68K* z, const uint32_t val);
+void CalcZN_u32_clear(M68K* z, const uint32_t val);
+uint8_t GetCCR(M68K* z);
+void SetCCR(M68K* z, uint8_t val);
+uint16_t GetSR(M68K* z);
+void SetSR(M68K* z, uint16_t val);
+bool GetSVisor(M68K* z);
+void NO_INLINE Exception(M68K* z, unsigned which, unsigned vecnum);
+void ORI_CCR(M68K* z);
+void ORI_SR(M68K* z);
+void ANDI_CCR(M68K* z);
+void ANDI_SR(M68K* z);
+void EORI_CCR(M68K* z);
+void EORI_SR(M68K* z);
+void Divide_u(M68K* z, uint16_t divisor, const unsigned dr);
+void Divide_s(M68K* z, uint16_t divisor, const unsigned dr);
+uint8_t DecimalSubtractX(M68K* z, const uint8_t src_data, const uint8_t dst_data);
+void MOVEP_w_mem_to_reg(M68K* z, const unsigned ar, const unsigned dr);
+void MOVEP_l_mem_to_reg(M68K* z, const unsigned ar, const unsigned dr);
+void MOVEP_w_reg_to_mem(M68K* z, const unsigned ar, const unsigned dr);
+void MOVEP_l_reg_to_mem(M68K* z, const unsigned ar, const unsigned dr);
+void SWAP(M68K* z, const unsigned dr);
+void EXG(M68K* z, uint32_t* a, uint32_t* b);
+bool TestCond(M68K* z, unsigned cc);
+void Bxx(M68K* z, unsigned cc, uint32_t disp);
+void DBcc(M68K* z, unsigned cc, const unsigned dr);
+void MOVE_USP(M68K* z, bool direction, const unsigned ar);
+void UNLK(M68K* z, const unsigned ar);
+void LINK(M68K* z, const unsigned ar);
+void RTE(M68K* z);
+void RTR(M68K* z);
+void RTS(M68K* z);
+void TRAP(M68K* z, const unsigned vf);
+void TRAPV(M68K* z);
+void ILLEGAL(M68K* z, const uint16_t instr);
+void LINEA(M68K* z);
+void LINEF(M68K* z);
+void NOP(M68K* z);
+void RESET(M68K* z);
+void STOP(M68K* z);
+bool CheckPrivilege(M68K* z);
+
+/* M68K_* free-function API exposed to consumers of m68k.h.
+ *
+ * All declarations live inside an `extern "C" { ... }` block (gated
+ * by __cplusplus so plain C consumers can include this header
+ * directly) -- the matching definitions in m68k.c also use
+ * `extern "C"` linkage.  This makes the wrappers callable from
+ * both C++ and C TUs, with one well-defined ABI symbol per name.
+ *
+ * Trade-off vs the previous `static FORCE_INLINE` header-side
+ * definitions:  we lose call-site inlining of the thunk body
+ * (each wrapper became a real function call to a 1-2 instruction
+ * out-of-line body in m68k.c), but gain a C-callable surface
+ * that sound.c needs.  None of these
+ * wrappers are on the M68K Run inner loop -- they're called
+ * from external orchestration code (IRQ change, savestate,
+ * reset, scheduler step, debugger register read/write) -- so
+ * the per-call function-call overhead is negligible in profile
+ * terms.  Phase-9 step 3's original comment about codegen
+ * folding under -O2 stops applying here; cross-TU inlining is
+ * now LTO-dependent.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void     M68K_Construct          (M68K* z, bool rev_e) MDFN_COLD;
+
+void     M68K_SetIPL             (M68K* z, uint8_t ipl_new);
+void     M68K_SignalDTACKHalted  (M68K* z, uint32_t addr);
+void     M68K_SignalAddressError (M68K* z, uint32_t addr, uint8_t type);
+
+void     M68K_Reset              (M68K* z, bool pwr) MDFN_COLD;
+void     M68K_Run                (M68K* z, int32_t until);
+#ifdef M68K_SPLIT_SWITCH
+void     M68K_RunSplit0          (M68K* z, uint16_t instr, const unsigned instr_b11_b9, const unsigned instr_b2_b0);
+void     M68K_RunSplit1          (M68K* z, uint16_t instr, const unsigned instr_b11_b9, const unsigned instr_b2_b0);
+#endif
+void     M68K_SetExtHalted       (M68K* z, bool state);
+void     M68K_StateAction        (M68K* z, StateMem* sm, const unsigned load,
+                                  const bool data_only, const char* sname);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif

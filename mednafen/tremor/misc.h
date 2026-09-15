@@ -29,7 +29,6 @@
 #  define LOOKUP_T const int32_t
 #endif
 
-#include "asm_arm.h"
 #include <stdlib.h> /* for abs() */
   
 #ifndef _V_WIDE_MATH
@@ -105,13 +104,6 @@ static INLINE int32_t MULT31_SHIFT15(int32_t x, int32_t y) {
 }
 
 #endif
-
-/*
- * This should be used as a memory barrier, forcing all cached values in
- * registers to wr writen back to memory.  Might or might not be beneficial
- * depending on the architecture and compiler.
- */
-#define MB()
 
 /*
  * The XPROD functions are meant to optimize the cross products found all

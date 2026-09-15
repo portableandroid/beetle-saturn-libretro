@@ -22,84 +22,81 @@
 #ifndef __MDFN_SS_VDP1_H
 #define __MDFN_SS_VDP1_H
 
-#include <mednafen/state.h>
+#include <stdint.h>
+#include <boolean.h>
 
+#include <retro_inline.h>
+#include "../mednafen-types.h"
+#include "../state.h"
 
-namespace VDP1
-{
+/* Formerly `namespace VDP1`. Converted to C: the namespace is removed
+   and every exported symbol gets a VDP1_ prefix. sscpu_timestamp_t
+   is defined in the no longer used ss.h as `typedef int32_t
+   sscpu_timestamp_t;` -- mirror that here rather than pulling in
+   ss.h. */
+#ifndef SS_SSCPU_TIMESTAMP_T_DEFINED
+#define SS_SSCPU_TIMESTAMP_T_DEFINED
+typedef int32_t sscpu_timestamp_t;
+#endif
 
-void Init(void) MDFN_COLD;
-void Kill(void) MDFN_COLD;
-void StateAction(StateMem* sm, const unsigned load, const bool data_only) MDFN_COLD;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-void Reset(bool powering_up) MDFN_COLD;
+void VDP1_Init(void) MDFN_COLD;
+void VDP1_Kill(void) MDFN_COLD;
+void VDP1_StateAction(StateMem* sm, const unsigned load, const bool data_only) MDFN_COLD;
 
-sscpu_timestamp_t Update(sscpu_timestamp_t timestamp);
-void AdjustTS(const int32 delta);
+void VDP1_Reset(bool powering_up) MDFN_COLD;
 
-MDFN_FASTCALL void Write_CheckDrawSlowdown(uint32 A, sscpu_timestamp_t time_thing) MDFN_HOT;
-MDFN_FASTCALL void Read_CheckDrawSlowdown(uint32 A, sscpu_timestamp_t time_thing) MDFN_HOT;
-MDFN_FASTCALL void Write8_DB(uint32 A, uint16 DB) MDFN_HOT;
-MDFN_FASTCALL void Write16_DB(uint32 A, uint16 DB) MDFN_HOT;
-MDFN_FASTCALL uint16 Read16_DB(uint32 A) MDFN_HOT;
+sscpu_timestamp_t VDP1_Update(sscpu_timestamp_t timestamp);
+void VDP1_AdjustTS(const int32_t delta);
 
-void SetHBVB(const sscpu_timestamp_t event_timestamp, const bool new_hb_status, const bool new_vb_status);
+MDFN_FASTCALL void VDP1_Write_CheckDrawSlowdown(uint32_t A, sscpu_timestamp_t time_thing) MDFN_HOT;
+MDFN_FASTCALL void VDP1_Read_CheckDrawSlowdown(uint32_t A, sscpu_timestamp_t time_thing) MDFN_HOT;
+MDFN_FASTCALL void VDP1_Write8_DB(uint32_t A, uint16_t DB) MDFN_HOT;
+MDFN_FASTCALL void VDP1_Write16_DB(uint32_t A, uint16_t DB) MDFN_HOT;
+MDFN_FASTCALL uint16_t VDP1_Read16_DB(uint32_t A) MDFN_HOT;
 
-bool GetLine(const int line, uint16* buf, unsigned w, uint32 rot_x, uint32 rot_y, uint32 rot_xinc, uint32 rot_yinc);
+void VDP1_SetHBVB(const sscpu_timestamp_t event_timestamp, const bool new_hb_status, const bool new_vb_status);
 
-//
-//
-//
+bool VDP1_GetLine(const int line, uint16_t* buf, uint16_t* mesh_buf, uint16_t* alt_buf, uint16_t* alt_mesh_buf, bool* alt_valid, unsigned w, uint32_t rot_x, uint32_t rot_y, uint32_t rot_xinc, uint32_t rot_yinc);
 
-INLINE uint8 PeekVRAM(const uint32 addr)
-{
- MDFN_HIDE extern uint16 VRAM[0x40000];
+/* Toggle the "improved mesh transparency" mode for VDP1 mesh-bit
+   primitives (mode bit 8 / MSH). When false (default), mesh
+   primitives use the hardware-accurate (x ^ y) & 1 stipple, which
+   looks like a visible checker pattern on a flat-panel display.
+   When true, mesh primitives instead get routed to a parallel side-
+   buffer (MeshFB) and VDP2's MixIt path blends them 50% over the
+   final composited surface -- a CPU port of Kronos's GL "improved
+   mesh" mechanism (outMeshSurface side-buffer + composite-time
+   blend).
 
- return ne16_rbo_be<uint8>(VRAM, addr & 0x7FFFF);
+   Setter is called from the libretro option-update path on the
+   emulator main thread; the same thread runs SH-2 / VDP1
+   rasterisation, so no synchronisation is needed. */
+void VDP1_SetMeshImproved(bool improved) MDFN_COLD;
+
+/* Enable capture of the complementary VDP1 double-interlace field for
+   progressive output.  This follows VDP2's current output mode and TVMD
+   interlace setting, so it can change while emulation is running. */
+void VDP1_SetAltFieldCapture(bool enabled);
+
+/* "Improved mesh transparency" toggle storage (libretro core
+   option). Defined in vdp1.c; read directly by vdp2_render. */
+MDFN_HIDE extern bool VDP1_MeshImproved;
+
+/*
+**
+**
+*/
+
+MDFN_HIDE extern uint16_t VDP1_VRAM[0x40000];
+MDFN_HIDE extern uint16_t VDP1_FB[2][0x20000];
+MDFN_HIDE extern uint16_t VDP1_AltFB[2][0x20000];
+
+#ifdef __cplusplus
 }
-
-INLINE void PokeVRAM(const uint32 addr, const uint8 val)
-{
- MDFN_HIDE extern uint16 VRAM[0x40000];
-
- ne16_wbo_be<uint8>(VRAM, addr & 0x7FFFF, val);
-}
-
-INLINE uint8 PeekFB(const bool which, const uint32 addr)
-{
- MDFN_HIDE extern uint16 FB[2][0x20000];
-
- return ne16_rbo_be<uint8>(FB[which], addr & 0x3FFFF);
-}
-
-INLINE void PokeFB(const bool which, const uint32 addr, const uint8 val)
-{
- MDFN_HIDE extern uint16 FB[2][0x20000];
-
- ne16_wbo_be<uint8>(FB[which], addr & 0x3FFFF, val);
-}
-
-enum
-{
- GSREG_SYSCLIPX = 0,
- GSREG_SYSCLIPY,
- GSREG_USERCLIPX0,
- GSREG_USERCLIPY0,
- GSREG_USERCLIPX1,
- GSREG_USERCLIPY1,
- GSREG_LOCALX,
- GSREG_LOCALY,
-
- GSREG_TVMR,
- GSREG_FBCR,
- GSREG_EWDR,
- GSREG_EWLR,
- GSREG_EWRR
-};
-uint32 GetRegister(const unsigned id, char* const special, const uint32 special_len) MDFN_COLD;
-void SetRegister(const unsigned id, const uint32 value) MDFN_COLD;
-
-}
-
+#endif
 
 #endif

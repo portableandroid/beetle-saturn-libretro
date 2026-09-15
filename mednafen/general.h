@@ -1,18 +1,12 @@
 #ifndef _GENERAL_H
 #define _GENERAL_H
 
-#include <string>
+#include <stddef.h>
+#include <stdint.h>
 
-extern uint32 MDFN_RoundUpPow2(uint32);
-
-void GetFileBase(const char *f);
-
-// File-inclusion for-read-only path, for PSF and CUE/TOC sheet usage.
-bool MDFN_IsFIROPSafe(const std::string &path);
-
-void MDFN_ltrim(std::string &string);
-void MDFN_rtrim(std::string &string);
-void MDFN_trim(std::string &string);
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef enum
 {
@@ -30,10 +24,29 @@ typedef enum
  MDFNMKF_FIRMWARE
 } MakeFName_Type;
 
-const char *MDFN_MakeFName(MakeFName_Type type, int id1, const char *cd1);
+// Caller-allocated buffer (buf, buflen). Returns buf for chaining.
+// See libretro.c definition for the migration rationale.
+char *MDFN_MakeFName(char *buf, size_t buflen, MakeFName_Type type, int id1, const char *cd1);
 
-const char * GetFNComponent(const char *str);
+// Split file_path into directory / base name / extension. Any of the
+// three output buffers may be NULL to skip that component; out_size
+// applies to whichever buffers are non-NULL.
+void MDFN_GetFilePathComponents(const char *file_path,
+      char *dir_path_out, char *file_base_out,
+      char *file_ext_out, size_t out_size);
 
-void MDFN_GetFilePathComponents(const std::string &file_path, std::string *dir_path_out, std::string *file_base_out = NULL, std::string *file_ext_out = NULL);
-std::string MDFN_EvalFIP(const std::string &dir_path, const std::string &rel_path, bool skip_safety_check = false);
+// Resolve rel_path against dir_path into the caller-supplied buffer.
+// Absolute rel_path values are copied through unchanged.
+void MDFN_EvalFIP(char *out, size_t out_size, const char *dir_path, const char *rel_path);
+
+// Mid-frame synchronisation hook called from inside Emulate() (ss.c).
+// Defined in libretro.c.  The decl is wrapped in the extern "C" guard
+// at the top of this header for any future C++ consumer; the SS-core
+// callers are all C now and consume this through the normal C linkage.
+void MDFN_MidSync(void);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

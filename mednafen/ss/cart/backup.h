@@ -22,6 +22,21 @@
 #ifndef __MDFN_SS_CART_BACKUP_H
 #define __MDFN_SS_CART_BACKUP_H
 
-void CART_Backup_Init(CartInfo* c) MDFN_COLD;
+#include <stdint.h>
+#include <boolean.h>
+
+#include "../../mednafen-types.h"   /* MDFN_COLD */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct CartInfo;
+
+void CART_Backup_Init(struct CartInfo* c) MDFN_COLD;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

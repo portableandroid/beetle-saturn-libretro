@@ -22,6 +22,19 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Initialize the two internal lookup tables (Q coefficient
+ * products and the EDC CRC table).  In the previous C++
+ * implementation these lived in static-const-class-with-ctor
+ * instances that initialized before main; the C version needs an
+ * explicit call.  CDUtility_Init() invokes this for the normal
+ * code path.  Idempotent.
+ */
+void lec_tables_init(void);
+
 /* Encodes a MODE 0 sector.
  * 'adr' is the current physical sector address
  * 'sector' must be 2352 byte wide
@@ -42,13 +55,6 @@ void lec_encode_mode1_sector(uint32_t adr, uint8_t *sector);
  */
 void lec_encode_mode2_sector(uint32_t adr, uint8_t *sector);
 
-/* Encodes a XA form 1 sector.
- * 'adr' is the current physical sector address
- * 'sector' must be 2352 byte wide containing 2048+8 bytes user data at
- * offset 16
- */
-void lec_encode_mode2_form1_sector(uint32_t adr, uint8_t *sector);
-
 /* Encodes a XA form 2 sector.
  * 'adr' is the current physical sector address
  * 'sector' must be 2352 byte wide containing 2324+8 bytes user data at
@@ -56,9 +62,8 @@ void lec_encode_mode2_form1_sector(uint32_t adr, uint8_t *sector);
  */
 void lec_encode_mode2_form2_sector(uint32_t adr, uint8_t *sector);
 
-/* Scrambles and byte swaps an encoded sector.
- * 'sector' must be 2352 byte wide.
- */
-void lec_scramble(int8_t *sector);
+#ifdef __cplusplus
+}
+#endif
 
 #endif

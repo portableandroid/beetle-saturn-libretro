@@ -22,8 +22,19 @@
 #ifndef __MDFN_SS_CDB_H
 #define __MDFN_SS_CDB_H
 
-class CDIF;
+#include "../state.h"
+/* MDFN_COLD / MDFN_HOT.  Existing TUs got these transitively
+ * via ss.h / mednafen.h; for C consumers include them directly. */
+#include "../mednafen-types.h"
 
+#include <stdint.h>
+#include <boolean.h>
+
+#include "../cdrom/cdromif.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 void CDB_Init(void) MDFN_COLD;
 void CDB_Kill(void) MDFN_COLD;
@@ -31,39 +42,24 @@ void CDB_StateAction(StateMem* sm, const unsigned load, const bool data_only) MD
 
 void CDB_SetDisc(bool tray_open, CDIF *cdif) MDFN_COLD;
 
-void CDB_Write_DBM(uint32 offset, uint16 DB, uint16 mask) MDFN_HOT;
-uint16 CDB_Read(uint32 offset) MDFN_HOT;
+void CDB_Write_DBM(uint32_t offset, uint16_t DB, uint16_t mask) MDFN_HOT;
+uint16_t CDB_Read(uint32_t offset) MDFN_HOT;
 
 void CDB_Reset(bool powering_up) MDFN_COLD;
 
-sscpu_timestamp_t CDB_Update(sscpu_timestamp_t timestamp);
+/* int32_t in place of sscpu_timestamp_t (typedef'd to int32_t in
+ * ss.h) -- keeps the header self-contained for C consumers and
+ * matches the C-ABI convention used by vdp1.c / sound.h / smpc.h /
+ * scu.h. */
+int32_t CDB_Update(int32_t timestamp);
 void CDB_ResetTS(void);
 
-void CDB_GetCDDA(uint16* outbuf);	// writes to outbuf[0] and outbuf[1]
+void CDB_GetCDDA(uint16_t* outbuf);	// writes to outbuf[0] and outbuf[1]
 
+void CDB_SetClockRatio(uint32_t ratio);
 
-void CDB_SetClockRatio(uint32 ratio);
-void CDB_ResetCD(void);
-void CDB_SetCDActive(bool active);
-
-enum
-{
- CDB_GSREG_HIRQ = 0,
- CDB_GSREG_HIRQ_MASK,
-
- CDB_GSREG_CDATA0,
- CDB_GSREG_CDATA1,
- CDB_GSREG_CDATA2,
- CDB_GSREG_CDATA3,
-
- CDB_GSREG_RESULT0,
- CDB_GSREG_RESULT1,
- CDB_GSREG_RESULT2,
- CDB_GSREG_RESULT3
-};
-
-uint32 CDB_GetRegister(const unsigned id, char* const special, const uint32 special_len) MDFN_COLD;
-void CDB_SetRegister(const unsigned id, const uint32 value) MDFN_COLD;
-
+#ifdef __cplusplus
+}
+#endif
 
 #endif

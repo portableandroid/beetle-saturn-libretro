@@ -1,6 +1,8 @@
 #ifndef __LIBRETRO_SETTINGS_HDR__
 #define __LIBRETRO_SETTINGS_HDR__
 
+#include <boolean.h>
+
 enum
 {
 	SETTING_GUN_CROSSHAIR_OFF,
@@ -31,5 +33,11 @@ extern bool setting_multitap_port1;
 extern bool setting_multitap_port2;
 extern bool opposite_directions;
 extern bool setting_midsync;
+extern bool setting_mpeg_card;
+extern bool setting_jit_scu;
+extern bool setting_jit_scsp;
+extern bool setting_sh2_jit;
+extern int  setting_sh2_interleave;
+extern int  setting_cpucache_override;   /* -1 = per-game database; else a CPUCACHE_EMUMODE_* value */   /* 0 = exact (per instruction); else cycles the master may run ahead of the slave */
 
 #endif

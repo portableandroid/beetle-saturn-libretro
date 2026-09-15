@@ -1,4 +1,6 @@
-DEBUG = 0
+SILENT := 0
+DEBUG := 0
+LTO := 1
 HAVE_OPENGL = 0
 HAVE_CHD = 1
 HAVE_CDROM = 0
@@ -29,6 +31,12 @@ else ifneq (,$(findstring armv,$(platform)))
    override platform += unix
 endif
 
+ifeq ($(platform), unix)
+   ifeq ($(shell uname -m),loongarch64)
+      arch = loongarch64
+   endif
+endif
+
 ifneq ($(platform), osx)
    ifeq ($(findstring Haiku,$(shell uname -s)),)
       PTHREAD_FLAGS = -pthread
@@ -57,8 +65,16 @@ ifneq ($(GIT_VERSION)," unknown")
    CXXFLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"
 endif
 
+# loongarch
+ifeq ($(arch),loongarch64)
+   libdir := $(libdir)/loongarch64-linux-gnu
+   CXXFLAGS += -D__loongarch64__
+endif
+
 # Unix
 ifneq (,$(findstring unix,$(platform)))
+   # local VFS may mmap FREQUENT_ACCESS files (cdstream/CHD zero-copy)
+   FLAGS += -DHAVE_MMAP
    TARGET := $(TARGET_NAME)_libretro.so
    fpic := -fPIC
    SHARED := -shared -Wl,--no-undefined -Wl,--version-script=link.T
@@ -179,6 +195,8 @@ else ifeq ($(platform), psl1ght)
    AR = $(PS3DEV)/ppu/bin/ppu-ar$(EXE_EXT)
    ENDIANNESS_DEFINES := -DMSB_FIRST
    STATIC_LINKING = 1
+   # frontend + core share one libretro-common; no hybrid there
+   FLAGS += -DSTATIC_LINKING
 
 # PSP
 else ifeq ($(platform), psp1)
@@ -188,6 +206,8 @@ else ifeq ($(platform), psp1)
    AR = psp-ar$(EXE_EXT)
    FLAGS += -DPSP -G0
    STATIC_LINKING = 1
+   # frontend + core share one libretro-common; no hybrid there
+   FLAGS += -DSTATIC_LINKING
    EXTRA_INCLUDES := -I$(shell psp-config --pspsdk-path)/include
 
 # Vita
@@ -198,6 +218,8 @@ else ifeq ($(platform), vita)
    AR = arm-vita-eabi-ar$(EXE_EXT)
    FLAGS += -DVITA
    STATIC_LINKING = 1
+   # frontend + core share one libretro-common; no hybrid there
+   FLAGS += -DSTATIC_LINKING
 
 # Xbox 360
 else ifeq ($(platform), xenon)
@@ -208,6 +230,8 @@ else ifeq ($(platform), xenon)
    ENDIANNESS_DEFINES += -D__LIBXENON__ -m32 -D__ppc__ -DMSB_FIRST 
    LIBS := $(PTHREAD_FLAGS)
    STATIC_LINKING = 1
+   # frontend + core share one libretro-common; no hybrid there
+   FLAGS += -DSTATIC_LINKING
 
 # Nintendo Game Cube / Nintendo Wii
 else ifneq (,$(filter $(platform),ngc wii))
@@ -224,6 +248,8 @@ else ifneq (,$(filter $(platform),ngc wii))
    AR = $(DEVKITPPC)/bin/powerpc-eabi-ar$(EXE_EXT)
    EXTRA_INCLUDES := -I$(DEVKITPRO)/libogc/include
    STATIC_LINKING = 1
+   # frontend + core share one libretro-common; no hybrid there
+   FLAGS += -DSTATIC_LINKING
 
 # GCW0
 else ifeq ($(platform), gcw0)
@@ -238,70 +264,16 @@ else ifeq ($(platform), gcw0)
    FLAGS += -ffast-math -march=mips32 -mtune=mips32r2 -mhard-float
    GLES = 1
    GL_LIB := -lGLESv2
-   
+
 # Emscripten
 else ifeq ($(platform), emscripten)
    TARGET := $(TARGET_NAME)_libretro_$(platform).bc
+   FLAGS += -pthread -msimd128 -ftree-vectorize
+   SYSTEM_ZLIB = 1
+   M68K_SPLIT_SWITCH = 1
    STATIC_LINKING = 1
-   FLAGS += $(PTHREAD_FLAGS) -Dretro_fopen=gg_retro_fopen\
-                 -Dmain=gg_main\
-                 -Dretro_fclose=gg_retro_fclose\
-                 -Dretro_fseek=gg_retro_fseek\
-                 -Dretro_fread=gg_retro_fread\
-                 -Dretro_fwrite=gg_retro_fwrite\
-                 -Dscond_broadcast=gg_scond_broadcast\
-                 -Dscond_wait_timeout=gg_scond_wait_timeout\
-                 -Dscond_signal=gg_scond_signal\
-                 -Dscond_wait=gg_scond_wait\
-                 -Dscond_free=gg_scond_free\
-                 -Dscond_new=gg_scond_new\
-                 -Dslock_unlock=gg_slock_unlock\
-                 -Dslock_lock=gg_slock_lock\
-                 -Dslock_free=gg_slock_free\
-                 -Dslock_new=gg_slock_new\
-                 -Dsthread_join=gg_sthread_join\
-                 -Dsthread_detach=gg_sthread_detach\
-                 -Dsthread_create=gg_sthread_create\
-                 -Dscond=gg_scond\
-                 -Dslock=gg_slock\
-                 -Drglgen_symbol_map=mupen_rglgen_symbol_map \
-		 -Dmain_exit=mupen_main_exit \
-		 -Dadler32=mupen_adler32 \
-		 -Drglgen_resolve_symbols_custom=mupen_rglgen_resolve_symbols_custom \
-		 -Drglgen_resolve_symbols=mupen_rglgen_resolve_symbols \
-		 -Dsinc_resampler=mupen_sinc_resampler \
-		 -Dnearest_resampler=mupen_nearest_resampler \
-		 -DCC_resampler=mupen_CC_resampler \
-		 -Daudio_resampler_driver_find_handle=mupen_audio_resampler_driver_find_handle \
-		 -Daudio_resampler_driver_find_ident=mupen_audio_resampler_driver_find_ident \
-		 -Drarch_resampler_realloc=mupen_rarch_resampler_realloc \
-		 -Daudio_convert_s16_to_float_C=mupen_audio_convert_s16_to_float_C \
-		 -Daudio_convert_float_to_s16_C=mupen_audio_convert_float_to_s16_C \
-		 -Daudio_convert_init_simd=mupen_audio_convert_init_simd \
-                 -Dfilestream_open=gg_filestream_open\
-                 -Dfilestream_get_fd=gg_filestream_get_fd\
-                 -Dfilestream_read=gg_filestream_read\
-                 -Dfilestream_seek=gg_filestream_seek\
-                 -Dfilestream_close=gg_filestream_close\
-                 -Dfilestream_tell=gg_filestream_tell\
-                 -Dfilestream_read_file=gg_filestream_read_file\
-                 -Dfilestream_write_file=gg_filestream_write_file\
-                 -Dfilestream_write=gg_filestream_write\
-                 -Dfilestream_rewind=gg_filestream_rewind\
-                 -Dfilestream_putc=gg_filestream_putc\
-                 -Dstring_is_empty=gg_string_is_empty\
-                 -Dstring_is_equal=gg_string_is_equal\
-                 -Dstring_to_upper=gg_string_to_upper\
-                 -Dstring_to_lower=gg_string_to_lower\
-                 -Dstring_ucwords=gg_string_ucwords\
-                 -Dstring_replace_substring=gg_string_replace_substring\
-                 -Dstring_trim_whitespace_left=gg_string_trim_whitespace_left\
-                 -Dstring_trim_whitespace_right=gg_string_trim_whitespace_right\
-                 -Dstring_trim_whitespace_left=gg_string_trim_whitespace_left\
-                 -Dstring_trim_whitespace=gg_string_trim_whitespace\
-                 -Dsthread_isself=gg_sthread_isself\
-                 -Dstring_is_equal_noncase=gg_string_is_equal_noncase\
-                 -Dmkdir_norecurse=gg_mkdir_norecurse
+   # frontend + core share one libretro-common; no hybrid there
+   FLAGS += -DSTATIC_LINKING
 
 ifeq ($(HAVE_OPENGL),1)
 	ifneq (,$(findstring gles,$(platform)))
@@ -421,8 +393,8 @@ else
    ifeq ($(HAVE_OPENGL),1)
       GL_LIB := -lopengl32
    endif
-	HAVE_CDROM = 1
-
+   HAVE_CDROM = 1
+   LTO = 0
 endif
 
 include Makefile.common
@@ -432,36 +404,89 @@ WARNINGS := -Wall \
    -Wno-unused-variable \
    -Wno-unused-function \
    -Wno-uninitialized \
-   $(NEW_GCC_WARNING_FLAGS) \
    -Wno-strict-aliasing
-
-#EXTRA_GCC_FLAGS := -funroll-loops
 
 ifeq ($(NO_GCC),1)
    WARNINGS :=
 endif
 
 OBJECTS := $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o)
+DEPS    := $(OBJECTS:.o=.d)
 
 all: $(TARGET)
 
 ifeq ($(DEBUG),0)
-   FLAGS += -O2 $(EXTRA_GCC_FLAGS)
+   # -DNDEBUG: compile out all assert() calls.  The Makefile previously
+   # shipped release builds without it, which left ~85 assertions live in
+   # the binary -- each one a runtime compare + conditional jump to an
+   # abort path with format-string call setup.  None of the assert
+   # expressions in this codebase have side effects (audited; the only
+   # function call inside any assert is GetSR() in m68k.c, which is a
+   # pure read of CCR | SRHB), so dropping them at NDEBUG is safe.
+   # Saves a measurable per-file footprint: -61 KiB on vdp2_render.c
+   # alone (asserts in the inner render loops compiled to substantial
+   # dead code under -O2), -2.7 KiB on cdb.c (17 CDB state-machine
+   # invariants), -2.9 KiB on ss.c, and small wins across the rest.
+   FLAGS += -O2 -DNDEBUG
 else
    FLAGS += -O0 -g
 endif
 
-LDFLAGS += $(fpic) $(SHARED)
-FLAGS += $(fpic) $(NEW_GCC_FLAGS)
-FLAGS += $(INCFLAGS)
+ifeq ($(LTO),1)
+   # -flto=auto and -fipa-pta are GCC-only spellings. clang (used on all
+   # Apple targets, and on some Linux/BSD setups) rejects -fipa-pta as
+   # an unknown argument, and older clangs (including Apple clang from
+   # Xcode <= 12) reject -flto=auto with "unsupported argument 'auto'".
+   # Clang from LLVM 13+ ignores -flto=auto as a GCC compat alias, but
+   # we have to support the older Apple SDKs the iOS CI runners ship.
+   # Use plain -flto on clang (full LTO, same effective behavior as
+   # -flto=auto on newer clangs), and the full GCC spelling otherwise.
+   CC_IS_CLANG := $(shell $(firstword $(CC)) --version 2>/dev/null | grep -ic clang)
+   ifeq ($(CC_IS_CLANG),0)
+      FLAGS   += -flto=auto -fipa-pta
+      LDFLAGS += -flto=auto -fipa-pta -O2
+   else
+      FLAGS   += -flto
+      LDFLAGS += -flto -O2
+   endif
+endif
 
-FLAGS += $(ENDIANNESS_DEFINES) $(WARNINGS) $(CORE_DEFINE) -DSTDC_HEADERS -D__STDC_LIMIT_MACROS -D__LIBRETRO__ -D_LOW_ACCURACY_ $(EXTRA_INCLUDES) $(SOUND_DEFINE) -D__STDC_CONSTANT_MACROS
+LDFLAGS += $(fpic) $(SHARED)
+
+FLAGS += $(fpic) $(INCFLAGS) $(ENDIANNESS_DEFINES) $(WARNINGS) $(CORE_DEFINE) -DSTDC_HEADERS -D__STDC_LIMIT_MACROS -D__LIBRETRO__ -D_LOW_ACCURACY_ $(EXTRA_INCLUDES) $(SOUND_DEFINE) -D__STDC_CONSTANT_MACROS
+
+# The codebase type-puns hardware memory through a handful of raw
+# (uint16_t*) casts (SH-2 instruction prefetch, cart ROM read paths).
+# WARNINGS already carries -Wno-strict-aliasing, but that only hides
+# the diagnostic - at -O2 the optimizer still does type-based alias
+# analysis unless -fno-strict-aliasing is also set.  Pair the two so
+# the optimizer assumption matches the silenced warning.
+FLAGS += -fno-strict-aliasing
 
 CXXFLAGS += $(FLAGS)
 CFLAGS   += $(FLAGS)
 
 ifeq (,$(findstring msvc,$(platform)))
     CXXFLAGS += -std=c++11
+    CFLAGS   += -MMD -MP
+    CXXFLAGS += -MMD -MP
+endif
+
+# DSP JIT (SCU + SCSP MPROG): on by default.  Source-level guards keep
+# it a no-op on non-aarch64 builds, and the beetle_saturn_jit_scu /
+# beetle_saturn_jit_scsp libretro options gate dispatch at runtime.
+# Pass WANT_JIT=0 to drop it at compile time.
+WANT_JIT ?= 1
+ifeq ($(WANT_JIT), 1)
+    CFLAGS   += -DWANT_JIT
+    CXXFLAGS += -DWANT_JIT
+endif
+# DSP JIT perf jitdump emitter: writes /tmp/jit-<pid>.dump so `perf
+# inject --jit` can resolve [JIT] samples to per-slot symbols.
+# Diagnostic only, and the dump grows unbounded over long runs.
+# Requires WANT_JIT=1.
+ifeq ($(WANT_DSP_JIT_PERF_DUMP), 1)
+    CFLAGS += -DWANT_DSP_JIT_PERF_DUMP
 endif
 
 OBJOUT   = -o
@@ -483,13 +508,19 @@ else
 endif
 
 %.o: %.cpp
+	@if [ $(SILENT) -ne 1 ]; then\
+		$(if $@, $(shell echo echo CXX $<),);\
+	fi
 	$(CXX) -c $(OBJOUT)$@ $< $(CXXFLAGS)
 
 %.o: %.c
+	@if [ $(SILENT) -ne 1 ]; then\
+		$(if $@, $(shell echo echo CC $<),);\
+	fi
 	$(CC) -c $(OBJOUT)$@ $< $(CFLAGS)
 
 clean:
-	rm -f $(TARGET) $(OBJECTS)
+	rm -f $(TARGET) $(OBJECTS) $(DEPS)
 
 install:
 	install -D -m 755 $(TARGET) $(DESTDIR)$(libdir)/$(LIBRETRO_INSTALL_DIR)/$(TARGET)
@@ -498,3 +529,5 @@ uninstall:
 	rm $(DESTDIR)$(libdir)/$(LIBRETRO_INSTALL_DIR)/$(TARGET)
 
 .PHONY: clean install uninstall
+
+-include $(DEPS)

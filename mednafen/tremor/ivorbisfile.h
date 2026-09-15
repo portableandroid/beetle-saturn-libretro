@@ -51,7 +51,6 @@ typedef struct {
 
 typedef struct OggVorbis_File {
   void            *datasource; /* Pointer to a FILE *, etc. */
-  int              seekable;
   int64_t      offset;
   int64_t      end;
   ogg_sync_state   oy;
@@ -89,7 +88,6 @@ extern int ov_open_callbacks(void *datasource, OggVorbis_File *vf,
 		const char *initial, long ibytes, ov_callbacks callbacks);
 
 extern int64_t ov_pcm_total(OggVorbis_File *vf,int i);
-extern int64_t ov_time_total(OggVorbis_File *vf,int i);
 
 extern int ov_raw_seek(OggVorbis_File *vf,int64_t pos);
 extern int ov_pcm_seek(OggVorbis_File *vf,int64_t pos);

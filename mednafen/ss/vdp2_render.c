@@ -1,0 +1,5663 @@
+/******************************************************************************/
+/* Mednafen Sega Saturn Emulation Module                                      */
+/******************************************************************************/
+/* vdp2_render.c - VDP2 Rendering
+**  Copyright (C) 2016-2019 Mednafen Team
+**
+** This program is free software; you can redistribute it and/or
+** modify it under the terms of the GNU General Public License
+** as published by the Free Software Foundation; either version 2
+** of the License, or (at your option) any later version.
+**
+** This program is distributed in the hope that it will be useful,
+** but WITHOUT ANY WARRANTY; without even the implied warranty of
+** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+** GNU General Public License for more details.
+**
+** You should have received a copy of the GNU General Public License
+** along with this program; if not, write to the Free Software Foundation, Inc.,
+** 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+*/
+
+// TODO: 31KHz monitor mode.
+// When implementing GetRegister(), remember RPRCTL and window x start and end registers can
+//  change outside of direct register writes
+// Ignore T4-T7 in hires and 31KHz monitor mode.
+
+#include "ss.h"
+#include "ss_memory.h"
+#include "../emuspec.h"
+#include "../mdfn_gameinfo.h"
+#include "vdp2_common.h"
+#include "vdp2_render.h"
+#include "mpeg.h"
+
+#include <retro_timers.h>
+#include <rthreads/rthreads.h>
+#include <string.h>
+#include <stdatomic.h>
+#if defined(_WIN32)
+ #include <windows.h>
+#else
+ #include <unistd.h>
+#endif
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+ #include <emmintrin.h>
+#endif
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+typedef _Atomic uint_least32_t vdp2_atomic_u32;
+#define VDP2_ATOMIC_INIT(a, v)        atomic_store_explicit(&(a), (v), memory_order_relaxed)
+#define VDP2_ATOMIC_LOAD_ACQ(a)       atomic_load_explicit(&(a), memory_order_acquire)
+#define VDP2_ATOMIC_STORE_REL(a, v)   atomic_store_explicit(&(a), (v), memory_order_release)
+
+/* Improved-mesh-transparency runtime flag, owned by VDP1. Read on
+ * MixIt's per-pixel hot path to gate the winprio-capture store, and
+ * in DrawLine to gate the mesh-overlay call -- forward-declared here
+ * to avoid pulling vdp1_common.h (a VDP1-private header) into the
+ * VDP2 translation unit. Set on the emulator main thread; flips only
+ * in response to the libretro option-update path, so a relaxed load
+ * is sufficient.  VDP1 is C; plain extern, default C linkage. */
+MDFN_HIDE extern bool VDP1_MeshImproved;
+
+//uint8_t vdp2rend_prepad_bss
+
+static struct EmulateSpecStruct* espec = NULL;
+static bool PAL;
+static bool CorrectAspect;
+static bool ShowHOverscan;
+bool DoHBlend; // LibRetro: non-static for accessibility
+static int LineVisFirst, LineVisLast;
+static uint32_t NextOutLine;
+static bool Clock28M;
+static unsigned VisibleLines;
+static struct VDP2Rend_LIB LIB[256];
+static uint16_t VRAM[262144];
+static uint16_t CRAM[2048];
+
+static uint8_t HRes, VRes;
+static bool BorderMode;
+static uint8_t InterlaceMode;
+enum { IM_NONE, IM_ILLEGAL, IM_SINGLE, IM_DOUBLE };
+
+static bool CRKTE;
+static uint8_t CRAM_Mode;
+enum
+{
+ CRAM_MODE_RGB555_1024	= 0,
+ CRAM_MODE_RGB555_2048	= 1,
+ CRAM_MODE_RGB888_1024	= 2,
+ CRAM_MODE_ILLEGAL	= 3
+};
+static uint8_t VRAM_Mode;
+static uint8_t RDBS_Mode;
+
+static uint8_t VCPRegs[4][8];
+static const uint16_t DummyTileNT[8 * 8 * 4 / sizeof(uint16_t)] = { 0 };
+
+/* Renderer-side deinterlace output mode.
+ *
+ * OFF keeps the older mirror behaviour: draw the current field and copy
+ * it to the opposite row.  PROGRESSIVE renders both fields into one full-height output frame:
+ * for each interlaced source line, draw field 0 to the even output row
+ * and field 1 to the odd output row.  The small line-state snapshots below
+ * are Beetle-specific bookkeeping so the existing DrawLine() logic can
+ * be reused without porting Ymir/Kronos renderer code. */
+static unsigned ProducerDeinterlaceMode = VDP2_DEINT_NORMAL;
+static unsigned ConsumerDeinterlaceMode = VDP2_DEINT_NORMAL;
+
+typedef struct
+{
+ uint32_t VCLast[2];
+ uint32_t YCoordAccum[2];
+ uint32_t CurXScrollIF[2];
+ uint32_t CurYScrollIF[2];
+ uint32_t CurLSA[2];
+ uint32_t CurBackTabAddr;
+ uint32_t CurLCTabAddr;
+ uint16_t CurXCoordInc[2];
+ uint16_t NBG23_YCounter[2];
+ uint16_t CurBackColor;
+ uint16_t CurLCColor;
+ uint32_t WindowCurLineWinAddr[2];
+ uint8_t MosaicVCount;
+} VDP2LineState;
+
+static VDP2LineState ProgressiveLineState[2];
+static bool ProgressiveLineStateValid[2];
+
+static uint16_t BGON;
+static uint16_t MZCTL;
+static uint8_t MosaicVCount;
+
+static uint8_t SFSEL;
+static uint16_t SFCODE;
+
+static uint16_t CHCTLA;
+static uint16_t CHCTLB;
+
+// External background enable (EXTEN bit 0).  The external image
+// replaces NBG1's data source; everything downstream -- priority,
+// window, mosaic, colour calculation -- is NBG1's.  Only the Video CD
+// Card drives this input on a retail Saturn.
+static bool ExBGEnable;
+
+static uint16_t BMPNA;
+static uint8_t BMPNB;
+
+static uint16_t PNCN[4];
+static uint16_t PNCNR;
+
+static uint16_t PLSZ;
+static uint16_t MPOFN;
+static uint16_t MPOFR;
+
+static uint8_t MapRegs[4][4];
+static uint8_t RotMapRegs[2][16];
+//
+static uint16_t XScrollI[4], YScrollI[4];
+static uint8_t XScrollF[2], YScrollF[2];
+
+static uint16_t ZMCTL;
+static uint16_t SCRCTL;
+static uint32_t LineScrollAddr[2];
+static uint32_t VCScrollAddr;
+static uint32_t VCLast[2];
+
+static uint16_t XCoordInc[2], YCoordInc[2];
+static uint32_t YCoordAccum[2];
+static uint32_t MosEff_YCoordAccum[2];
+
+static uint32_t CurXScrollIF[2];
+static uint32_t CurYScrollIF[2];
+static uint16_t CurXCoordInc[2];
+static uint32_t CurLSA[2];
+
+static uint16_t NBG23_YCounter[2];
+static uint16_t MosEff_NBG23_YCounter[2];
+//
+static uint8_t RPMD;
+static uint8_t KTCTL[2];
+static uint16_t OVPNR[2];
+//
+static uint32_t BKTA;
+static uint32_t CurBackTabAddr;
+static uint16_t CurBackColor;
+
+static uint32_t LCTA;
+static uint32_t CurLCTabAddr;
+static uint16_t CurLCColor;
+
+static uint8_t LineColorEn;
+
+static uint16_t SFPRMD;
+static uint16_t CCCTL;
+static uint16_t SFCCMD;
+//
+static uint8_t NBGPrioNum[4];
+static uint8_t RBG0PrioNum;
+
+static uint8_t NBGCCRatio[4];
+static uint8_t RBG0CCRatio;
+static uint8_t LineColorCCRatio;
+static uint8_t BackCCRatio;
+
+//
+static struct
+{
+ uint16_t XStart, XEnd;
+ uint32_t LineWinAddr;
+ bool LineWinEn;
+ //
+ bool YMet;
+ uint16_t CurXStart, CurXEnd;
+ uint32_t CurLineWinAddr;
+} Window[2];
+
+static uint8_t WinControl[8];
+enum
+{
+ WINLAYER_NBG0 = 0,
+ WINLAYER_NBG1 = 1,
+ WINLAYER_NBG2 = 2,
+ WINLAYER_NBG3 = 3,
+ WINLAYER_RBG0 = 4,
+ WINLAYER_SPRITE = 5,
+ WINLAYER_ROTPARAM = 6,
+ WINLAYER_CC = 7,
+};
+
+static unsigned WinPieces[5];
+//
+static uint8_t SpriteCCCond;
+static uint8_t SpriteCCNum;
+static uint8_t SPCTL_Low;
+
+static uint16_t SDCTL;
+
+static uint8_t SpritePrioNum[8];
+static uint8_t SpriteCCRatio[8];
+
+static uint8_t SpriteCCLUT[8];	// Temp optimization data
+static uint8_t SpriteCC3Mask; 	// Temp optimization data
+
+//
+static uint8_t CRAMAddrOffs_NBG[4];
+static uint8_t CRAMAddrOffs_RBG0;
+static uint8_t CRAMAddrOffs_Sprite;
+//
+static uint8_t ColorOffsEn;
+static uint8_t ColorOffsSel;
+
+//enum
+//{
+// COLOFFS_ENSEL_NBG0 = 0,
+// COLOFFS_ENSEL_NBG1 = 0,
+//};
+
+static int32_t ColorOffs[2][3];	// [A,B] [R << 0, G << 8, B << 16]
+
+/* Field declarations split into a head block (before adj_map_regs)
+ * and a tail block (after), so the two named structs can differ
+ * only in the array dimension and share everything else. */
+#define TILEFETCHER_FIELDS_PREARR \
+ unsigned        CRAOffs; \
+ bool            BMSCC; \
+ bool            BMSPR; \
+ unsigned        BMPalNo; \
+ unsigned        BMSize; \
+ unsigned        PlaneSize; \
+ unsigned        PlaneOver; \
+ uint16_t        PlaneOverChar; \
+ bool            PNDSize; \
+ bool            CharSize; \
+ bool            AuxMode; \
+ unsigned        Supp; \
+ unsigned        BMOffset; \
+ unsigned        BMWShift; \
+ unsigned        BMWMask; \
+ unsigned        BMHMask
+
+#define TILEFETCHER_FIELDS_POSTARR \
+ uint32_t        doxm; \
+ uint32_t        doym; \
+ bool            nt_ok[4]; \
+ bool            cg_ok[4]; \
+ uint32_t        pcco; \
+ bool            spr; \
+ bool            scc; \
+ const uint16_t* tile_vrb; \
+ uint32_t        cellx_xor
+
+struct TileFetcher_Rot
+{
+ TILEFETCHER_FIELDS_PREARR;
+ uint32_t adj_map_regs[16];
+ TILEFETCHER_FIELDS_POSTARR;
+};
+
+struct TileFetcher_NonRot
+{
+ TILEFETCHER_FIELDS_PREARR;
+ uint32_t adj_map_regs[4];
+ TILEFETCHER_FIELDS_POSTARR;
+};
+
+/* Field-redirect block: bare field-name tokens (`pcco`, `BMOffset`,
+ * ..., 22 names) are aliased to `(self->NAME)` so the body macros
+ * below can keep the original method-source-style field-access
+ * syntax.  The bracket pairs are tight; outside this region the
+ * function-table BODY macros use `tf.NAME` syntax, which doesn't
+ * trigger these aliases. */
+#define CRAOffs         (self->CRAOffs)
+#define BMSCC           (self->BMSCC)
+#define BMSPR           (self->BMSPR)
+#define BMPalNo         (self->BMPalNo)
+#define BMSize          (self->BMSize)
+#define PlaneSize       (self->PlaneSize)
+#define PlaneOver       (self->PlaneOver)
+#define PlaneOverChar   (self->PlaneOverChar)
+#define PNDSize         (self->PNDSize)
+#define CharSize        (self->CharSize)
+#define AuxMode         (self->AuxMode)
+#define Supp            (self->Supp)
+#define BMOffset        (self->BMOffset)
+#define BMWShift        (self->BMWShift)
+#define BMWMask         (self->BMWMask)
+#define BMHMask         (self->BMHMask)
+#define adj_map_regs    (self->adj_map_regs)
+#define doxm            (self->doxm)
+#define doym            (self->doym)
+#define nt_ok           (self->nt_ok)
+#define cg_ok           (self->cg_ok)
+#define pcco            (self->pcco)
+#define spr             (self->spr)
+#define scc             (self->scc)
+#define tile_vrb        (self->tile_vrb)
+#define cellx_xor       (self->cellx_xor)
+
+/* Shared Start body.  IS_ROT is a 0/1 literal at expansion time;
+ * `if((IS_ROT))` and `((IS_ROT) ? 16 : 4)` fold to constants. */
+#define TILEFETCHER_START_BODY(IS_ROT) \
+ {                                                                                                                      \
+  BMOffset = map_offset << 16;                                                                                          \
+  BMWShift = ((BMSize & 2) ? 10 : 9);                                                                                   \
+  BMWMask = (1U << BMWShift) - 8;                                                                                       \
+  BMHMask = (BMSize & 1) ? 0x1FF : 0xFF;                                                                                \
+                                                                                                                       \
+  const unsigned psshift = (13 - PNDSize - (CharSize << 1));                                                            \
+                                                                                                                       \
+  for(unsigned i = 0; i < ((IS_ROT) ? 16 : 4); i++)                                                                     \
+  {                                                                                                                     \
+   adj_map_regs[i] = ((map_offset << 6) + (map_regs[i] &~ PlaneSize)) << psshift;                                       \
+  }                                                                                                                     \
+                                                                                                                       \
+  if((IS_ROT))                                                                                                          \
+  {                                                                                                                     \
+   if(bmen)                                                                                                             \
+   {                                                                                                                    \
+    doxm = ~(BMWMask + 7);                                                                                              \
+    doym = ~BMHMask;                                                                                                    \
+   }                                                                                                                    \
+   else                                                                                                                 \
+   {                                                                                                                    \
+    doxm = ~((1U << ((9 + (bool)(PlaneSize & 0x1)) + ((IS_ROT) ? 2 : 1))) - 1);                                         \
+    doym = ~((1U << ((9 + (bool)(PlaneSize & 0x2)) + ((IS_ROT) ? 2 : 1))) - 1);                                         \
+   }                                                                                                                    \
+                                                                                                                       \
+   if(PlaneOver == 0)                                                                                                   \
+    doxm = doym = 0;                                                                                                    \
+   else if(PlaneOver == 3)                                                                                              \
+    doxm = doym = ~511;                                                                                                 \
+  }                                                                                                                     \
+                                                                                                                       \
+/* Kludgeyness: */                                                                                                      \
+  for(unsigned bank = 0; bank < 4; bank++)                                                                              \
+  {                                                                                                                     \
+   const unsigned esb = bank & (2 | ((VRAM_Mode >> (bank >> 1)) & 1));                                                  \
+   const uint8_t rdbs = (RDBS_Mode >> (esb << 1)) & 0x3;                                                                \
+                                                                                                                       \
+   if((IS_ROT))                                                                                                         \
+   {                                                                                                                    \
+    if(!(BGON & 0x20) || n == 4)                                                                                        \
+    {                                                                                                                   \
+     nt_ok[bank] = (rdbs == RDBS_NAME) && (bank < 2 || !(BGON & 0x20));                                                 \
+     cg_ok[bank] = (rdbs == RDBS_CHAR) && (bank < 2 || !(BGON & 0x20));                                                 \
+    }                                                                                                                   \
+    else                                                                                                                \
+    {                                                                                                                   \
+     nt_ok[bank] = (bank == 3);                                                                                         \
+     cg_ok[bank] = (bank == 2);                                                                                         \
+    }                                                                                                                   \
+   }                                                                                                                    \
+   else                                                                                                                 \
+   {                                                                                                                    \
+    nt_ok[bank] = false;                                                                                                \
+    cg_ok[bank] = false;                                                                                                \
+                                                                                                                       \
+    if((BGON & 0x20) && (bank & 0x2)) { }                                                                               \
+    else if(!(BGON & 0x10) || rdbs == RDBS_UNUSED)                                                                      \
+    {                                                                                                                   \
+     for(unsigned ac = 0; ac < ((HRes & 0x6) ? 4 : 8); ac++)                                                            \
+     {                                                                                                                  \
+      if(VCPRegs[esb][ac] == (VCP_NBG0_CG + n))                                                                         \
+       cg_ok[bank] = true;                                                                                              \
+                                                                                                                       \
+      if(VCPRegs[esb][ac] == (VCP_NBG0_NT + n))                                                                         \
+       nt_ok[bank] = true;                                                                                              \
+     }                                                                                                                  \
+    }                                                                                                                   \
+   }                                                                                                                    \
+  }                                                                                                                     \
+                                                                                                                       \
+  pcco = 0;                                                                                                             \
+  spr = false;                                                                                                          \
+  scc = false;                                                                                                          \
+  tile_vrb = NULL;                                                                                                      \
+  cellx_xor = 0;                                                                                                        \
+ }
+
+/* Shared Fetch body.  Same as Start but also parameterized on
+ * TA_BPP, a literal 4/8/16/32 at expansion time -- `if(TA_BPP >= 8)`
+ * and similar branches fold per-instantiation. */
+#define TILEFETCHER_FETCH_BODY(IS_ROT, TA_BPP) \
+ {                                                                                                                      \
+  size_t cg_addr;                                                                                                       \
+  uint32_t palno;                                                                                                       \
+  bool is_outside = false;                                                                                              \
+                                                                                                                       \
+  if((IS_ROT))                                                                                                          \
+   is_outside = (ix & doxm) | (iy & doym);                                                                              \
+                                                                                                                       \
+  if(bmen)                                                                                                              \
+  {                                                                                                                     \
+   palno = BMPalNo;                                                                                                     \
+   spr = BMSPR;                                                                                                         \
+   scc = BMSCC;                                                                                                         \
+   cellx_xor = (ix &~ 0x7);                                                                                             \
+   cg_addr = (BMOffset + ((((ix & BMWMask) + ((iy & BMHMask) << BMWShift)) * (TA_BPP)) >> 4)) & 0x3FFFF;                \
+  }                                                                                                                     \
+  else                                                                                                                  \
+  {                                                                                                                     \
+   bool vflip, hflip;                                                                                                   \
+   uint16_t charno;                                                                                                     \
+   uint32_t mapidx, planeidx, planeoffs, pageoffs;                                                                      \
+   const uint16_t* pnd;                                                                                                 \
+   uint32_t celly;                                                                                                      \
+   size_t nt_addr;                                                                                                      \
+                                                                                                                       \
+   if((IS_ROT))                                                                                                         \
+    mapidx = ((ix >> (9 + (bool)(PlaneSize & 0x1))) & 0x3) | ((iy >> (9 + (bool)(PlaneSize & 0x2) - 2)) & 0xC);         \
+   else                                                                                                                 \
+    mapidx = ((ix >> (9 + (bool)(PlaneSize & 0x1))) & 0x1) | ((iy >> (9 + (bool)(PlaneSize & 0x2) - 1)) & 0x2);         \
+                                                                                                                       \
+   planeidx = ((ix >> 9) & PlaneSize & 0x1) | ((iy >> (9 - 1)) & PlaneSize & 0x2);                                      \
+   planeoffs = planeidx << (13 - PNDSize - (CharSize << 1));                                                            \
+   pageoffs = ((((ix >> 3) & 0x3F) >> CharSize) + ((((iy >> 3) & 0x3F) >> CharSize) << (6 - CharSize))) << (1 - PNDSize);\
+   nt_addr = (adj_map_regs[mapidx] + planeoffs + pageoffs) & 0x3FFFF;                                                   \
+                                                                                                                       \
+   pnd = &VRAM[nt_addr];                                                                                                \
+   if(!nt_ok[nt_addr >> 16])                                                                                            \
+    pnd = DummyTileNT;                                                                                                  \
+                                                                                                                       \
+   if((IS_ROT) && is_outside && PlaneOver == 1)                                                                         \
+   {                                                                                                                    \
+    pnd = &PlaneOverChar;                                                                                               \
+    goto OverCharCase;                                                                                                  \
+   }                                                                                                                    \
+                                                                                                                       \
+   if(!PNDSize)                                                                                                         \
+   {                                                                                                                    \
+    uint16_t tmp = pnd[0];                                                                                              \
+                                                                                                                       \
+    palno = tmp & 0x7F;                                                                                                 \
+    vflip = (bool)(tmp & 0x8000);                                                                                       \
+    hflip = (bool)(tmp & 0x4000);                                                                                       \
+    spr = (bool)(tmp & 0x2000);                                                                                         \
+    scc = (bool)(tmp & 0x1000);                                                                                         \
+    charno = pnd[1] & 0x7FFF;                                                                                           \
+   }                                                                                                                    \
+   else                                                                                                                 \
+   {                                                                                                                    \
+    OverCharCase:;                                                                                                      \
+    uint16_t tmp = pnd[0];                                                                                              \
+                                                                                                                       \
+    if((TA_BPP) >= 8)                                                                                                   \
+     palno = ((tmp >> 12) & 0x7) << 4;                                                                                  \
+    else                                                                                                                \
+     palno = ((tmp >> 12) & 0xF) | (((Supp >> 5) & 0x7) << 4);                                                          \
+    spr = (bool)(Supp & 0x200);                                                                                         \
+    scc = (bool)(Supp & 0x100);                                                                                         \
+                                                                                                                       \
+    if(!AuxMode)                                                                                                        \
+    {                                                                                                                   \
+     vflip = (bool)(tmp & 0x800);                                                                                       \
+     hflip = (bool)(tmp & 0x400);                                                                                       \
+                                                                                                                       \
+     if(CharSize)                                                                                                       \
+      charno = ((tmp & 0x3FF) << 2) + ((Supp & 0x1C) << 10) + (Supp & 0x3);                                             \
+     else                                                                                                               \
+      charno = (tmp & 0x3FF) + ((Supp & 0x1F) << 10);                                                                   \
+    }                                                                                                                   \
+    else                                                                                                                \
+    {                                                                                                                   \
+     hflip = vflip = false;                                                                                             \
+                                                                                                                       \
+     if(CharSize)                                                                                                       \
+      charno = ((tmp & 0xFFF) << 2) + ((Supp & 0x10) << 10) + (Supp & 0x3);                                             \
+     else                                                                                                               \
+      charno = (tmp & 0xFFF) + ((Supp & 0x1C) << 10);                                                                   \
+    }                                                                                                                   \
+   }                                                                                                                    \
+                                                                                                                       \
+   if(CharSize)                                                                                                         \
+   {                                                                                                                    \
+    uint32_t cidx = (((ix >> 3) ^ hflip) & 0x1) + (((iy >> 2) ^ (vflip << 1)) & 0x2);                                   \
+    charno = (charno + cidx * ((TA_BPP) >> 2)) & 0x7FFF;                                                                \
+   }                                                                                                                    \
+                                                                                                                       \
+   cellx_xor = (ix &~ 0x7) | (hflip ? 0x7 : 0x0);                                                                       \
+   celly = (iy & 0x7) ^ (vflip ? 0x7 : 0);                                                                              \
+   cg_addr = ((charno << 4) + ((celly * (TA_BPP)) >> 1)) & 0x3FFFF;                                                     \
+  }                                                                                                                     \
+  tile_vrb = &VRAM[cg_addr];                                                                                            \
+                                                                                                                       \
+  if(!cg_ok[cg_addr >> 16])                                                                                             \
+   tile_vrb = DummyTileNT;                                                                                              \
+                                                                                                                       \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+  pcco = ((palno << 4) &~ ((1U << ((TA_BPP) & 0x1F)) - 1)) + CRAOffs;                                                   \
+                                                                                                                       \
+  return (IS_ROT) && is_outside && (PlaneOver & 2);                                                                     \
+ }
+
+static INLINE void TileFetcher_Rot_Start(struct TileFetcher_Rot* self, const unsigned n, const bool bmen, const unsigned map_offset, const uint8_t* map_regs)
+ TILEFETCHER_START_BODY(1)
+
+static INLINE void TileFetcher_NonRot_Start(struct TileFetcher_NonRot* self, const unsigned n, const bool bmen, const unsigned map_offset, const uint8_t* map_regs)
+ TILEFETCHER_START_BODY(0)
+
+static MDFN_FORCE_INLINE bool TileFetcher_Rot_Fetch_4(struct TileFetcher_Rot* self, const bool bmen, const uint32_t ix, const uint32_t iy)
+ TILEFETCHER_FETCH_BODY(1, 4)
+
+static MDFN_FORCE_INLINE bool TileFetcher_Rot_Fetch_8(struct TileFetcher_Rot* self, const bool bmen, const uint32_t ix, const uint32_t iy)
+ TILEFETCHER_FETCH_BODY(1, 8)
+
+static MDFN_FORCE_INLINE bool TileFetcher_Rot_Fetch_16(struct TileFetcher_Rot* self, const bool bmen, const uint32_t ix, const uint32_t iy)
+ TILEFETCHER_FETCH_BODY(1, 16)
+
+static MDFN_FORCE_INLINE bool TileFetcher_Rot_Fetch_32(struct TileFetcher_Rot* self, const bool bmen, const uint32_t ix, const uint32_t iy)
+ TILEFETCHER_FETCH_BODY(1, 32)
+
+static MDFN_FORCE_INLINE bool TileFetcher_NonRot_Fetch_4(struct TileFetcher_NonRot* self, const bool bmen, const uint32_t ix, const uint32_t iy)
+ TILEFETCHER_FETCH_BODY(0, 4)
+
+static MDFN_FORCE_INLINE bool TileFetcher_NonRot_Fetch_8(struct TileFetcher_NonRot* self, const bool bmen, const uint32_t ix, const uint32_t iy)
+ TILEFETCHER_FETCH_BODY(0, 8)
+
+static MDFN_FORCE_INLINE bool TileFetcher_NonRot_Fetch_16(struct TileFetcher_NonRot* self, const bool bmen, const uint32_t ix, const uint32_t iy)
+ TILEFETCHER_FETCH_BODY(0, 16)
+
+static MDFN_FORCE_INLINE bool TileFetcher_NonRot_Fetch_32(struct TileFetcher_NonRot* self, const bool bmen, const uint32_t ix, const uint32_t iy)
+ TILEFETCHER_FETCH_BODY(0, 32)
+
+/* Drop the field-redirect aliases so subsequent code (the function-
+ * table BODY macros that follow) can use plain `tf.NAME` field
+ * access without the alias mangling the dot-expression. */
+#undef CRAOffs
+#undef BMSCC
+#undef BMSPR
+#undef BMPalNo
+#undef BMSize
+#undef PlaneSize
+#undef PlaneOver
+#undef PlaneOverChar
+#undef PNDSize
+#undef CharSize
+#undef AuxMode
+#undef Supp
+#undef BMOffset
+#undef BMWShift
+#undef BMWMask
+#undef BMHMask
+#undef adj_map_regs
+#undef doxm
+#undef doym
+#undef nt_ok
+#undef cg_ok
+#undef pcco
+#undef spr
+#undef scc
+#undef tile_vrb
+#undef cellx_xor
+
+#undef TILEFETCHER_FETCH_BODY
+#undef TILEFETCHER_START_BODY
+
+/* Compile-time-folded BPP dispatch for Fetch, used inside the
+ * function-table BODY macros.  At -O2 the compiler folds the ?:
+ * chain and emits a direct call to the matching Fetch_N variant.
+ * The macros take a TileFetcher_{Rot,NonRot}* `self_p` rather than
+ * an object; call sites that previously had an `auto& tf` C++
+ * reference pass `&tf`, which decays to the right pointer type. */
+#define TF_ROT_FETCH(self_p, bpp, bmen, ix, iy) \
+ TileFetcher_Rot_Fetch_##bpp((self_p), (bmen), (ix), (iy))
+
+#define TF_NR_FETCH(self_p, bpp, bmen, ix, iy) \
+ TileFetcher_NonRot_Fetch_##bpp((self_p), (bmen), (ix), (iy))
+
+struct RotVars
+{
+ int32_t Xsp, Ysp;// .10
+ int32_t Xp, Yp;	// .10
+ int32_t dX, dY;	// .10
+
+ int32_t kx, ky;	// .16
+
+ bool use_coeff;
+ uint32_t base_coeff;
+
+ struct TileFetcher_Rot tf;
+};
+
+static struct
+{
+ uint64_t spr[704];
+ uint64_t rbg0[704];
+ union
+ {
+  uint64_t nbg[4][8 + 704 + 8];
+  struct
+  {
+   /* `sizeof(nbg)` here would walk up into the enclosing union, which
+    * the non-standard name lookup.  Spell
+    * the size out literally instead -- both branches stay in lockstep
+    * with the nbg array's declared dimensions above. */
+   uint8_t dummy[sizeof(uint64_t[4][8 + 704 + 8]) / 2];
+   uint16_t vcscr[2][88 + 1 + 1];	/* + 1 for fine x scroll != 0, + 1 for pointer shenanigans in FetchVCScroll */
+  };
+  struct
+  {
+   uint8_t rotdummy[sizeof(uint64_t[4][8 + 704 + 8]) / 4];
+   uint8_t rotabsel[352];	/* Also used as a scratch buffer in T_DrawRBG() to handle mosaic-related junk. */
+   struct RotVars rotv[2];
+   uint32_t rotcoeff[352];
+  };
+ };
+ __attribute__((aligned(16))) uint8_t lc[704];
+} LB;
+
+// LB.* zero-fill skip state.
+//
+// Six layer buffers in LB (sprite, rbg0, nbg[0..3]) get zero-filled
+// per scanline when their corresponding layer is disabled, so MixIt
+// can read 0 for them while still doing its priority comparisons.
+// Each fill is w * sizeof(uint64_t) bytes (2.5 - 5.5 KB depending on
+// resolution). For a game with one or two layers permanently
+// disabled that is 5 - 10 KB / line * 240 lines * 60 fps =
+// ~70 - 150 MB/s of pure zero-writing.
+//
+// But the buffers are static, so once we have zeroed one, it stays
+// zero until something writes content to it. Track per-buffer
+// "is currently all zeros in the [0, cleared_w) range" state; skip
+// the fill if it is still clean. Mark dirty whenever a real render
+// (DrawSpriteData / DrawRBG / DrawNBG / DrawNBG23) writes content.
+//
+// Because all six buffers always get filled at the same `w` on any
+// given scanline, a single shared "last width zero-filled" suffices
+// instead of a per-buffer cleared_w; when w changes between lines
+// (resolution / HRes register change) we invalidate every flag in
+// one shot at the top of DrawLine and the next clean line re-zeros
+// at the new width.
+//
+// State is process-lifetime: zero-initialised at startup matches
+// the layer buffers themselves being zero-initialised
+// (uninitialised static data in C++), and Reset paths in this file
+// memset whole regions so the all-zero invariant always holds at
+// the boundary.
+//
+static bool     LB_clean_rbg0;    // LB.rbg0[0 .. LB_cleaned_w) is all zeros
+static bool     LB_clean_nbg[4];  // LB.nbg[n][8 .. 8 + LB_cleaned_w) is all zeros
+static unsigned LB_cleaned_w;     // width at which the clean flags were established
+
+// ColorOffsEn, etc. ?...hmm, discrepancy with ColorCalcEn and LineColorEn...
+enum
+{
+ LAYER_NBG0 = 0,
+ //LAYER_RBG1 = 0,
+ LAYER_NBG1 = 1,
+ //LAYER_EXBG = 1,
+ LAYER_NBG2 = 2,
+ LAYER_NBG3 = 3,
+
+ LAYER_RBG0 = 4,
+ LAYER_BACK = 5, // Line color?
+ LAYER_SPRITE = 6,
+};
+
+//
+//
+//
+static uint32_t ColorCache[2048];
+static void CacheCRE(const unsigned cri)
+{
+ if(CRAM_Mode & CRAM_MODE_RGB888_1024)
+ {
+  (ColorCache + 0x000)[cri >> 1] = (ColorCache + 0x400)[cri >> 1] = (((CRAM + 0x000)[(cri >> 1) & 0x3FF] & 0x80FF) << 16) | ((CRAM + 0x400)[(cri >> 1) & 0x3FF] << 0);
+ }
+ else
+ {
+  const uint16_t t = CRAM[cri & ((CRAM_Mode == CRAM_MODE_RGB555_1024) ? 0x3FF : 0x7FF)];
+  const uint32_t col = ((t << 3) & 0xF8) | ((t << 6) & 0xF800) | ((t << 9) & 0xF80000) | ((t << 16) & 0x80000000);
+
+  if(CRAM_Mode == CRAM_MODE_RGB555_1024)
+   (ColorCache + 0x000)[cri & 0x3FF] = (ColorCache + 0x400)[cri & 0x3FF] = col;
+  else
+   ColorCache[cri] = col;
+ }
+}
+
+static void RecalcColorCache(void)
+{
+ if(CRAM_Mode & CRAM_MODE_RGB888_1024)
+ {
+  for(unsigned i = 0; i < 2048; i += 2)
+   CacheCRE(i);
+ }
+ else
+ {
+  const unsigned count = (CRAM_Mode == CRAM_MODE_RGB555_2048) ? 2048 : 1024;
+
+  for(unsigned i = 0; i < count; i++)
+   CacheCRE(i);
+ }
+}
+
+//
+// Register writes seem to always be 16-bit
+//
+static INLINE void RegsWrite(uint32_t A, uint16_t V)
+{
+ A &= 0x1FE;
+
+ switch(A)
+ {
+  default:
+	break;
+
+  case 0x00:
+	//DisplayOn = (V >> 15) & 0x1;
+	BorderMode = (V >> 8) & 0x1;
+	InterlaceMode = (V >> 6) & 0x3;
+	VRes = (V >> 4) & 0x3;
+	HRes = (V >> 0) & 0x7;
+	break;
+
+  case 0x02:
+	//ExLatchEnable = (V >> 9) & 0x1;
+	//ExSyncEnable = (V >> 8) & 0x1;
+
+	//DispAreaSelect = (V >> 1) & 0x1;
+	ExBGEnable = (V >> 0) & 0x1;
+	break;
+
+  case 0x0E:
+	{
+	 const unsigned old_CRAM_Mode = CRAM_Mode;
+
+	 CRKTE = (V >> 15) & 0x1;
+	 CRAM_Mode = (V >> 12) & 0x3;;
+	 VRAM_Mode = (V >> 8) & 0x3;
+	 RDBS_Mode = V & 0xFF;
+
+	 if(old_CRAM_Mode != CRAM_Mode)
+	  RecalcColorCache();
+	}
+	break;
+  //
+  case 0x10:
+  case 0x12:
+  case 0x14:
+  case 0x16:
+  case 0x18:
+  case 0x1A:
+  case 0x1C:
+  case 0x1E:
+	{
+	 uint8_t* const b = &VCPRegs[(A >> 2) & 3][(A & 0x2) << 1];
+	 b[0] = (V >> 12) & 0xF;
+	 b[1] = (V >>  8) & 0xF;
+	 b[2] = (V >>  4) & 0xF;
+	 b[3] = (V >>  0) & 0xF;
+	}
+	break;
+  //
+  case 0x20:
+	BGON = V & 0x1F3F;
+	break;
+
+  case 0x22:
+	MZCTL = V & 0xFF1F;
+	break;
+
+  case 0x24:
+	SFSEL = V & 0x1F;
+	break;
+
+  case 0x26:
+	SFCODE = V;
+	break;
+
+  case 0x28:
+	CHCTLA = V & 0x3F7F;
+	break;
+
+  case 0x2A:
+	CHCTLB = V & 0x7733;
+	break;
+
+  case 0x2C:
+	BMPNA = V & 0x3737;
+	break;
+
+  case 0x2E:
+	BMPNB = V & 0x37;
+	break;
+
+  //
+  case 0x30:
+  case 0x32:
+  case 0x34:
+  case 0x36:
+	PNCN[(A & 0x6) >> 1] = V & 0xC3FF;
+	break;
+
+  case 0x38:
+	PNCNR = V & 0xC3FF;
+	break;
+
+  //
+  case 0x3A:
+	PLSZ = V;	// Plane size
+	break;
+
+  case 0x3C:
+	MPOFN = V & 0x7777;	// Map offset NBG
+	break;
+
+  case 0x3E:
+	MPOFR = V & 0x0077;	// Map offset RBG
+	break;
+  //
+  case 0x40:
+  case 0x42:
+  case 0x44:
+  case 0x46:
+  case 0x48:
+  case 0x4A:
+  case 0x4C:
+  case 0x4E:
+	MapRegs[(A & 0xC) >> 2][(A & 0x2) + 0] = (V >> 0) & 0x3F;
+	MapRegs[(A & 0xC) >> 2][(A & 0x2) + 1] = (V >> 8) & 0x3F;
+	break;
+
+  case 0x50: case 0x52: case 0x54: case 0x56: case 0x58: case 0x5A: case 0x5C: case 0x5E:
+  case 0x60: case 0x62: case 0x64: case 0x66: case 0x68: case 0x6A: case 0x6C: case 0x6E:
+	RotMapRegs[(bool)(A & 0x20)][(A & 0xE) + 0] = (V >> 0) & 0x3F;
+	RotMapRegs[(bool)(A & 0x20)][(A & 0xE) + 1] = (V >> 8) & 0x3F;
+	break;
+  //
+  case 0x70:
+  case 0x80:
+	XScrollI[A >> 7] = V & 0x7FF;
+	break;
+
+  case 0x72:
+  case 0x82:
+	XScrollF[A >> 7] = (V >> 8) & 0xFF;
+	break;
+
+  case 0x74:
+  case 0x84:
+	YScrollI[A >> 7] = V & 0x7FF;
+	break;
+
+  case 0x76:
+  case 0x86:
+	YScrollF[A >> 7] = (V >> 8) & 0xFF;
+	break;
+
+  case 0x78:
+  case 0x88:
+	XCoordInc[A >> 7] = (XCoordInc[A >> 7] & 0xFF) | ((V & 0x7) << 8);
+	break;
+
+  case 0x7A:
+  case 0x8A:
+	XCoordInc[A >> 7] = (XCoordInc[A >> 7] & 0x700) | ((V >> 8) & 0xFF);
+	break;
+
+  case 0x7C:
+  case 0x8C:
+	YCoordInc[A >> 7] = (YCoordInc[A >> 7] & 0xFF) | ((V & 0x7) << 8);
+	break;
+
+  case 0x7E:
+  case 0x8E:
+	YCoordInc[A >> 7] = (YCoordInc[A >> 7] & 0x700) | ((V >> 8) & 0xFF);
+	break;
+
+  case 0x90:
+  case 0x94:
+	XScrollI[2 + (bool)(A & 0x4)] = V & 0x7FF;
+	break;
+
+  case 0x92:
+  case 0x96:
+	{
+	 const unsigned which = (bool)(A & 0x4);
+
+	 NBG23_YCounter[which] = YScrollI[2 + which] = V & 0x7FF;
+	}
+	break;
+
+  case 0x98:
+	ZMCTL = V & 0x0303;
+	break;
+
+  case 0x9A:
+	SCRCTL = V & 0x3F3F;
+	break;
+
+  case 0x9C:
+	VCScrollAddr = (VCScrollAddr & 0xFFFF) | ((V & 0x7) << 16);
+	break;
+
+  case 0x9E:
+	VCScrollAddr = (VCScrollAddr & 0x70000) | (V & 0xFFFE);
+	break;
+
+  case 0xA0:
+	LineScrollAddr[0] = (LineScrollAddr[0] & 0xFFFF) | ((V & 0x7) << 16);
+	break;
+
+  case 0xA2:
+	LineScrollAddr[0] = (LineScrollAddr[0] & 0x70000) | (V & 0xFFFE);
+	break;
+
+  case 0xA4:
+	LineScrollAddr[1] = (LineScrollAddr[1] & 0xFFFF) | ((V & 0x7) << 16);
+	break;
+
+  case 0xA6:
+	LineScrollAddr[1] = (LineScrollAddr[1] & 0x70000) | (V & 0xFFFE);
+	break;
+
+  //
+  case 0xA8:
+	LCTA = (LCTA & 0xFFFF) | ((V & 0x8007) << 16);
+	break;
+
+  case 0xAA:
+	LCTA = (LCTA & ~0xFFFF) | V;
+	break;
+
+  case 0xAC:
+	BKTA = (BKTA & 0xFFFF) | ((V & 0x8007) << 16);
+	break;
+
+  case 0xAE:
+	BKTA = (BKTA & ~0xFFFF) | V;
+	break;
+  //
+  case 0xB0:
+	RPMD = V & 0x3;
+	break;
+
+  case 0xB4:
+	KTCTL[0] = (V >> 0) & 0x1F;
+	KTCTL[1] = (V >> 8) & 0x1F;
+	break;
+
+  case 0xB8:
+	OVPNR[0] = V;
+	break;
+
+  case 0xBA:
+	OVPNR[1] = V;
+	break;
+
+  //
+  case 0xC0: Window[0].XStart = V & 0x3FF; break;
+  case 0xC4: Window[0].XEnd = V & 0x3FF; break;
+
+  case 0xC8: Window[1].XStart = V & 0x3FF; break;
+  case 0xCC: Window[1].XEnd = V & 0x3FF; break;
+
+  case 0xD0:
+  case 0xD2:
+  case 0xD4:
+	WinControl[(A & 0x6) + 0] = (V >> 0) & 0xBF;
+	WinControl[(A & 0x6) + 1] = (V >> 8) & 0xBF;
+	break;
+
+  case 0xD6:
+	WinControl[(A & 0x6) + 0] = (V >> 0) & 0x8F;	// Rot
+	WinControl[(A & 0x6) + 1] = (V >> 8) & 0xBF;	// CC
+	break;
+
+  case 0xD8:
+  case 0xDC:
+	{
+	 const unsigned w = (A & 0x4) >> 2;
+
+	 Window[w].LineWinEn = (bool)(V & 0x8000);
+	 Window[w].LineWinAddr = (Window[w].LineWinAddr & 0xFFFF) | ((V & 0x7) << 16);
+	}
+	break;
+
+  case 0xDA:
+  case 0xDE:
+	{
+	 const unsigned w = (A & 0x4) >> 2;
+
+	 Window[w].LineWinAddr = (Window[w].LineWinAddr & 0x70000) | (V & 0xFFFE);
+	}
+	break;
+
+  //
+  case 0xE0:
+	SpriteCCCond = (V >> 12) & 0x3;
+	SpriteCCNum = (V >> 8) & 0x7;
+	SPCTL_Low = V & 0x3F;
+	break;	
+
+  case 0xE2:
+	SDCTL = V & 0x13F;
+	break;
+
+  case 0xE4:
+	CRAMAddrOffs_NBG[0] = (V >>  0) & 0x7;
+	CRAMAddrOffs_NBG[1] = (V >>  4) & 0x7;
+	CRAMAddrOffs_NBG[2] = (V >>  8) & 0x7;
+	CRAMAddrOffs_NBG[3] = (V >> 12) & 0x7;
+	break;
+
+  case 0xE6:
+	CRAMAddrOffs_RBG0 = (V >> 0) & 0x7;
+	CRAMAddrOffs_Sprite = (V >> 4) & 0x7;
+	break;
+
+  case 0xE8:
+	LineColorEn = V & 0x3F;
+	break;
+
+  case 0xEA:
+	SFPRMD = V & 0x3FF;
+	break;
+
+  case 0xEC:
+	CCCTL = V & 0xF77F;
+	break;
+
+  case 0xEE:
+	SFCCMD = V & 0x3FF;
+	break;
+
+  case 0xF0:
+  case 0xF2:
+  case 0xF4:
+  case 0xF6:
+	SpritePrioNum[(A & 0x6) + 0] = ((V >> 0) & 0x7);
+	SpritePrioNum[(A & 0x6) + 1] = ((V >> 8) & 0x7);
+	break;
+
+  case 0xF8:
+	NBGPrioNum[0] = (V >> 0) & 0x7;
+	NBGPrioNum[1] = (V >> 8) & 0x7;
+	break;
+
+  case 0xFA:
+	NBGPrioNum[2] = (V >> 0) & 0x7;
+	NBGPrioNum[3] = (V >> 8) & 0x7;
+	break;
+
+  case 0xFC:
+	RBG0PrioNum = (V >> 0) & 0x7;
+	break;
+
+  case 0x100:
+  case 0x102:
+  case 0x104:
+  case 0x106:
+	SpriteCCRatio[(A & 0x6) + 0] = (V >> 0) & 0x1F;
+	SpriteCCRatio[(A & 0x6) + 1] = (V >> 8) & 0x1F;
+	break;
+
+  case 0x108:
+  case 0x10A:
+	NBGCCRatio[(A & 0x2) + 0] = (V >> 0) & 0x1F;
+	NBGCCRatio[(A & 0x2) + 1] = (V >> 8) & 0x1F;
+	break;
+
+  case 0x10C:
+	RBG0CCRatio = V & 0x1F;
+	break;
+
+  case 0x10E:
+	LineColorCCRatio = (V >> 0) & 0x1F;
+	BackCCRatio = (V >> 8) & 0x1F;
+	break;
+
+  case 0x110:
+	ColorOffsEn = V & 0x7F;
+	break;
+
+  case 0x112:
+	ColorOffsSel = V & 0x7F;
+	break;
+
+  case 0x114: // A Red
+  case 0x116: // A Green
+  case 0x118: // A Blue
+  case 0x11A: // B Red
+  case 0x11C: // B Green
+  case 0x11E: // B Blue
+	{
+	 const unsigned ab = (A >= 0x11A);
+	 const unsigned wcc = ((A - 0x114) >> 1) % 3;
+
+	 ColorOffs[ab][wcc] = (uint32_t)sign_x_to_s32(9, V) << (wcc << 3);
+	}
+	break;
+ }
+}
+
+/* MemW: was `template<typename T> static INLINE void MemW(uint32_t A,
+ * const uint16_t DB)` with two instantiations (T = uint8_t, uint16_t).
+ * The only T-dependent expression is the VRAM-write mask -- byte writes
+ * select the high or low byte of the BE uint16_t storage based on A's
+ * LSB; word writes write the whole uint16_t.  CRAM and register paths
+ * are size-agnostic.  Monomorphized into MemW_u8 / MemW_u16 sharing
+ * the body via MEMW_BODY -- only argument is the mask expression. */
+#define MEMW_BODY(MASK_EXPR)                                                     \
+{                                                                                \
+ A &= 0x1FFFFF;                                                                  \
+                                                                                 \
+ /* VRAM */                                                                      \
+ if(A < 0x100000)                                                                \
+ {                                                                               \
+  const size_t vri = (A & 0x7FFFF) >> 1;                                         \
+  const unsigned mask = (MASK_EXPR);                                             \
+                                                                                 \
+  VRAM[vri] = (VRAM[vri] &~ mask) | (DB & mask);                                 \
+                                                                                 \
+  return;                                                                        \
+ }                                                                               \
+                                                                                 \
+ /* CRAM */                                                                      \
+ if(A < 0x180000)                                                                \
+ {                                                                               \
+  const unsigned cri = (A & 0xFFF) >> 1;                                         \
+                                                                                 \
+  switch(CRAM_Mode)                                                              \
+  {                                                                              \
+    case CRAM_MODE_RGB555_1024:                                                  \
+        (CRAM + 0x000)[cri & 0x3FF] = DB;                                        \
+        (CRAM + 0x400)[cri & 0x3FF] = DB;                                        \
+        CacheCRE(cri);                                                           \
+        break;                                                                   \
+                                                                                 \
+    case CRAM_MODE_RGB555_2048:                                                  \
+        CRAM[cri] = DB;                                                          \
+        CacheCRE(cri);                                                           \
+        break;                                                                   \
+                                                                                 \
+    case CRAM_MODE_RGB888_1024:                                                  \
+    case CRAM_MODE_ILLEGAL:                                                      \
+    default:                                                                     \
+        CRAM[((cri >> 1) & 0x3FF) | ((cri & 1) << 10)] = DB;                     \
+        CacheCRE(cri);                                                           \
+        break;                                                                   \
+  }                                                                              \
+                                                                                 \
+  return;                                                                        \
+ }                                                                               \
+                                                                                 \
+ /* Registers */                                                                 \
+ if(A < 0x1C0000)                                                                \
+ {                                                                               \
+  RegsWrite(A, DB);                                                              \
+                                                                                 \
+  return;                                                                        \
+ }                                                                               \
+}
+
+static INLINE void MemW_u8 (uint32_t A, const uint16_t DB) MEMW_BODY(0xFF00 >> ((A & 1) << 3))
+static INLINE void MemW_u16(uint32_t A, const uint16_t DB) MEMW_BODY(0xFFFF)
+
+static void Reset(bool powering_up)
+{
+ if(powering_up)
+ {
+  memset(VRAM, 0, sizeof(VRAM));
+  memset(CRAM, 0, sizeof(CRAM));
+ }
+ //
+ //
+ CRKTE = false;
+ CRAM_Mode = 0;
+ VRAM_Mode = 0;
+ RDBS_Mode = 0;
+ HRes = 0;
+ VRes = 0;
+ BorderMode = false;
+ InterlaceMode = 0;
+ //
+ memset(VCPRegs, 0, sizeof(VCPRegs));
+ //
+ BGON = 0;
+ MZCTL = 0;
+ MosaicVCount = 0;
+
+ SFSEL = 0;
+ SFCODE = 0;
+
+ CHCTLA = 0;
+ CHCTLB = 0;
+
+ // Restored on state load by the RegsWrite() replay in
+ // VDP2REND_StateAction, same as every other register-derived flag.
+ ExBGEnable = false;
+
+ BMPNA = 0;
+ BMPNB = 0;
+
+ for(unsigned n = 0; n < 4; n++)
+  PNCN[n] = 0;
+
+ PNCNR = 0;
+
+ PLSZ = 0;
+ MPOFN = 0;
+ MPOFR = 0;
+
+ for(unsigned n = 0; n < 4; n++)
+ {
+  for(unsigned i = 0; i < 4; i++)
+   MapRegs[n][i] = 0;
+ }
+
+ for(unsigned rn = 0; rn < 2; rn++)
+ {
+  for(unsigned i = 0; i < 16; i++)
+   RotMapRegs[rn][i] = 0;
+ }
+
+ //
+ for(unsigned n = 0; n < 4; n++)
+ {
+  XScrollI[n] = 0;
+  YScrollI[n] = 0;
+
+  if(n < 2)
+  {
+   XScrollF[n] = 0;
+   YScrollF[n] = 0;
+
+   XCoordInc[n] = 0;
+   YCoordInc[n] = 0;
+   YCoordAccum[n] = 0;
+   MosEff_YCoordAccum[n] = 0;
+  }
+  else
+  {
+   NBG23_YCounter[n & 1] = 0;
+   MosEff_NBG23_YCounter[n & 1] = 0;
+  }
+ }
+
+ ZMCTL = 0;
+ SCRCTL = 0;
+ LineScrollAddr[0] = 0;
+ LineScrollAddr[1] = 0;
+ VCScrollAddr = 0;
+ VCLast[0] = VCLast[1] = 0;
+
+ for(unsigned n = 0; n < 2; n++)
+ {
+  CurXScrollIF[n] = 0;
+  CurYScrollIF[n] = 0;
+  CurLSA[n] = 0;
+  CurXCoordInc[n] = 0;
+ }
+
+ for(unsigned n = 0; n < 4; n++)
+  NBGPrioNum[n] = 0;
+
+ RBG0PrioNum = 0;
+
+ for(unsigned n = 0; n < 4; n++)
+  NBGCCRatio[n] = 0;
+
+ RBG0CCRatio = 0;
+ LineColorCCRatio = 0;
+ BackCCRatio = 0;
+
+ for(unsigned w = 0; w < 2; w++)
+ {
+  Window[w].XStart = 0;
+  Window[w].XEnd = 0;
+  Window[w].LineWinAddr = 0;
+  Window[w].LineWinEn = false;
+
+  Window[w].YMet = false;
+  Window[w].CurXStart = 0;
+  Window[w].CurXEnd = 0;
+  Window[w].CurLineWinAddr = 0;
+ }
+
+ for(unsigned i = 0; i < 8; i++)
+  WinControl[i] = 0;
+
+ //
+ RPMD = 0;
+ for(unsigned i = 0; i < 2; i++)
+ {
+  KTCTL[i] = 0;
+  OVPNR[i] = 0;
+ }
+ //
+ BKTA = 0;
+ CurBackTabAddr = 0;
+ CurBackColor = 0;
+
+ LCTA = 0;
+ CurLCTabAddr = 0;
+ CurLCColor = 0;
+
+ LineColorEn = 0;
+
+ SFPRMD = 0;
+ SFCCMD = 0;
+
+ CCCTL = 0;
+ //
+ SpriteCCCond = 0;
+ SpriteCCNum = 0;
+ SPCTL_Low = 0;
+
+ SDCTL = 0;
+ //
+ memset(SpritePrioNum, 0, sizeof(SpritePrioNum));
+ //
+ memset(SpriteCCRatio, 0, sizeof(SpriteCCRatio));
+ //
+ memset(CRAMAddrOffs_NBG, 0, sizeof(CRAMAddrOffs_NBG));
+
+ CRAMAddrOffs_RBG0 = 0;
+
+ CRAMAddrOffs_Sprite = 0;
+ //
+ ColorOffsEn = 0;
+ ColorOffsSel = 0;
+
+ memset(ColorOffs, 0, sizeof(ColorOffs));
+}
+
+// Prio(3 bits), color calc(1 bit), layer num(3 bits), 1 bit for palette/rgb format, 1 bit for line color enable, 1 bit for color offs enable, 1 bit for color offs select
+//    1 bit for line color screen enable?, 1 bit allow sprite shadow, 1 bit do sprite shadow
+// Prio, color calc, layer num
+
+enum
+{
+ PIX_ISRGB_SHIFT = 0,	// original format, 0 = paletted, 1 = RGB
+ PIX_LCE_SHIFT = 1,	// Line color enable
+ PIX_COE_SHIFT = 2,	// Color offs enable
+ PIX_COSEL_SHIFT = 3,	// Color offset select(which color offset registers to use)
+ PIX_CCE_SHIFT = 4,	// Color calc enable
+
+ //
+ // Sprite shadow nonsense
+ // Keep these in this order at these bit positions
+ PIX_SHADEN_SHIFT = 5,	//
+ PIX_DOSHAD_SHIFT = 6,
+ PIX_SELFSHAD_SHIFT = 7,
+ PIX_SHADHALVTEST8_VAL = 0x60,
+ //
+ //
+ //
+ //
+
+ // 8 ... 15
+ PIX_PRIO_TEST_SHIFT = 8,
+ PIX_PRIO_SHIFT = PIX_PRIO_TEST_SHIFT + 3,
+
+ //
+ PIX_GRAD_SHIFT = 16,
+ PIX_LAYER_CCE_SHIFT = 17,	// For extended color calculation
+
+ // 24...31
+ PIX_CCRATIO_SHIFT = 24,
+
+ // 32 ... 55
+ PIX_RGB_SHIFT = 32,
+
+ //
+ PIX_SWBIT_SHIFT = 56,
+
+ // Reminder that highest bit can be == 1 when RGB data is pulled from ColorCache
+ //SPECIAL_CCALC_SHIFT = 63
+};
+
+static INLINE void GetCWV(const uint8_t ctrl, const bool* const xmet, bool* cwv)
+{
+ const bool logic = (ctrl >> 7) & 1;	// 0 = OR, 1 = AND
+ const bool w_enable[2] = { (bool)(ctrl & 0x02), (bool)(ctrl & 0x08) };
+ const bool w_area[2] = { (bool)(ctrl & 0x01), (bool)(ctrl & 0x04) };
+ const bool sw_enable = ctrl & 0x20;
+ const bool sw_area = ctrl & 0x10;
+
+ for(unsigned swinput = 0; swinput < 2; swinput++)
+ {
+  bool wval[2];
+  bool swval;
+
+  wval[0] = (w_enable[0] ? ((xmet[0] & Window[0].YMet) ^ w_area[0]) : logic);
+  wval[1] = (w_enable[1] ? ((xmet[1] & Window[1].YMet) ^ w_area[1]) : logic);
+
+  swval = sw_enable ? (swinput ^ sw_area) : logic;
+
+  if(logic)
+   cwv[swinput] = wval[0] & wval[1] & swval;
+  else
+   cwv[swinput] = wval[0] | wval[1] | swval;
+ }
+}
+
+static void GetWinRotAB(void)
+{
+ unsigned x = 0;
+
+ for(unsigned piece = 0; piece < 5; piece++)
+ {
+  bool xmet[2];
+
+  xmet[0] = ((x >= Window[0].CurXStart) & (x <= Window[0].CurXEnd));
+  xmet[1] = ((x >= Window[1].CurXStart) & (x <= Window[1].CurXEnd));
+  //
+  //
+  //
+  bool cwv[2];
+
+  GetCWV(WinControl[WINLAYER_ROTPARAM], xmet, cwv);
+
+  /* Branchless cwv[bool] selection (same idea as ApplyWin's slow
+   * path) so SLP can vectorize: sel_or | (sel_xor & sel_bits). */
+  const uint8_t r_or  = (uint8_t)cwv[0];
+  const uint8_t r_xor = (uint8_t)(cwv[0] ^ cwv[1]);
+  if(HRes & 0x2)
+  {
+   for(; MDFN_LIKELY(x < WinPieces[piece]); x += 2)
+    LB.rotabsel[x >> 1] = r_or ^ (r_xor & (uint8_t)((LB.spr[x] >> PIX_SWBIT_SHIFT) & 1));
+  }
+  else
+  {
+   for(; MDFN_LIKELY(x < WinPieces[piece]); x++)
+    LB.rotabsel[x] = r_or ^ (r_xor & (uint8_t)((LB.spr[x] >> PIX_SWBIT_SHIFT) & 1));
+  }
+ }
+}
+
+static void ApplyWin(const unsigned wlayer, uint64_t* __restrict__ buf)
+{
+ unsigned x = 0;
+
+ for(unsigned piece = 0; piece < 5; piece++)
+ {
+  bool xmet[2];
+
+  xmet[0] = ((x >= Window[0].CurXStart) & (x <= Window[0].CurXEnd));
+  xmet[1] = ((x >= Window[1].CurXStart) & (x <= Window[1].CurXEnd));
+
+  //
+  //
+  //
+  bool cwv[2];
+  bool cc_cwv[2];
+
+  GetCWV(WinControl[wlayer], xmet, cwv);
+  GetCWV(WinControl[WINLAYER_CC], xmet, cc_cwv);
+
+  if(!((cwv[0] ^ cwv[1]) | (cc_cwv[0] ^ cc_cwv[1])))	// Fast path(no sprite window, or sprite window wouldn't have an effect in this piece).
+  {
+   if(cwv[0])
+   {
+    for(; MDFN_LIKELY(x < WinPieces[piece]); x++)
+     buf[x] &= ~(uint64_t)0xFFFFFFFF;
+   }
+   else if(cc_cwv[0])
+   {
+    for(; MDFN_LIKELY(x < WinPieces[piece]); x++)
+     buf[x] &= ~(uint64_t)(1U << PIX_CCE_SHIFT);
+   }
+   x = WinPieces[piece];
+  }
+  else
+  {
+   uint64_t masks[2];
+
+   for(unsigned i = 0; i < 2; i++)
+   {
+    uint64_t m = ~(uint64_t)0;
+
+    if(cwv[i])
+     m = ~(uint64_t)0xFFFFFFFF;
+
+    if(cc_cwv[i])
+     m &= ~(uint64_t)(1U << PIX_CCE_SHIFT);
+
+    masks[i] = m;
+   }
+
+   /* Branchless mask select: replace masks[bool] gather with
+    * `mor ^ (sel_bits & mxor)` so SLP can vectorize the loop.
+    * Form `sel` via a sign-extending arith shift so we never have
+    * a 1-bit intermediate (GCC's bool-pattern recognizer would
+    * otherwise reconstruct a conditional select and the v2di
+    * conversion path bails with "bit-precision arithmetic not
+    * supported"). */
+   const uint64_t mor  = masks[0];
+   const uint64_t mxor = masks[0] ^ masks[1];
+   for(; MDFN_LIKELY(x < WinPieces[piece]); x++)
+   {
+    const int64_t shifted = (int64_t)(LB.spr[x] << (63 - PIX_SWBIT_SHIFT));
+    const uint64_t sel    = (uint64_t)(shifted >> 63);
+    buf[x] &= mor ^ (sel & mxor);
+   }
+  }
+ }
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+ #pragma GCC push_options
+ #pragma GCC optimize("no-unroll-loops,no-peel-loops,no-crossjumping")
+#endif
+static NO_INLINE void ApplyHMosaic(const unsigned layer, uint64_t* buf, const unsigned w)
+{
+ if(!(MZCTL & (1U << layer)))
+  return;
+
+ const unsigned moz_horiz_param = ((MZCTL >> 8) & 0xF);
+ const unsigned moz_wmax = w - moz_horiz_param;
+ unsigned x = 0;
+
+ switch(moz_horiz_param)
+ {
+  case 0x0: x = moz_wmax; break;
+  case 0x1: for(; x < moz_wmax; x += 0x2) { uint64_t b = buf[x]; buf[x + 1] = b; } break;
+  case 0x2: for(; x < moz_wmax; x += 0x3) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; } break;
+  case 0x3: for(; x < moz_wmax; x += 0x4) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; } break;
+  case 0x4: for(; x < moz_wmax; x += 0x5) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; } break;
+  case 0x5: for(; x < moz_wmax; x += 0x6) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; } break;
+  case 0x6: for(; x < moz_wmax; x += 0x7) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; } break;
+  case 0x7: for(; x < moz_wmax; x += 0x8) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; buf[x + 7] = b; } break;
+  case 0x8: for(; x < moz_wmax; x += 0x9) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; buf[x + 7] = b; buf[x + 8] = b; } break;
+  case 0x9: for(; x < moz_wmax; x += 0xA) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; buf[x + 7] = b; buf[x + 8] = b; buf[x + 9] = b; } break;
+  case 0xA: for(; x < moz_wmax; x += 0xB) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; buf[x + 7] = b; buf[x + 8] = b; buf[x + 9] = b; buf[x + 10] = b; } break;
+  case 0xB: for(; x < moz_wmax; x += 0xC) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; buf[x + 7] = b; buf[x + 8] = b; buf[x + 9] = b; buf[x + 10] = b; buf[x + 11] = b; } break;
+  case 0xC: for(; x < moz_wmax; x += 0xD) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; buf[x + 7] = b; buf[x + 8] = b; buf[x + 9] = b; buf[x + 10] = b; buf[x + 11] = b; buf[x + 12] = b; } break;
+  case 0xD: for(; x < moz_wmax; x += 0xE) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; buf[x + 7] = b; buf[x + 8] = b; buf[x + 9] = b; buf[x + 10] = b; buf[x + 11] = b; buf[x + 12] = b; buf[x + 13] = b; } break;
+  case 0xE: for(; x < moz_wmax; x += 0xF) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; buf[x + 7] = b; buf[x + 8] = b; buf[x + 9] = b; buf[x + 10] = b; buf[x + 11] = b; buf[x + 12] = b; buf[x + 13] = b; buf[x + 14] = b; } break;
+  case 0xF: for(; x < moz_wmax; x += 0x10) { uint64_t b = buf[x]; buf[x + 1] = b; buf[x + 2] = b; buf[x + 3] = b; buf[x + 4] = b; buf[x + 5] = b; buf[x + 6] = b; buf[x + 7] = b; buf[x + 8] = b; buf[x + 9] = b; buf[x + 10] = b; buf[x + 11] = b; buf[x + 12] = b; buf[x + 13] = b; buf[x + 14] = b; buf[x + 15] = b;} break;
+ }
+ assert(x <= w);
+
+ for(uint64_t b = buf[x]; x < w; x++)
+  buf[x] = b;
+}
+#if defined(__GNUC__) && !defined(__clang__)
+ #pragma GCC pop_options
+#endif
+
+//
+// NBG0(HRES=0x1):
+//   Cycle 0: OK
+//   Cycle 1: OK
+//
+//   Cycle 2:
+//	[Entry 0] [Entry 0] [Entry 1] [Entry 2]
+//   Cycle 3 ... 7:
+//	[Entry 44] [Entry 44] [Entry 0] [Entry 1]
+//
+
+static void FetchVCScroll(const unsigned w)
+{
+ const bool vcon[2] = { (bool)(SCRCTL & BGON & !(MZCTL & 0x1)), (bool)((SCRCTL >> 8) & (BGON >> 1) & !(MZCTL & 0x2) & 0x1) };
+ const unsigned max_cyc = (HRes & 0x6) ? 4 : 8;
+ const unsigned tc = (w >> 3) + 1;
+ uint32_t tmp[2] = { VCLast[0], VCLast[1] };
+ uint32_t vcaddr = VCScrollAddr & 0x3FFFE;
+ uint32_t base[2];
+ unsigned inc[8];
+ uint8_t VRMVCPCache[4][8];
+
+ for(unsigned bank = 0; bank < 4; bank++)
+ {
+  //unsigned brm[4];
+  //brm[bank] = bank & (2 | ((VRAM_Mode >> (bank >> 1)) & 1));
+  const unsigned esb = bank & (2 | ((VRAM_Mode >> (bank >> 1)) & 1));
+  memcpy(VRMVCPCache[bank], VCPRegs[esb], 8);
+ }
+
+ for(unsigned n = 0; n < 2; n++)
+  base[n] = CurYScrollIF[n] + YCoordAccum[n];
+
+ for(unsigned cyc = 0; cyc < max_cyc; cyc++)
+ {
+  unsigned do_inc = 0;
+
+  for(unsigned bank = 0; bank < 4; bank++)
+  {
+   const unsigned act = VRMVCPCache[bank][cyc];
+
+   do_inc |= vcon[0] & (act == VCP_NBG0_VCS);
+   do_inc |= vcon[1] & (act == VCP_NBG1_VCS);
+  }
+
+  inc[cyc] = do_inc << 1;
+ }
+
+ for(unsigned tile = 0; MDFN_LIKELY(tile < tc); tile++)
+ {
+  for(unsigned cyc = 0; cyc < max_cyc; cyc++)
+  {
+   const unsigned act = VRMVCPCache[vcaddr >> 16][cyc];
+
+   // NBG0
+   if(vcon[0])
+   {
+    if(cyc == 3)
+     LB.vcscr[0][tile] = ((base[0] + tmp[0]) >> 8);
+
+    if(cyc == 3)
+     tmp[0] = VCLast[0];
+
+    if(act == VCP_NBG0_VCS)
+    {
+     VCLast[0] = (VRAM[vcaddr + 0] << 8) | (VRAM[vcaddr + 1] >> 8);
+     if(cyc <= (1 + !tile))
+      tmp[0] = VCLast[0];
+    }
+   }
+
+   // NBG1
+   if(vcon[1])
+   {
+    if(cyc == 4)
+     LB.vcscr[1][tile] = ((base[1] + tmp[1]) >> 8);
+
+    if(cyc == 4)
+     tmp[1] = VCLast[1];
+
+    if(act == VCP_NBG1_VCS)
+    {
+     VCLast[1] = (VRAM[vcaddr + 0] << 8) | (VRAM[vcaddr + 1] >> 8);
+     if(cyc <= 2) //(2 + !tile)) // TODO: Check
+      tmp[1] = VCLast[1];
+    }
+   }
+
+   vcaddr = (vcaddr + inc[cyc]) & 0x3FFFE;
+  }
+ }
+}
+
+/* MakeSFCodeLUT: was a `template<unsigned TA_PrioMode, unsigned TA_CCMode>`
+ * INLINE helper.  Body branches on (TA_PrioMode & 2) and (TA_CCMode == 2)
+ * which the compiler folds per instantiation, so the template produced
+ * one specialized loop per (PrioMode, CCMode) combination.  Macro form
+ * does the same -- the compiler sees the branch conditions as constant
+ * expressions from the macro argument substitution and folds them at
+ * the call site.  Yields byte-identical .o vs the template version.
+ *
+ * Note: macro emits a `{ ... }` block, so call sites that wrote
+ * `MAKE_SFCODE_LUT(a, b, c, d);` become `MAKE_SFCODE_LUT(a, b, c, d);` --
+ * the trailing `;` becomes an empty statement after the block. */
+/* Explicit-unroll SLP-friendly form: the original `for(i=0;i<8;i++)` body
+ * carried a variable shift `(MK_SF_code >> i)` per iteration, which kept
+ * GCC from packing the eight uint16_t stores.  Computing the lane mask via
+ * `-((c>>i)&1)` against a precomputed flip-pattern lets each of the eight
+ * stores share the same shape with a constant shift -- SLP packs them into
+ * one (or two) 128-bit stores.  When the spec collapses MK_SF_off to
+ * 0xFFFF (the common PrioMode/CCMode pairing where neither bit clears)
+ * the whole block folds to a single broadcast/store. */
+#define MAKE_SFCODE_LUT(TA_PrioMode, TA_CCMode, layer, sfcode_lut)                                    \
+{                                                                                                     \
+ const uint32_t MK_SF_off  = 0xFFFFu                                                                  \
+                            & ~(((TA_PrioMode) & 2) ? (1U << PIX_PRIO_SHIFT) : 0u)                    \
+                            & ~(((TA_CCMode) == 2)  ? (1U << PIX_CCE_SHIFT)  : 0u);                   \
+ const uint32_t MK_SF_flip = 0xFFFFu ^ MK_SF_off;                                                     \
+ const uint32_t MK_SF_c    = SFCODE >> (((SFSEL >> (layer)) & 1) << 3);                               \
+                                                                                                      \
+ (sfcode_lut)[0] = (int16_t)(MK_SF_off | ((0u - ((MK_SF_c >> 0) & 1u)) & MK_SF_flip));                \
+ (sfcode_lut)[1] = (int16_t)(MK_SF_off | ((0u - ((MK_SF_c >> 1) & 1u)) & MK_SF_flip));                \
+ (sfcode_lut)[2] = (int16_t)(MK_SF_off | ((0u - ((MK_SF_c >> 2) & 1u)) & MK_SF_flip));                \
+ (sfcode_lut)[3] = (int16_t)(MK_SF_off | ((0u - ((MK_SF_c >> 3) & 1u)) & MK_SF_flip));                \
+ (sfcode_lut)[4] = (int16_t)(MK_SF_off | ((0u - ((MK_SF_c >> 4) & 1u)) & MK_SF_flip));                \
+ (sfcode_lut)[5] = (int16_t)(MK_SF_off | ((0u - ((MK_SF_c >> 5) & 1u)) & MK_SF_flip));                \
+ (sfcode_lut)[6] = (int16_t)(MK_SF_off | ((0u - ((MK_SF_c >> 6) & 1u)) & MK_SF_flip));                \
+ (sfcode_lut)[7] = (int16_t)(MK_SF_off | ((0u - ((MK_SF_c >> 7) & 1u)) & MK_SF_flip));                \
+}
+
+static INLINE uint32_t rgb15_to_rgb24(uint16_t src)
+{
+ return ((((src << 3) & 0xF8) | ((src << 6) & 0xF800) | ((src << 9) & 0xF80000) | ((src << 16) & 0x80000000)));;
+}
+
+/* MakeNBGRBGPix: was a templated INLINE function with six
+ * non-type template parameters (TA_bmen, TA_bpp, TA_isrgb,
+ * TA_igntp, TA_PrioMode, TA_CCMode) plus a type parameter T
+ * naming the TileFetcher_{Rot,NonRot} struct, returning the
+ * 64-bit composited pixel.  Always called as the body of a
+ * tight per-pixel loop inside T_DrawNBG / T_DrawRBG /
+ * T_DrawRBG_CAB; the INLINE hint coupled with -O2 made the
+ * compiler inline every call site fully, with each spec's
+ * template-arg-dependent branches constant-folded away.
+ *
+ * Replaced here with a do-while macro that takes the same
+ * six non-type args plus the destination lvalue, the tf
+ * struct (any TileFetcher_{Rot,NonRot}), and the tail
+ * arguments.  TA_bmen was an unused parameter in the body
+ * (the bmen state is captured upstream in TileFetcher_*_Fetch
+ * via tf.cellx_xor, tf.tile_vrb, tf.scc, tf.spr, tf.pcco),
+ * but we still accept BMEN in the macro signature so the
+ * call sites read the same as the template-call sites did.
+ *
+ * Outer do { ... } while(0) makes the macro a single
+ * statement and gives the inner locals (cellx, vrb, pbor,
+ * rgb24, opaque, tmp, dcc) their own block scope.  No
+ * variable-name collision with the surrounding T_Draw* body
+ * macros' locals (which use ix, iy, i, bgbuf, pix_base_or,
+ * sfcode_lut, tf -- the latter three are macro args and
+ * resolve to the caller's locals by name-binding).
+ *
+ * Codegen-equivalent to the template-instantiated INLINE
+ * function: each macro expansion sees BPP/ISRGB/IGNTP/PMODE/
+ * CCMODE as 4/0|1/0|1/0|1|2/0|1|2|3 literals, the branches
+ * fold, and the surviving statements get scheduled into the
+ * surrounding loop the same way the inlined function body
+ * was. */
+#define MAKE_NBGRBG_PIX(DEST, BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, tf, pix_base_or, sfcode_lut, ix, iy) \
+do                                                                                                                                          \
+{                                                                                                                                           \
+ uint32_t cellx = ((ix) ^ (tf)->cellx_xor);                                                                                                    \
+ const uint16_t* vrb = &(tf)->tile_vrb[((cellx * (BPP)) >> 4)];                                                                                \
+/* */                                                                                                                                       \
+/* */                                                                                                                                       \
+/* */                                                                                                                                       \
+ uint32_t pbor = pix_base_or;                                                                                                               \
+ uint32_t rgb24;                                                                                                                            \
+ bool opaque;                                                                                                                               \
+                                                                                                                                           \
+ if((CCMODE) == 1 || ((CCMODE) == 2 && !(ISRGB)))                                                                                           \
+  pbor |= ((tf)->scc << PIX_CCE_SHIFT);                                                                                                        \
+                                                                                                                                           \
+ if((PMODE) == 1 || ((PMODE) == 2 && !(ISRGB)))                                                                                             \
+  pbor |= ((tf)->spr << PIX_PRIO_SHIFT);                                                                                                       \
+                                                                                                                                           \
+ if((ISRGB))                                                                                                                                \
+ {                                                                                                                                          \
+  if((BPP) == 32)                                                                                                                           \
+  {                                                                                                                                         \
+   uint32_t tmp = (vrb[0] << 16) | vrb[1];                                                                                                  \
+                                                                                                                                           \
+   rgb24 = tmp & 0xFFFFFF;                                                                                                                  \
+   opaque = (bool)(tmp & 0x80000000);                                                                                                       \
+  }                                                                                                                                         \
+  else                                                                                                                                      \
+  {                                                                                                                                         \
+   uint32_t tmp = vrb[0];                                                                                                                   \
+                                                                                                                                           \
+   rgb24 = rgb15_to_rgb24(tmp & 0x7FFF);                                                                                                    \
+   opaque = (bool)(tmp & 0x8000);                                                                                                           \
+  }                                                                                                                                         \
+                                                                                                                                           \
+  if((CCMODE) == 3)                                                                                                                         \
+   pbor |= (1 << PIX_CCE_SHIFT);                                                                                                            \
+ }                                                                                                                                          \
+ else                                                                                                                                       \
+ {                                                                                                                                          \
+  uint32_t dcc;                                                                                                                             \
+  uint32_t tmp = vrb[0]; /* charno ^ (charno << 8); vrb[0]; */                                                                              \
+                                                                                                                                           \
+  if((BPP) == 16)                                                                                                                           \
+   dcc = tmp & 0x7FF;                                                                                                                       \
+  else if((BPP) == 8)                                                                                                                       \
+   dcc = (tmp >> (((cellx & 1) ^ 1) << 3)) & 0xFF;                                                                                          \
+  else                                                                                                                                      \
+   dcc = (tmp >> (((cellx & 3) ^ 3) << 2)) & 0x0F;                                                                                          \
+                                                                                                                                           \
+  opaque = (bool)dcc;                                                                                                                       \
+                                                                                                                                           \
+  rgb24 = ColorCache[((tf)->pcco + dcc) & 2047];                                                                                               \
+                                                                                                                                           \
+  if((CCMODE) == 3)                                                                                                                         \
+   pbor |= ((int32_t)rgb24 >> 31) & (1 << PIX_CCE_SHIFT);                                                                                   \
+/* */                                                                                                                                       \
+  if((PMODE) == 2 || (CCMODE) == 2)                                                                                                         \
+   pbor &= *(const int16_t*)((const uint8_t*)sfcode_lut + (dcc & 0xE));                                                                     \
+ }                                                                                                                                          \
+                                                                                                                                           \
+ if(!(IGNTP) && !opaque)                                                                                                                    \
+  pbor = 0;                                                                                                                                 \
+                                                                                                                                           \
+ (DEST) = pbor | ((uint64_t)rgb24 << PIX_RGB_SHIFT);                                                                                        \
+} while(0)
+
+/* DrawCell8_BPP4: 8 paletted pixels for one BPP=4 cell row, shared by
+ * T_DrawNBG23_BODY (8-px tile body) and T_DrawNBG_BODY's xcinc==0x100
+ * cell-aligned fast path (BPP=4 branch).
+ *
+ * Per-pixel work matches MAKE_NBG23_PIX exactly (and MAKE_NBGRBG_PIX with
+ * BPP=4, ISRGB=0, which has identical semantics for the paletted path):
+ *   dcc    = nibble extracted from (vrb0<<16)|vrb1 in big-endian nibble order
+ *   rgb24  = ColorCache[(pcco + dcc) & 2047]
+ *   if CCMODE==3:               pbor |= ((int32_t)rgb24>>31) & (1<<PIX_CCE_SHIFT)
+ *   if PMODE==2 || CCMODE==2:   pbor &= sfcode_lut[(dcc & 0xE)/2]
+ *   if !IGNTP && dcc==0:        pbor = 0
+ *   out[k] = pbor + ((uint64_t)rgb24 << PIX_RGB_SHIFT)
+ *
+ * Callers must pre-merge CCMODE-1/2 SCC bits and PMODE-1/2 SPR bits into
+ * pbor_in, matching MAKE_NBG23_PIX / MAKE_NBGRBG_PIX's per-pixel OR.
+ *
+ * REV=true is the cellx_xor & 0x7 case: writes out[7]..out[0] instead of
+ * out[0]..out[7].
+ *
+ * aarch64 fast path: 16 ColorCache entries are contiguous when
+ * (pcco & 2047) <= 2032, fitting in 4 q-regs; vqtbl4q_u8 performs all 8
+ * gathers in one TBL.  The wrap case (pcco_m in [2033..2047]) falls back to
+ * scalar.  On amd64 / others the scalar fallback runs unconditionally, which
+ * is codegen-equivalent to the 8 inlined MAKE_NBG{,RBG}_PIX stamps it replaces. */
+static MDFN_FORCE_INLINE void DrawCell8_BPP4(uint64_t* out,
+                                             uint32_t pcco,
+                                             uint16_t vrb0,
+                                             uint16_t vrb1,
+                                             uint32_t pbor_in,
+                                             const int16_t* sfcode_lut,
+                                             const bool IGNTP,
+                                             const unsigned PMODE,
+                                             const unsigned CCMODE,
+                                             const bool REV)
+{
+ const uint8_t nibbles[8] = {
+  (uint8_t)((vrb0 >> 12) & 0xF),
+  (uint8_t)((vrb0 >>  8) & 0xF),
+  (uint8_t)((vrb0 >>  4) & 0xF),
+  (uint8_t)((vrb0 >>  0) & 0xF),
+  (uint8_t)((vrb1 >> 12) & 0xF),
+  (uint8_t)((vrb1 >>  8) & 0xF),
+  (uint8_t)((vrb1 >>  4) & 0xF),
+  (uint8_t)((vrb1 >>  0) & 0xF),
+ };
+
+#if defined(__aarch64__)
+ const uint32_t pcco_m = pcco & 2047;
+ if(MDFN_LIKELY(pcco_m <= 2032))
+ {
+  const uint8_t* const cc_base = (const uint8_t*)&ColorCache[pcco_m];
+  uint8x16x4_t cc4;
+  cc4.val[0] = vld1q_u8(cc_base +  0);
+  cc4.val[1] = vld1q_u8(cc_base + 16);
+  cc4.val[2] = vld1q_u8(cc_base + 32);
+  cc4.val[3] = vld1q_u8(cc_base + 48);
+
+  /* nv carries the 8 dcc values in output order; for REV the source-order
+   * nibbles vector is reversed once so all downstream lanes are already
+   * indexed by the destination pixel slot. */
+  const uint8x8_t nv_src = vld1_u8(nibbles);
+  const uint8x8_t nv = REV ? vrev64_u8(nv_src) : nv_src;
+
+  /* Build 32 byte indices over two q-regs (4 pixels * 4 bytes per reg).
+   * idx[4*k + j] = nv[k]*4 + j, j in 0..3.  For dcc in 0..15 the maximum
+   * index is 63, within the 64-byte (4 q-reg) vqtbl4q lookup span. */
+  static const uint8x16_t broadcast4_lo = {0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3};
+  static const uint8x16_t broadcast4_hi = {4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7};
+  static const uint8x16_t byte_off      = {0,1,2,3, 0,1,2,3, 0,1,2,3, 0,1,2,3};
+  const uint8x16_t nv_q  = vcombine_u8(nv, vdup_n_u8(0));
+  const uint8x16_t idx_lo = vaddq_u8(vshlq_n_u8(vqtbl1q_u8(nv_q, broadcast4_lo), 2), byte_off);
+  const uint8x16_t idx_hi = vaddq_u8(vshlq_n_u8(vqtbl1q_u8(nv_q, broadcast4_hi), 2), byte_off);
+
+  const uint32x4_t rgb_lo = vreinterpretq_u32_u8(vqtbl4q_u8(cc4, idx_lo));
+  const uint32x4_t rgb_hi = vreinterpretq_u32_u8(vqtbl4q_u8(cc4, idx_hi));
+
+  uint32x4_t pbor_lo = vdupq_n_u32(pbor_in);
+  uint32x4_t pbor_hi = vdupq_n_u32(pbor_in);
+
+  if(CCMODE == 3)
+  {
+   const int32x4_t sb_lo = vshrq_n_s32(vreinterpretq_s32_u32(rgb_lo), 31);
+   const int32x4_t sb_hi = vshrq_n_s32(vreinterpretq_s32_u32(rgb_hi), 31);
+   const uint32x4_t cc_mask = vdupq_n_u32(1U << PIX_CCE_SHIFT);
+   pbor_lo = vorrq_u32(pbor_lo, vandq_u32(vreinterpretq_u32_s32(sb_lo), cc_mask));
+   pbor_hi = vorrq_u32(pbor_hi, vandq_u32(vreinterpretq_u32_s32(sb_hi), cc_mask));
+  }
+
+  if(PMODE == 2 || CCMODE == 2)
+  {
+   /* 8 small i16 loads from sfcode_lut; SLP-pack into one i32x4 per half. */
+   uint8_t nv_arr[8];
+   uint32_t m[8];
+   vst1_u8(nv_arr, nv);
+   for(unsigned i = 0; i < 8; i++)
+    m[i] = (uint32_t)(int32_t)(*(const int16_t*)((const uint8_t*)sfcode_lut + (nv_arr[i] & 0xE)));
+   pbor_lo = vandq_u32(pbor_lo, vld1q_u32(m));
+   pbor_hi = vandq_u32(pbor_hi, vld1q_u32(m + 4));
+  }
+
+  if(!IGNTP)
+  {
+   /* pbor zeroed where dcc==0.  Build the clear-mask at u32 width directly:
+    * unsigned-widen nv (u8 -> u16 -> u32), then vceqq_u32 against 0 produces
+    * a proper 0xFFFFFFFF / 0x00000000 mask.  The earlier u8-0xFF + unsigned
+    * widening path produced 0x000000FF, which only cleared the low 8 bits and
+    * silently dropped pbor's PRIO/CCE/SWBIT bits on every opaque pixel. */
+   const uint16x8_t nv16    = vmovl_u8(nv);
+   const uint32x4_t nv32_lo = vmovl_u16(vget_low_u16(nv16));
+   const uint32x4_t nv32_hi = vmovl_u16(vget_high_u16(nv16));
+   const uint32x4_t clear_lo = vceqq_u32(nv32_lo, vdupq_n_u32(0));
+   const uint32x4_t clear_hi = vceqq_u32(nv32_hi, vdupq_n_u32(0));
+   pbor_lo = vbicq_u32(pbor_lo, clear_lo);
+   pbor_hi = vbicq_u32(pbor_hi, clear_hi);
+  }
+
+  /* Interleave pbor (low 32) and rgb24 (high 32) into each u64 output. */
+  vst1q_u64(&out[0], vreinterpretq_u64_u32(vzip1q_u32(pbor_lo, rgb_lo)));
+  vst1q_u64(&out[2], vreinterpretq_u64_u32(vzip2q_u32(pbor_lo, rgb_lo)));
+  vst1q_u64(&out[4], vreinterpretq_u64_u32(vzip1q_u32(pbor_hi, rgb_hi)));
+  vst1q_u64(&out[6], vreinterpretq_u64_u32(vzip2q_u32(pbor_hi, rgb_hi)));
+  return;
+ }
+#endif
+
+ /* Scalar fallback (wrap case on aarch64, baseline elsewhere). */
+ for(unsigned k = 0; k < 8; k++)
+ {
+  const unsigned dest = REV ? (7U - k) : k;
+  const uint32_t dcc   = nibbles[k];
+  const uint32_t rgb24 = ColorCache[(pcco + dcc) & 2047];
+  uint32_t pbor = pbor_in;
+  if(CCMODE == 3)
+   pbor |= ((int32_t)rgb24 >> 31) & (1 << PIX_CCE_SHIFT);
+  if(PMODE == 2 || CCMODE == 2)
+   pbor &= *(const int16_t*)((const uint8_t*)sfcode_lut + (dcc & 0xE));
+  if(!IGNTP && !dcc)
+   pbor = 0;
+  out[dest] = pbor + ((uint64_t)rgb24 << PIX_RGB_SHIFT);
+ }
+}
+
+/* T_DrawNBG: was `template<bool TA_bmen, unsigned TA_bpp, bool
+ * TA_isrgb, bool TA_igntp, unsigned TA_PrioMode, unsigned TA_CCMode>
+ * static void T_DrawNBG(const unsigned n, uint64_t* bgbuf,
+ * const unsigned w, const uint32_t pix_base_or)`.  240 specs:
+ * bmen in {0,1}, color-mode in 0..4 ((BPP, ISRGB) is one of
+ * (4,0), (8,0), (16,0), (16,1), (32,1)), igntp in {0,1},
+ * PrioMode in {0..2}, CCMode in {0..3}.
+ *
+ * Converted via the same X-macro pattern as T_DrawRBG_ConstAB
+ * (existing precedent in this file).  Five-dimensional descent:
+ * BMEN -> CM -> IGNTP -> PMODE -> CCMODE, with CM enumerating
+ * the (BPP, ISRGB) pairs.  Function-name suffix uses CM, not
+ * (BPP, ISRGB), matching the T_DrawRBG_CAB convention.
+ *
+ * Body's `tf.Start()` and `tf.Fetch<BPP>(...)` calls were converted
+ * to TileFetcher_NonRot_Start / TF_NR_FETCH by phase 4a; the body
+ * now references the new struct `TileFetcher_NonRot`.  MakeNBGRBGPix
+ * is still a template, converted next as phase 4b.
+ *
+ * Line-comments rewritten as block-comments for line-spliced macro
+ * safety, same as T_DrawNBG23_BODY and the existing T_DrawRBG_CAB. */
+#define T_DrawNBG_BODY(BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE) \
+{                                                                                                                       \
+ assert(n < 2);                                                                                                         \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+ const bool VCSEn = ((SCRCTL >> (n << 3)) & 0x1) && !(MZCTL & (1U << n));                                               \
+/* */                                                                                                                   \
+ struct TileFetcher_NonRot tf;                                                                                                         \
+ uint32_t xcinc;                                                                                                        \
+ uint32_t xc;                                                                                                           \
+ uint32_t iy;                                                                                                           \
+ int16_t sfcode_lut[8];                                                                                                 \
+                                                                                                                       \
+ tf.CRAOffs = CRAMAddrOffs_NBG[n] << 8;                                                                                 \
+/* */                                                                                                                   \
+ tf.BMSCC = ((BMPNA >> (4 + (n << 3))) & 1);                                                                            \
+ tf.BMSPR = ((BMPNA >> (5 + (n << 3))) & 1);                                                                            \
+ tf.BMPalNo = ((BMPNA >> (0 + (n << 3))) & 0x7) << 4;                                                                   \
+ tf.BMSize = ((CHCTLA >> (2 + (n << 3))) & 0x3);                                                                        \
+/* */                                                                                                                   \
+ tf.PlaneSize = (PLSZ >> (n << 1)) & 0x3;                                                                               \
+ tf.PNDSize = (PNCN[n] >> 15) & 1; /* 0 = 2 words, 1 = 1 word */                                                        \
+ tf.CharSize = ((CHCTLA >> (0 + (n << 3))) & 1);                                                                        \
+ tf.AuxMode = (PNCN[n] >> 14) & 1;                                                                                      \
+ tf.Supp = (PNCN[n] & 0x3FF); /* Supplement bits when PNDSize == 1 */                                                   \
+/* */                                                                                                                   \
+ TileFetcher_NonRot_Start(&tf, n, (BMEN), (MPOFN >> (n << 2)) & 0x7, MapRegs[n]);                                                            \
+                                                                                                                       \
+ MAKE_SFCODE_LUT((PMODE), (CCMODE), n, sfcode_lut);                                                                     \
+                                                                                                                       \
+ xc = CurXScrollIF[n];                                                                                                  \
+ iy = (CurYScrollIF[n] + MosEff_YCoordAccum[n]) >> 8;                                                                   \
+ xcinc = CurXCoordInc[n];                                                                                               \
+                                                                                                                       \
+/* Map: 2x2 planes */                                                                                                   \
+/* Plane: 1x1, 2x1, or 2x2 pages */                                                                                     \
+/* Page: 64x64 cells */                                                                                                 \
+/* Character: 1x1, 2x2 cells */                                                                                         \
+/* Cell: 8x8 dots */                                                                                                    \
+ uint32_t prev_ix = ~0U;                                                                                                \
+                                                                                                                       \
+ if(((ZMCTL >> (n << 3)) & 0x3) && VCSEn)                                                                               \
+ {                                                                                                                      \
+  /* CACHE FIX (#71): tile_vrb depends on (celly = iy & 7) in tile mode and             \
+   * varies bit-wise on (ix, iy) in bitmap mode, neither captured by                    \
+   * (celli, cellj) alone.  Key extended to full `iy` (catches iy & 7); bitmap         \
+   * mode bypassed via compile-time `(BMEN) ||` in the predicate. */                     \
+  uint32_t prev_celli = ~0u;                                                                                            \
+  uint32_t prev_iy    = ~0u;                                                                                            \
+                                                                                                                        \
+  for(unsigned i = 0; MDFN_LIKELY(i < w); i++)                                                                          \
+  {                                                                                                                     \
+   const uint32_t ix = xc >> 8;                                                                                         \
+   iy = LB.vcscr[n][i >> 3];                                                                                            \
+   const uint32_t celli = ix >> 3;                                                                                      \
+                                                                                                                        \
+   if((BMEN) || celli != prev_celli || iy != prev_iy)                                                                   \
+   {                                                                                                                    \
+    prev_celli = celli;                                                                                                 \
+    prev_iy    = iy;                                                                                                    \
+    TF_NR_FETCH(&tf, BPP, (BMEN), ix, iy);                                                                              \
+   }                                                                                                                    \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+   MAKE_NBGRBG_PIX(bgbuf[i], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix, iy);             \
+   xc += xcinc;                                                                                                         \
+  }                                                                                                                     \
+ }                                                                                                                      \
+ else if(xcinc == 0x100 && !VCSEn)                                                                                      \
+ {                                                                                                                      \
+/* Cell-aligned 8-px fast path: 1:1 horizontal scroll, no vertical cell scroll. */                                      \
+/* Eliminates the per-pixel cell-cross branch by splitting into head / 8-px body */                                     \
+/* / tail.  iy is constant across the run.  Each block issues exactly one        */                                     \
+/* TF_NR_FETCH before unrolled MAKE_NBGRBG_PIX calls with ix+0..ix+7.            */                                     \
+  uint32_t ix = xc >> 8;                                                                                                \
+  unsigned i = 0;                                                                                                       \
+  unsigned head_n = (8U - (ix & 7U)) & 7U;                                                                              \
+  if(head_n > w) head_n = w;                                                                                            \
+  if(head_n)                                                                                                            \
+  {                                                                                                                     \
+   TF_NR_FETCH(&tf, BPP, (BMEN), ix, iy);                                                                               \
+   for(unsigned k = 0; k < head_n; k++)                                                                                 \
+    MAKE_NBGRBG_PIX(bgbuf[i + k], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + k, iy);    \
+   i += head_n; ix += head_n;                                                                                           \
+  }                                                                                                                     \
+  while(i + 8U <= w)                                                                                                    \
+  {                                                                                                                     \
+   TF_NR_FETCH(&tf, BPP, (BMEN), ix, iy);                                                                               \
+   if((BPP) == 4)                                                                                                       \
+   {                                                                                                                    \
+/* BPP=4 cell body: dispatch to NEON-TBL helper (shared with T_DrawNBG23).         */                                   \
+/* Pre-merge SCC/SPR bits into pbor here, matching NBG23's per-cell prologue, so   */                                   \
+/* DrawCell8_BPP4 sees the same pbor_in contract.  CCMODE==3 / PMODE==2 / IGNTP==0 */                                   \
+/* are handled inside the helper.                                                  */                                   \
+    uint32_t pbor_pre = pix_base_or;                                                                                    \
+    if((CCMODE) == 1 || (CCMODE) == 2) pbor_pre |= (tf.scc << PIX_CCE_SHIFT);                                           \
+    if((PMODE)  == 1 || (PMODE)  == 2) pbor_pre |= (tf.spr << PIX_PRIO_SHIFT);                                          \
+    if(tf.cellx_xor & 0x7)                                                                                              \
+     DrawCell8_BPP4(&bgbuf[i], tf.pcco, tf.tile_vrb[0], tf.tile_vrb[1], pbor_pre, sfcode_lut, (bool)(IGNTP), (PMODE), (CCMODE), true ); \
+    else                                                                                                                \
+     DrawCell8_BPP4(&bgbuf[i], tf.pcco, tf.tile_vrb[0], tf.tile_vrb[1], pbor_pre, sfcode_lut, (bool)(IGNTP), (PMODE), (CCMODE), false); \
+   }                                                                                                                    \
+   else                                                                                                                 \
+   {                                                                                                                    \
+    MAKE_NBGRBG_PIX(bgbuf[i + 0], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + 0, iy);    \
+    MAKE_NBGRBG_PIX(bgbuf[i + 1], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + 1, iy);    \
+    MAKE_NBGRBG_PIX(bgbuf[i + 2], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + 2, iy);    \
+    MAKE_NBGRBG_PIX(bgbuf[i + 3], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + 3, iy);    \
+    MAKE_NBGRBG_PIX(bgbuf[i + 4], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + 4, iy);    \
+    MAKE_NBGRBG_PIX(bgbuf[i + 5], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + 5, iy);    \
+    MAKE_NBGRBG_PIX(bgbuf[i + 6], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + 6, iy);    \
+    MAKE_NBGRBG_PIX(bgbuf[i + 7], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + 7, iy);    \
+   }                                                                                                                    \
+   i += 8U; ix += 8U;                                                                                                   \
+  }                                                                                                                     \
+  if(i < w)                                                                                                             \
+  {                                                                                                                     \
+   const unsigned tail_n = w - i;                                                                                       \
+   TF_NR_FETCH(&tf, BPP, (BMEN), ix, iy);                                                                               \
+   for(unsigned k = 0; k < tail_n; k++)                                                                                 \
+    MAKE_NBGRBG_PIX(bgbuf[i + k], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix + k, iy);    \
+  }                                                                                                                     \
+ }                                                                                                                      \
+ else                                                                                                                   \
+ {                                                                                                                      \
+  for(unsigned i = 0; MDFN_LIKELY(i < w); i++)                                                                          \
+  {                                                                                                                     \
+   const uint32_t ix = xc >> 8;                                                                                         \
+                                                                                                                       \
+   if((ix >> 3) != prev_ix)                                                                                             \
+   {                                                                                                                    \
+    prev_ix = ix >> 3;                                                                                                  \
+/* */                                                                                                                   \
+    if(VCSEn)                                                                                                           \
+     iy = LB.vcscr[n][(i + 7) >> 3];                                                                                    \
+                                                                                                                       \
+    TF_NR_FETCH(&tf, BPP, (BMEN), ix, iy);                                                                                    \
+   }                                                                                                                    \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+   MAKE_NBGRBG_PIX(bgbuf[i], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, &tf, pix_base_or, sfcode_lut, ix, iy);           \
+   xc += xcinc;                                                                                                         \
+  }                                                                                                                     \
+ }                                                                                                                      \
+}
+
+#define T_DrawNBG_NAME(BMEN, CM, IGNTP, PMODE, CCMODE) \
+ T_DrawNBG_##BMEN##_##CM##_##IGNTP##_##PMODE##_##CCMODE
+
+#define DEFINE_T_DrawNBG(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, CCMODE)                              \
+ static void T_DrawNBG_NAME(BMEN, CM, IGNTP, PMODE, CCMODE)(const unsigned n, uint64_t* bgbuf,    \
+                                                            const unsigned w,                     \
+                                                            const uint32_t pix_base_or)           \
+ T_DrawNBG_BODY(BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE)
+
+/* One-level enumerators.  Match the DRBG_ENUM_* shape pioneered for
+ * T_DrawRBG_ConstAB. */
+#define DNBG_ENUM_CC(M, BMEN, CM, BPP, ISRGB, IGNTP, PMODE) \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 0)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 1)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 2)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 3)
+
+#define DNBG_ENUM_PM(M, BMEN, CM, BPP, ISRGB, IGNTP) \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, 0)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, 1)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, 2)
+
+#define DNBG_ENUM_IG(M, BMEN, CM, BPP, ISRGB) \
+ M(BMEN, CM, BPP, ISRGB, 0)                   \
+ M(BMEN, CM, BPP, ISRGB, 1)
+
+#define DNBG_ENUM_CM(M, BMEN) \
+ M(BMEN, 0, 4,  0)            \
+ M(BMEN, 1, 8,  0)            \
+ M(BMEN, 2, 16, 0)            \
+ M(BMEN, 3, 16, 1)            \
+ M(BMEN, 4, 32, 1)
+
+/* Function-definition composition: descend through every level,
+ * invoking DEFINE_T_DrawNBG at the leaf. */
+#define DNBG_FN_AT_PM(BMEN, CM, BPP, ISRGB, IGNTP, PMODE) DNBG_ENUM_CC(DEFINE_T_DrawNBG, BMEN, CM, BPP, ISRGB, IGNTP, PMODE)
+#define DNBG_FN_AT_IG(BMEN, CM, BPP, ISRGB, IGNTP)        DNBG_ENUM_PM(DNBG_FN_AT_PM, BMEN, CM, BPP, ISRGB, IGNTP)
+#define DNBG_FN_AT_CM(BMEN, CM, BPP, ISRGB)               DNBG_ENUM_IG(DNBG_FN_AT_IG, BMEN, CM, BPP, ISRGB)
+#define DNBG_FN_AT_BM(BMEN)                               DNBG_ENUM_CM(DNBG_FN_AT_CM, BMEN)
+
+DNBG_FN_AT_BM(0)
+DNBG_FN_AT_BM(1)
+
+/* Table composition: same descent but each non-leaf wraps its inner
+ * expansion in braces, producing the nested [2][5][2][3][4] initializer. */
+#define DNBG_TBL_AT_CC(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, CCMODE) T_DrawNBG_NAME(BMEN, CM, IGNTP, PMODE, CCMODE),
+#define DNBG_TBL_AT_PM(BMEN, CM, BPP, ISRGB, IGNTP, PMODE) { DNBG_ENUM_CC(DNBG_TBL_AT_CC, BMEN, CM, BPP, ISRGB, IGNTP, PMODE) },
+#define DNBG_TBL_AT_IG(BMEN, CM, BPP, ISRGB, IGNTP)        { DNBG_ENUM_PM(DNBG_TBL_AT_PM, BMEN, CM, BPP, ISRGB, IGNTP) },
+#define DNBG_TBL_AT_CM(BMEN, CM, BPP, ISRGB)               { DNBG_ENUM_IG(DNBG_TBL_AT_IG, BMEN, CM, BPP, ISRGB) },
+#define DNBG_TBL_AT_BM(BMEN)                               { DNBG_ENUM_CM(DNBG_TBL_AT_CM, BMEN) },
+
+/*
+   External background.
+
+   The Video CD Card's decoded picture enters VDP2 here.  It is not an
+   overlay: the external image replaces NBG1's data source and keeps
+   NBG1's priority, window, mosaic and colour-calculation registers, so
+   writing it into LB.nbg[1] in the ordinary linebuffer format is all
+   that is needed -- everything downstream is unchanged.
+
+   The card's picture is 352 wide against a 320 or 352 pixel display, so
+   the window registers place it and the border colour fills whatever it
+   does not cover.  Source and destination origins come from SET_WINDOW.
+*/
+/* Sample one source pixel, applying the soften filter when SET_VIDEO_
+   EFFECTS asks for it.  Soften is a 3-tap box across the enabled axes,
+   clamped at the picture edges -- CDC_MPSOFT_ON is a plain switch with
+   no strength parameter, so a symmetric one-tap-either-side average is
+   the only reading of it that does not invent a knob. */
+static INLINE uint32_t SampleEXBG(const uint16_t *row, const uint8_t *lrow,
+                                  const int32_t sx, const int32_t sy,
+                                  const uint32_t fw, const uint32_t fh,
+                                  const MPEG_DisplayState *ds)
+{
+   uint32_t acc_r, acc_g, acc_b, n;
+   int32_t dx, dy;
+   const int32_t hspan = ds->soft_h ? 1 : 0;
+   const int32_t vspan = ds->soft_v ? 1 : 0;
+
+   (void)lrow;
+
+   if(!hspan && !vspan)
+      return rgb15_to_rgb24(row[sx] & 0x7FFF);
+
+   acc_r = acc_g = acc_b = n = 0;
+
+   for(dy = -vspan; dy <= vspan; dy++)
+   {
+      const int32_t yy = sy + dy;
+      const uint16_t *r2;
+
+      if(yy < 0 || (uint32_t)yy >= fh)
+         continue;
+
+      r2 = row + (ptrdiff_t)dy * MPEG_MAX_WIDTH;
+
+      for(dx = -hspan; dx <= hspan; dx++)
+      {
+         const int32_t xx = sx + dx;
+         uint32_t c;
+
+         if(xx < 0 || (uint32_t)xx >= fw)
+            continue;
+
+         c = rgb15_to_rgb24(r2[xx] & 0x7FFF);
+
+         acc_r += c & 0xFF;
+         acc_g += (c >> 8) & 0xFF;
+         acc_b += (c >> 16) & 0xFF;
+         n++;
+      }
+   }
+
+   if(!n)
+      return rgb15_to_rgb24(row[sx] & 0x7FFF);
+
+   return (acc_r / n) | ((acc_g / n) << 8) | ((acc_b / n) << 16);
+}
+
+static void DrawEXBG(uint64_t *bgbuf, const unsigned w, const uint32_t pix_base_or,
+                     const unsigned line)
+{
+   const MPEG_DisplayState *ds = MPEG_GetDisplayState();
+   uint32_t fw = 0, fh = 0;
+   const uint16_t *fb = MPEG_GetFrame(&fw, &fh);
+   const uint64_t border = (uint64_t)pix_base_or
+                         | ((uint64_t)rgb15_to_rgb24(ds->border_color & 0x7FFF) << PIX_RGB_SHIFT);
+   unsigned x;
+   int32_t sy;
+
+   if(!fb || !MPEG_MapRow(ds, line, fh, &sy))
+   {
+      for(x = 0; x < w; x++)
+         bgbuf[x] = border;
+      return;
+   }
+
+   {
+      const uint8_t *luma = MPEG_GetFrameLuma();
+      const uint16_t *src = fb + (size_t)sy * MPEG_MAX_WIDTH;
+      const uint8_t  *lsrc = luma ? (luma + (size_t)sy * MPEG_MAX_WIDTH) : NULL;
+      const unsigned trp = ds->trp & MPEG_TRP_MASK;
+
+      for(x = 0; x < w; x++)
+      {
+         int32_t sx;
+
+         if(!MPEG_MapCol(ds, x, fw, &sx))
+         {
+            bgbuf[x] = border;
+            continue;
+         }
+
+         /* Luminance key. Pixels below the threshold become fully
+            transparent -- a zero linebuffer entry, which is how a
+            disabled layer is represented, so lower-priority layers show
+            through rather than the border colour. CDC_MPTRP_MAG, which
+            dilates the keyed region, is not applied. */
+         if(trp != MPEG_TRP_DFL && lsrc)
+         {
+            static const unsigned thresh[4] = { 0, 64, 128, 256 };
+
+            if((unsigned)lsrc[sx] < thresh[trp])
+            {
+               bgbuf[x] = 0;
+               continue;
+            }
+         }
+
+         {
+            uint32_t c = SampleEXBG(src, lsrc, sx, sy, fw, fh, ds);
+
+            /* Fade is a straight scale on the way out, which is what
+               MPEG_SET_FADE describes; 0xFF is unity and is the common
+               case, so keep it off the multiply path. */
+            if(ds->fade != 0xFF)
+            {
+               const uint32_t r = ((c & 0x0000FF) * ds->fade) >> 8;
+               const uint32_t g = (((c >> 8) & 0xFF) * ds->fade) >> 8;
+               const uint32_t b = (((c >> 16) & 0xFF) * ds->fade) >> 8;
+
+               c = r | (g << 8) | (b << 16);
+            }
+
+            bgbuf[x] = (uint64_t)pix_base_or | ((uint64_t)c << PIX_RGB_SHIFT);
+         }
+      }
+   }
+}
+
+static void (*DrawNBG[2 /*bitmap enable*/][5/*col mode*/][2/*igntp*/][3/*priomode*/][4/*ccmode*/])(const unsigned n, uint64_t* bgbuf, const unsigned w, const uint32_t pix_base_or) =
+{
+ DNBG_TBL_AT_BM(0)
+ DNBG_TBL_AT_BM(1)
+};
+
+#undef DNBG_TBL_AT_BM
+#undef DNBG_TBL_AT_CM
+#undef DNBG_TBL_AT_IG
+#undef DNBG_TBL_AT_PM
+#undef DNBG_TBL_AT_CC
+#undef DNBG_FN_AT_BM
+#undef DNBG_FN_AT_CM
+#undef DNBG_FN_AT_IG
+#undef DNBG_FN_AT_PM
+#undef DNBG_ENUM_CM
+#undef DNBG_ENUM_IG
+#undef DNBG_ENUM_PM
+#undef DNBG_ENUM_CC
+#undef DEFINE_T_DrawNBG
+#undef T_DrawNBG_NAME
+#undef T_DrawNBG_BODY
+
+/* MakeNBG23Pix: was `template<bool TA_igntp, unsigned TA_PrioMode,
+ * unsigned TA_CCMode> static INLINE uint64_t MakeNBG23Pix(uint32_t dcc,
+ * uint32_t pbor, const int16_t* sfcode_lut, uint32_t colcacheoffs)`.
+ * Called 16x per inner loop iteration in T_DrawNBG23 (8 per cellx_xor
+ * branch x 2 bpp paths).  Template caller cached the specialization
+ * in an `mbp` function pointer; macro form stamps the body directly
+ * at each call site, removing the per-pixel indirection.
+ *
+ * Block macro form (writes to caller-supplied out_var) -- avoids the
+ * GCC statement-expression extension so the construct stays valid
+ * under MSVC and any other standard-C99/C11 compiler.  Codegen is
+ * equivalent: the final pbor + (rgb24<<...) is assigned to out_var
+ * inside the do/while block, exactly where the template's `return`
+ * was, leaving the optimiser the same lvalue to write to.  Three
+ * branches all on macro-arg constants (folded per stamp).  Call-site
+ * args bound to local temporaries on entry, so call-site arithmetic
+ * (e.g. (uint8_t)(tf.tile_vrb[0] >> 8)) is single-evaluated. */
+#define MAKE_NBG23_PIX(out_var, TA_igntp, TA_PrioMode, TA_CCMode,                        \
+                       dcc, pbor, sfcode_lut, colcacheoffs)                              \
+ do {                                                                                    \
+  const uint32_t MK_NBG23_dcc   = (dcc);                                                 \
+  uint32_t       MK_NBG23_pbor  = (pbor);                                                \
+  const uint32_t MK_NBG23_cco   = (colcacheoffs);                                        \
+  const int16_t* const MK_NBG23_lut = (sfcode_lut);                                      \
+  const uint32_t MK_NBG23_rgb24 = ColorCache[(MK_NBG23_cco + MK_NBG23_dcc) & 2047];      \
+                                                                                         \
+  if((TA_CCMode) == 3)                                                                   \
+   MK_NBG23_pbor |= ((int32_t)MK_NBG23_rgb24 >> 31) & (1 << PIX_CCE_SHIFT);              \
+                                                                                         \
+  if((TA_PrioMode) == 2 || (TA_CCMode) == 2)                                             \
+   MK_NBG23_pbor &= *(const int16_t*)((const uint8_t*)MK_NBG23_lut + (MK_NBG23_dcc & 0xE)); \
+                                                                                         \
+  if(!(TA_igntp) && !MK_NBG23_dcc)                                                       \
+   MK_NBG23_pbor = 0;                                                                    \
+                                                                                         \
+  (out_var) = MK_NBG23_pbor + ((uint64_t)MK_NBG23_rgb24 << PIX_RGB_SHIFT);               \
+ } while(0)
+
+//
+// CCMode will be forced to 0 in the effective instantiation if corresponding NBG CCE bit in CCCTL is 0.
+//
+#define T_DrawNBG23_BODY(BPP, IGNTP, PMODE, CCMODE) \
+{                                                                                                                       \
+ assert(n >= 2);                                                                                                        \
+ struct TileFetcher_NonRot tf;                                                                                                         \
+ int16_t sfcode_lut[8];                                                                                                 \
+ unsigned tc = 1 + (w >> 3);                                                                                            \
+ const unsigned xscr = XScrollI[n];                                                                                     \
+ const unsigned yscr = MosEff_NBG23_YCounter[n & 1];                                                                    \
+ unsigned tx;                                                                                                           \
+                                                                                                                       \
+ tf.CRAOffs = CRAMAddrOffs_NBG[n] << 8;                                                                                 \
+/* */                                                                                                                   \
+ tf.PlaneSize = (PLSZ >> (n << 1)) & 0x3;                                                                               \
+ tf.PNDSize = (PNCN[n] >> 15) & 1; /* 0 = 2 words, 1 = 1 word */                                                        \
+ tf.CharSize = ((CHCTLB >> (0 + ((n & 1) << 2))) & 1);                                                                  \
+ tf.AuxMode = (PNCN[n] >> 14) & 1;                                                                                      \
+ tf.Supp = (PNCN[n] & 0x3FF); /* Supplement bits when PNDSize == 1 */                                                   \
+/* */                                                                                                                   \
+ TileFetcher_NonRot_Start(&tf, n, false, (MPOFN >> (n << 2)) & 0x7, MapRegs[n]);                                                             \
+                                                                                                                       \
+ MAKE_SFCODE_LUT((PMODE), (CCMODE), n, sfcode_lut);                                                                     \
+                                                                                                                       \
+ bgbuf -= xscr & 0x7;                                                                                                   \
+ tx = xscr >> 3;                                                                                                        \
+                                                                                                                       \
+/* */                                                                                                                   \
+/* Layer offset kludges */                                                                                              \
+/* */                                                                                                                   \
+/* Note: When/If adding new kludges, check that the NT and CG fetches for the layer each occur only in one bank, to safely handle other cases may require something more complex. */\
+ const uint32_t lok_modestuff = (VRAM_Mode << 0) | ((HRes & 0x6) << 1) | (tf.PNDSize << 4) | (tf.CharSize << 5);        \
+                                                                                                                       \
+ /* Precompute the 4 VCPRegs rows as host-endian 64-bit and 32-bit                                                      \
+  * values for the game-detection comparisons below.  Was inline                                                        \
+  * MDFN_de64lsb(VCPRegs[i]) / MDFN_de32lsb(VCPRegs[i]) on every                                                        \
+  * comparison; folded here to avoid re-doing the byte-wise LE                                                          \
+  * construction 4-16 times per call. */                                                                                \
+ const uint64_t r0_64 = (uint64_t)VCPRegs[0][0] | ((uint64_t)VCPRegs[0][1] << 8) | ((uint64_t)VCPRegs[0][2] << 16) | ((uint64_t)VCPRegs[0][3] << 24)\
+                    | ((uint64_t)VCPRegs[0][4] << 32) | ((uint64_t)VCPRegs[0][5] << 40) | ((uint64_t)VCPRegs[0][6] << 48) | ((uint64_t)VCPRegs[0][7] << 56);\
+ const uint64_t r1_64 = (uint64_t)VCPRegs[1][0] | ((uint64_t)VCPRegs[1][1] << 8) | ((uint64_t)VCPRegs[1][2] << 16) | ((uint64_t)VCPRegs[1][3] << 24)\
+                    | ((uint64_t)VCPRegs[1][4] << 32) | ((uint64_t)VCPRegs[1][5] << 40) | ((uint64_t)VCPRegs[1][6] << 48) | ((uint64_t)VCPRegs[1][7] << 56);\
+ const uint64_t r2_64 = (uint64_t)VCPRegs[2][0] | ((uint64_t)VCPRegs[2][1] << 8) | ((uint64_t)VCPRegs[2][2] << 16) | ((uint64_t)VCPRegs[2][3] << 24)\
+                    | ((uint64_t)VCPRegs[2][4] << 32) | ((uint64_t)VCPRegs[2][5] << 40) | ((uint64_t)VCPRegs[2][6] << 48) | ((uint64_t)VCPRegs[2][7] << 56);\
+ const uint64_t r3_64 = (uint64_t)VCPRegs[3][0] | ((uint64_t)VCPRegs[3][1] << 8) | ((uint64_t)VCPRegs[3][2] << 16) | ((uint64_t)VCPRegs[3][3] << 24)\
+                    | ((uint64_t)VCPRegs[3][4] << 32) | ((uint64_t)VCPRegs[3][5] << 40) | ((uint64_t)VCPRegs[3][6] << 48) | ((uint64_t)VCPRegs[3][7] << 56);\
+ const uint32_t r0_32 = (uint32_t)r0_64;                                                                                \
+ const uint32_t r1_32 = (uint32_t)r1_64;                                                                                \
+ const uint32_t r2_32 = (uint32_t)r2_64;                                                                                \
+ const uint32_t r3_32 = (uint32_t)r3_64;                                                                                \
+                                                                                                                       \
+ if(MDFN_UNLIKELY(                                                                                                      \
+  /* Akumajou Dracula X */ ((BPP) == 4 && n == 3 && VRAM_Mode == 0x2 && (HRes & 0x6) == 0x0 && r0_64 == 0x0f0f070406060505ULL && r1_64 == 0x0f0f0f0f0f0f0f0fULL && r2_64 == 0x0f0f03000f0f0201ULL && r3_64 == 0x0f0f0f0f0f0f0f0fULL) ||\
+  /* Alien Trilogy      */ ((BPP) == 4 && n == 3 && VRAM_Mode == 0x2 && (HRes & 0x6) == 0x0 && r0_64 == 0x07050f0f0f0f0606ULL && r1_64 == 0x0f0f0f0f0f0f0f0fULL && r2_64 == 0x0f0f0f0f0f0f0f0fULL && r3_64 == 0x0f0103020f0f0f0fULL) ||\
+  /* Daytona USA CCE    */ ((BPP) == 4 && n == 2 && VRAM_Mode == 0x3 && (HRes & 0x6) == 0x0 && r0_64 == 0x0f0f0f0f00000404ULL && r1_64 == 0x0f0f0f060f0f0f0fULL && r2_64 == 0x0f0f0f0f0505070fULL && r3_64 == 0x0f0f03020f010f00ULL) ||\
+  /* Fighters Megamix   */ ((BPP) == 4           && lok_modestuff == 0x17 && r0_32 == 0x0e0f0706 && r1_32 == 0x05050404 && r2_32 == 0x03020100 && r3_32 == 0x0f0f0f0f) ||\
+  /* Fighters Megamix   */ ((BPP) == 4 && n == 2 && lok_modestuff == 0x17 && r0_32 == 0x0e0e0e06 && r1_32 == 0x0e0e0404 && r2_32 == 0x0e0e0200 && r3_32 == 0x0e0e0e0e) ||\
+  /* Fighters Megamix   */ ((BPP) == 4 && n == 2 && lok_modestuff == 0x17 && r0_32 == 0x0f050506 && r1_32 == 0x0f0f0f04 && r2_32 == 0x0f020100 && r3_32 == 0x0f0f0f0f) ||\
+  /* Fighters Megamix   */ ((BPP) == 4 && n == 2 && lok_modestuff == 0x17 && r0_32 == 0x0e0f0f06 && r1_32 == 0x0e050504 && r2_32 == 0x0e020100 && r3_32 == 0x0e0f0f0f) ||\
+  0))                                                                                                                   \
+ {                                                                                                                      \
+  for(unsigned i = 0; i < 8; i++)                                                                                       \
+   *bgbuf++ = 0;                                                                                                        \
+  tc--;                                                                                                                 \
+ }                                                                                                                      \
+                                                                                                                       \
+ while(MDFN_LIKELY(tc--))                                                                                               \
+ {                                                                                                                      \
+  uint32_t pbor = pix_base_or;                                                                                          \
+                                                                                                                       \
+  TF_NR_FETCH(&tf, BPP, false, tx << 3, yscr);                                                                                \
+                                                                                                                       \
+  if((CCMODE) == 1 || (CCMODE) == 2)                                                                                    \
+   pbor |= (tf.scc << PIX_CCE_SHIFT);                                                                                   \
+                                                                                                                       \
+  if((PMODE) == 1 || (PMODE) == 2)                                                                                      \
+   pbor |= (tf.spr << PIX_PRIO_SHIFT);                                                                                  \
+/* */                                                                                                                   \
+/* (MakeNBG23Pix template's `auto* const mbp = ...;` function-pointer */                                                \
+/* cache removed in favor of direct MAKE_NBG23_PIX macro stamps; same */                                                \
+/* codegen, one fewer per-pixel indirection in the worst case.) */                                                      \
+/* */                                                                                                                   \
+  if((BPP) == 8)                                                                                                        \
+  {                                                                                                                     \
+   if(tf.cellx_xor & 0x7)                                                                                               \
+   {                                                                                                                    \
+    MAKE_NBG23_PIX(bgbuf[7], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[0] >>  8), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[6], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[0] >>  0), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[5], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[1] >>  8), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[4], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[1] >>  0), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[3], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[2] >>  8), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[2], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[2] >>  0), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[1], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[3] >>  8), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[0], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[3] >>  0), pbor, sfcode_lut, tf.pcco);   \
+   }                                                                                                                    \
+   else                                                                                                                 \
+   {                                                                                                                    \
+    MAKE_NBG23_PIX(bgbuf[0], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[0] >>  8), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[1], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[0] >>  0), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[2], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[1] >>  8), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[3], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[1] >>  0), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[4], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[2] >>  8), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[5], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[2] >>  0), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[6], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[3] >>  8), pbor, sfcode_lut, tf.pcco);   \
+    MAKE_NBG23_PIX(bgbuf[7], (IGNTP), (PMODE), (CCMODE), (uint8_t)(tf.tile_vrb[3] >>  0), pbor, sfcode_lut, tf.pcco);   \
+   }                                                                                                                    \
+  }                                                                                                                     \
+  else                                                                                                                  \
+  {                                                                                                                     \
+   if(tf.cellx_xor & 0x7)                                                                                               \
+    DrawCell8_BPP4(bgbuf, tf.pcco, tf.tile_vrb[0], tf.tile_vrb[1], pbor, sfcode_lut, (bool)(IGNTP), (PMODE), (CCMODE), true ); \
+   else                                                                                                                 \
+    DrawCell8_BPP4(bgbuf, tf.pcco, tf.tile_vrb[0], tf.tile_vrb[1], pbor, sfcode_lut, (bool)(IGNTP), (PMODE), (CCMODE), false); \
+  }                                                                                                                     \
+                                                                                                                       \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+  tx++;                                                                                                                 \
+  bgbuf += 8;                                                                                                           \
+ }                                                                                                                      \
+}
+
+#define T_DrawNBG23_NAME(BPP, IGNTP, PMODE, CCMODE) \
+ T_DrawNBG23_##BPP##_##IGNTP##_##PMODE##_##CCMODE
+
+#define DEFINE_T_DrawNBG23(BPP, IGNTP, PMODE, CCMODE)                                              \
+ static void T_DrawNBG23_NAME(BPP, IGNTP, PMODE, CCMODE)(const unsigned n, uint64_t* bgbuf,        \
+                                                         const unsigned w,                         \
+                                                         const uint32_t pix_base_or)               \
+ T_DrawNBG23_BODY(BPP, IGNTP, PMODE, CCMODE)
+
+/* One-level enumerators.  Same composition shape as the DRBG_ENUM_*
+ * macros for T_DrawRBG_ConstAB. */
+#define DNBG23_ENUM_CC(M, BPP, IGNTP, PMODE) \
+ M(BPP, IGNTP, PMODE, 0)                     \
+ M(BPP, IGNTP, PMODE, 1)                     \
+ M(BPP, IGNTP, PMODE, 2)                     \
+ M(BPP, IGNTP, PMODE, 3)
+
+#define DNBG23_ENUM_PM(M, BPP, IGNTP) \
+ M(BPP, IGNTP, 0)                    \
+ M(BPP, IGNTP, 1)                    \
+ M(BPP, IGNTP, 2)
+
+#define DNBG23_ENUM_IG(M, BPP) \
+ M(BPP, 0)                    \
+ M(BPP, 1)
+
+/* Function-definition composition: descend through every level,
+ * invoking DEFINE_T_DrawNBG23 at the leaf. */
+#define DNBG23_FN_AT_PM(BPP, IGNTP, PMODE) DNBG23_ENUM_CC(DEFINE_T_DrawNBG23, BPP, IGNTP, PMODE)
+#define DNBG23_FN_AT_IG(BPP, IGNTP)        DNBG23_ENUM_PM(DNBG23_FN_AT_PM, BPP, IGNTP)
+#define DNBG23_FN_AT_BPP(BPP)              DNBG23_ENUM_IG(DNBG23_FN_AT_IG, BPP)
+
+DNBG23_FN_AT_BPP(4)
+DNBG23_FN_AT_BPP(8)
+
+/* Table composition: same descent but each non-leaf wraps its inner
+ * expansion in braces, producing the nested [2][2][3][4] initializer. */
+#define DNBG23_TBL_AT_CC(BPP, IGNTP, PMODE, CCMODE) T_DrawNBG23_NAME(BPP, IGNTP, PMODE, CCMODE),
+#define DNBG23_TBL_AT_PM(BPP, IGNTP, PMODE) { DNBG23_ENUM_CC(DNBG23_TBL_AT_CC, BPP, IGNTP, PMODE) },
+#define DNBG23_TBL_AT_IG(BPP, IGNTP)        { DNBG23_ENUM_PM(DNBG23_TBL_AT_PM, BPP, IGNTP) },
+#define DNBG23_TBL_AT_BPP(BPP)              { DNBG23_ENUM_IG(DNBG23_TBL_AT_IG, BPP) },
+
+static void (*DrawNBG23[2/*col mode*/][2/*igntp*/][3/*priomode*/][4/*ccmode*/])(const unsigned n, uint64_t* bgbuf, const unsigned w, const uint32_t pix_base_or) =
+{
+ DNBG23_TBL_AT_BPP(4)
+ DNBG23_TBL_AT_BPP(8)
+};
+
+#undef DNBG23_TBL_AT_BPP
+#undef DNBG23_TBL_AT_IG
+#undef DNBG23_TBL_AT_PM
+#undef DNBG23_TBL_AT_CC
+#undef DNBG23_FN_AT_BPP
+#undef DNBG23_FN_AT_IG
+#undef DNBG23_FN_AT_PM
+#undef DNBG23_ENUM_IG
+#undef DNBG23_ENUM_PM
+#undef DNBG23_ENUM_CC
+#undef DEFINE_T_DrawNBG23
+#undef T_DrawNBG23_NAME
+#undef T_DrawNBG23_BODY
+
+static INLINE uint32_t GetCoeffAddr(const unsigned i, uint32_t offset)
+{
+ const uint32_t src_mask = (CRKTE ? 0x3FF : 0x3FFFF);
+
+ offset >>= 10;
+ offset <<= !(KTCTL[i] & 0x2);
+ offset &= src_mask;
+
+ return offset;
+}
+
+static INLINE uint32_t ReadCoeff(const unsigned i, const uint32_t addr)
+{
+ const uint16_t* src = (CRKTE ? &CRAM[0x400] : VRAM);
+
+ if(KTCTL[i] & 0x2)
+ {
+  const uint16_t tmp = src[addr];
+  return (sign_x_to_s32(21, tmp << 6) & 0x00FFFFFF) | ((tmp & 0x8000) << 16);
+ }
+ const uint16_t* ea = &src[addr];
+ return (ea[0] << 16) | ea[1];
+}
+
+// Coefficient table reading can (temporarily) override kx, ky, and/or Xp
+//
+// When RBG1 is enabled, line color screen uses rotation parameter A coefficient table
+//
+// RBG1 always uses MSB of coefficient data as transparent bit.
+//
+// RBG1 requires RPMD == 0, or else bad things happen?
+
+/* SetupRotVars: was `template<typename T> static void SetupRotVars(
+ * const T* rs, const unsigned rbg_w)`.  Only call site passes
+ * LIB[vdp2_line].rv (a VDP2Rend_RotVars[2] array), so T was always
+ * the same concrete struct type.  Drop the template; the struct is
+ * now named in vdp2_render.h (was an anonymous inline `struct {...}
+ * rv[2]` previously), so the function signature can reference it
+ * directly without __typeof__. */
+static void SetupRotVars(const struct VDP2Rend_RotVars* rs, const unsigned rbg_w)
+{
+ const uint8_t EffRPMD = ((BGON & 0x20) ? 0 : RPMD);
+
+ if(EffRPMD < 2)
+ {
+  for(unsigned x = 0; MDFN_LIKELY(x < rbg_w); x++)
+   LB.rotabsel[x] = RPMD;
+ }
+ else if(EffRPMD == 3)
+  GetWinRotAB();
+
+ //
+ //
+ //
+
+ for(unsigned i = 0; i < 2; i++)
+ {
+  struct RotVars* r = &LB.rotv[i];
+
+  r->Xsp = rs[i].Xsp;
+  r->Ysp = rs[i].Ysp;
+  r->Xp = rs[i].Xp;
+  r->Yp = rs[i].Yp;
+  r->dX = rs[i].dX;
+  r->dY = rs[i].dY;
+  r->kx = rs[i].kx;
+  r->ky = rs[i].ky;
+
+  LB.rotv[i].tf.BMSCC = ((BMPNB >> 4) & 1);
+  LB.rotv[i].tf.BMSPR = ((BMPNB >> 5) & 1);
+  LB.rotv[i].tf.BMPalNo = ((BMPNB >> 0) & 0x7) << 4;
+  LB.rotv[i].tf.BMSize = ((CHCTLB >> 10) & 0x1);
+
+  //
+  //
+  //
+  //
+  //
+  //
+  if((BGON & 0x20) && i)
+  {
+   LB.rotv[1].tf.CRAOffs = CRAMAddrOffs_NBG[0] << 8;
+   LB.rotv[1].tf.PNDSize = (PNCN[0] >> 15) & 1;
+   LB.rotv[1].tf.CharSize = ((CHCTLA >> 0) & 1);
+   LB.rotv[1].tf.AuxMode = (PNCN[0] >> 14) & 1;
+   LB.rotv[1].tf.Supp = (PNCN[0] & 0x3FF);
+  }
+  else
+  {
+   LB.rotv[i].tf.CRAOffs = CRAMAddrOffs_RBG0 << 8;
+   LB.rotv[i].tf.PNDSize = (PNCNR >> 15) & 1;
+   LB.rotv[i].tf.CharSize = ((CHCTLB >> 8) & 1);
+   LB.rotv[i].tf.AuxMode = (PNCNR >> 14) & 1;
+   LB.rotv[i].tf.Supp = (PNCNR & 0x3FF);
+  }
+  LB.rotv[i].tf.PlaneSize = (PLSZ >> ( 8 + (i << 2))) & 0x3;
+  LB.rotv[i].tf.PlaneOver = (PLSZ >> (10 + (i << 2))) & 0x3;
+  LB.rotv[i].tf.PlaneOverChar = OVPNR[i];
+  TileFetcher_Rot_Start(&LB.rotv[i].tf, 4 + i, !i && ((CHCTLB >> 9) & 1), (MPOFR >> (i << 2)) & 0x7, RotMapRegs[i]);
+ }
+
+ //
+ //
+ //
+ {
+  bool bank_tab[4];
+
+  for(unsigned i = 0; i < 4; i++)
+   bank_tab[i] = ((RDBS_Mode >> (i << 1)) & 0x3) == RDBS_COEFF;
+  //
+  if(!(VRAM_Mode & 0x1))
+   bank_tab[1] = bank_tab[0];
+
+  if(!(VRAM_Mode & 0x2))
+   bank_tab[3] = bank_tab[2];
+  //
+  // If CRKTE is 1, or the setting in RDBS for an active bank field is 0x1(COEFF), per-dot mode will be enabled.
+  //
+  // If the bank to read the coefficient from is not configured for coefficient reads, it should be treated as
+  // if the value 0 were read.
+  //
+  // RBG1 being enabled doesn't seem to affect the calculation for determining if per-dot mode is enabled
+  // or not, but having a coefficient read in bank B0/B1 with RBG1 enabled resulted in unstable,
+  // inconsistent behavior in tests.  Reluctant to test further as it may be a sign of a potentially
+  // damaging electrical conflict inside the VDP2.
+  //
+  const uint32_t perdot_mask = (CRKTE || bank_tab[0] || bank_tab[1] || bank_tab[2] || bank_tab[3]) - 1;
+
+  if(CRKTE)
+   bank_tab[0] = bank_tab[1] = bank_tab[2] = bank_tab[3] = true;
+
+  LB.rotv[0].use_coeff = (bool)(KTCTL[0] & 0x1);
+  LB.rotv[1].use_coeff = (bool)(KTCTL[1] & 0x1);
+
+  uint32_t coeff[2];
+
+  for(unsigned i = 0; i < 2; i++)
+   LB.rotv[i].base_coeff = coeff[i] = ReadCoeff(i, GetCoeffAddr(i, rs[i].KAstAccum));
+
+  // Const-i specialization: when RPMD < 2 SetupRotVars's earlier fill
+  // (line 1899) wrote LB.rotabsel[x] = RPMD uniformly across the line.
+  // EffRPMD is also < 2 (RPMD < 2 makes the (BGON & 0x20 ? 0 : RPMD)
+  // expression < 2 regardless of BGON), so the `i = ((EffRPMD == 2)
+  // ? 0 : LB.rotabsel[x])` lookup is loop-constant and equal to RPMD,
+  // and the EffRPMD == 2 branch never fires. Hoist rs[i], KTCTL[i],
+  // and coeff[i] to scalars; drop the per-pixel rotabsel byte-load and
+  // the EffRPMD == 2 write back to rotabsel/rotcoeff. The two paths
+  // share the perdot_mask / bank_tab / ReadCoeff plumbing above, which
+  // is already loop-invariant.
+  //
+  // Same gate as the T_DrawRBG ConstAB patch (commit 9739bf2). Falling
+  // back to the original variable-i loop covers EffRPMD == 2 (runtime
+  // per-coefficient switching), EffRPMD == 3 (window-decided), and the
+  // pathological BGON & 0x20 with RPMD >= 2 hardware-invalid case
+  // (which would land an out-of-bounds rs[2] / rs[3] on either path --
+  // existing behavior preserved).
+  if(RPMD < 2)
+  {
+   const unsigned ci    = RPMD;
+   const struct VDP2Rend_RotVars* rsi = &rs[ci];
+   const int32_t    rs_KA = rsi->KAstAccum;
+   const int32_t    rs_DK = rsi->DKAx;
+   const bool     wr_lc = (KTCTL[ci] & 0x10);
+
+   /* perdot_mask is a loop-invariant 0/~0u toggle.  Per-dot mode
+    * (mask == 0) zeros cur_c every pixel before the optional bank
+    * read, so iterations are independent and the body SLP-packs;
+    * stickiness mode (mask == ~0u) carries cur_c across iterations
+    * on bank misses, a true scalar dep that has to stay scalar.
+    * Unswitching here lets GCC reason about each loop separately
+    * instead of conservatively treating the cur_c flow as dependent
+    * in both. */
+   if(perdot_mask == 0)
+   {
+    for(unsigned x = 0; MDFN_LIKELY(x < rbg_w); x++)
+    {
+     const uint32_t addr = GetCoeffAddr(ci, rs_KA + (x * rs_DK));
+     uint32_t cur_c = 0;
+
+     if(bank_tab[addr >> 16])
+      cur_c = ReadCoeff(ci, addr);
+
+     if(wr_lc)
+      LB.lc[x] = (cur_c >> 24) & 0x7F;
+
+     LB.rotcoeff[x] = cur_c;
+    }
+   }
+   else
+   {
+    uint32_t cur_c = coeff[ci];
+
+    for(unsigned x = 0; MDFN_LIKELY(x < rbg_w); x++)
+    {
+     const uint32_t addr = GetCoeffAddr(ci, rs_KA + (x * rs_DK));
+
+     if(bank_tab[addr >> 16])
+      cur_c = ReadCoeff(ci, addr);
+
+     if(wr_lc)
+      LB.lc[x] = (cur_c >> 24) & 0x7F;
+
+     LB.rotcoeff[x] = cur_c;
+    }
+   }
+  }
+  else
+  {
+   for(unsigned x = 0; MDFN_LIKELY(x < rbg_w); x++)
+   {
+    const unsigned i = ((EffRPMD == 2) ? 0 : LB.rotabsel[x]);
+    const uint32_t addr = GetCoeffAddr(i, rs[i].KAstAccum + (x * rs[i].DKAx));
+
+    coeff[i] &= perdot_mask;
+    if(bank_tab[addr >> 16])
+     coeff[i] = ReadCoeff(i, addr);
+
+    if(KTCTL[i] & 0x10)
+     LB.lc[x] = (coeff[i] >> 24) & 0x7F;
+
+    if(EffRPMD == 2)
+    {
+     uint32_t tmp = coeff[0];
+
+     LB.rotabsel[x] = tmp >> 31;
+
+     if((int32_t)tmp < 0)
+      tmp = coeff[1];
+
+     LB.rotcoeff[x] = tmp;
+    }
+    else
+     LB.rotcoeff[x] = coeff[i];
+   }
+  }
+ }
+}
+
+// const bool TA_bmen = ((rn == 1) ? false : ((CHCTLB >> 9) & 1));
+/* T_DrawRBG: was `template<bool TA_bmen, unsigned TA_bpp, bool
+ * TA_isrgb, bool TA_igntp, unsigned TA_PrioMode, unsigned TA_CCMode>
+ * static void T_DrawRBG(const bool rn, uint64_t* bgbuf,
+ * const unsigned w, const uint32_t pix_base_or)`.  240 specs:
+ * bmen in {0,1}, color-mode in 0..4, igntp in {0,1}, PrioMode
+ * in {0..2}, CCMode in {0..3}.
+ *
+ * Converted via the same X-macro pattern used by the existing
+ * T_DrawRBG_ConstAB and the just-landed T_DrawNBG / T_DrawNBG23:
+ * five-dimensional descent through BMEN -> CM -> IGNTP -> PMODE
+ * -> CCMODE, with CM enumerating the five (BPP, ISRGB) pairs.
+ * Function-name suffix uses CM (not BPP, ISRGB), matching the
+ * T_DrawRBG_CAB / T_DrawNBG convention -- so e.g. CM=3 means
+ * BPP=16 ISRGB=1.
+ *
+ * Body uses `auto& r` (a RotVars&), then takes `auto& tf = r.tf;`
+ * (a TileFetcher_Rot&); pixels are produced via TF_ROT_FETCH and
+ * MakeNBGRBGPix<...>().
+ *
+ * The existing T_DrawRBG_CAB block below uses identical macro
+ * names (DRBG_ENUM_*, DRBG_FN_AT_*, DRBG_TBL_AT_*).  We #undef
+ * everything at the end of this block, so the CAB block can
+ * redefine fresh -- it also has matching #undefs after itself.
+ *
+ * Line-comments rewritten as block-comments for line-spliced
+ * macro safety. */
+#define T_DrawRBG_BODY(BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE) \
+{                                                                                                                       \
+/* Full color format selection for both RBG0 and RBG1 */                                                                \
+/* Bitmap only allowed for RBG0 */                                                                                      \
+/* RBG0 can use rot param A and B, RBG1 is fixed to rot param B */                                                      \
+/* RBG1 shares setting bitfields with NBG0 */                                                                           \
+/* 16 planes instead of 4 like with NBG* */                                                                             \
+/* Mosaic only has effect in the horizontal direction? */                                                               \
+/* */                                                                                                                   \
+ int16_t sfcode_lut[8];                                                                                                 \
+                                                                                                                        \
+ MAKE_SFCODE_LUT((PMODE), (CCMODE), (rn ? 0 : 4), sfcode_lut);                                                          \
+                                                                                                                        \
+ /* CACHE FIX (#71): key cache on full `iy` (tile-mode safe; catches iy & 7); bypass    \
+  * entirely in bitmap mode via `(BMEN) ||` in the predicate. */                          \
+ unsigned prev_ab    = ~0u;                                                                                             \
+ uint32_t prev_celli = ~0u;                                                                                             \
+ uint32_t prev_iy    = ~0u;                                                                                             \
+ bool     prev_rot_tp_f = false;                                                                                        \
+                                                                                                                        \
+ for(unsigned i = 0; MDFN_LIKELY(i < w); i++)                                                                           \
+ {                                                                                                                      \
+  const unsigned ab = LB.rotabsel[i];                                                                                   \
+  struct RotVars*           r  = &LB.rotv[ab];                                                                          \
+  struct TileFetcher_Rot*   tf = &r->tf;                                                                                \
+  uint32_t Xp = r->Xp;                                                                                                  \
+  int32_t kx = r->kx;                                                                                                   \
+  int32_t ky = r->ky;                                                                                                   \
+  bool rot_tp = false;                                                                                                  \
+                                                                                                                       \
+  if(r->use_coeff)                                                                                                      \
+  {                                                                                                                     \
+   const uint32_t coeff = (rn ? r->base_coeff : LB.rotcoeff[i]);                                                        \
+                                                                                                                       \
+   rot_tp = ((int32_t)coeff < 0);                                                                                       \
+                                                                                                                       \
+   const uint32_t sext = sign_x_to_s32(24, coeff);                                                                      \
+                                                                                                                       \
+   switch((KTCTL[ab] >> 2) & 0x3)                                                                                       \
+   {                                                                                                                    \
+    case 0: kx = ky = sext; break;                                                                                      \
+    case 1: kx = sext; break;                                                                                           \
+    case 2: ky = sext; break;                                                                                           \
+    case 3: Xp = sext << 2; break;                                                                                      \
+   }                                                                                                                    \
+  }                                                                                                                     \
+                                                                                                                       \
+  const uint32_t ix = (  Xp + (uint32_t)(((int64_t)kx * (int32_t)(r->Xsp + (r->dX * i))) >> 16)) >> 10;                 \
+  const uint32_t iy = (r->Yp + (uint32_t)(((int64_t)ky * (int32_t)(r->Ysp + (r->dY * i))) >> 16)) >> 10;                \
+                                                                                                                       \
+  const uint32_t celli = ix >> 3;                                                                                       \
+                                                                                                                        \
+  if((BMEN) || ab != prev_ab || celli != prev_celli || iy != prev_iy)                                                   \
+  {                                                                                                                     \
+   prev_ab    = ab;                                                                                                     \
+   prev_celli = celli;                                                                                                  \
+   prev_iy    = iy;                                                                                                     \
+   prev_rot_tp_f = TF_ROT_FETCH(tf, BPP, (BMEN), ix, iy);                                                               \
+  }                                                                                                                     \
+  rot_tp |= prev_rot_tp_f;                                                                                              \
+                                                                                                                        \
+  LB.rotabsel[i] = rot_tp;                                                                                              \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+/* */                                                                                                                   \
+  MAKE_NBGRBG_PIX(bgbuf[i], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, tf, pix_base_or, sfcode_lut, ix, iy);               \
+ }                                                                                                                      \
+}
+
+#define T_DrawRBG_NAME(BMEN, CM, IGNTP, PMODE, CCMODE) \
+ T_DrawRBG_##BMEN##_##CM##_##IGNTP##_##PMODE##_##CCMODE
+
+#define DEFINE_T_DrawRBG(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, CCMODE)                              \
+ static void T_DrawRBG_NAME(BMEN, CM, IGNTP, PMODE, CCMODE)(const bool rn, uint64_t* bgbuf,       \
+                                                            const unsigned w,                     \
+                                                            const uint32_t pix_base_or)           \
+ T_DrawRBG_BODY(BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE)
+
+/* One-level enumerators.  Match the DRBG_ENUM_* shape pioneered for
+ * T_DrawRBG_ConstAB and reused for T_DrawNBG. */
+#define DRBG_ENUM_CC(M, BMEN, CM, BPP, ISRGB, IGNTP, PMODE) \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 0)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 1)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 2)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 3)
+
+#define DRBG_ENUM_PM(M, BMEN, CM, BPP, ISRGB, IGNTP) \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, 0)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, 1)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, 2)
+
+#define DRBG_ENUM_IG(M, BMEN, CM, BPP, ISRGB) \
+ M(BMEN, CM, BPP, ISRGB, 0)                   \
+ M(BMEN, CM, BPP, ISRGB, 1)
+
+#define DRBG_ENUM_CM(M, BMEN) \
+ M(BMEN, 0, 4,  0)            \
+ M(BMEN, 1, 8,  0)            \
+ M(BMEN, 2, 16, 0)            \
+ M(BMEN, 3, 16, 1)            \
+ M(BMEN, 4, 32, 1)
+
+/* Function-definition composition: descend through every level,
+ * invoking DEFINE_T_DrawRBG at the leaf. */
+#define DRBG_FN_AT_PM(BMEN, CM, BPP, ISRGB, IGNTP, PMODE) DRBG_ENUM_CC(DEFINE_T_DrawRBG, BMEN, CM, BPP, ISRGB, IGNTP, PMODE)
+#define DRBG_FN_AT_IG(BMEN, CM, BPP, ISRGB, IGNTP)        DRBG_ENUM_PM(DRBG_FN_AT_PM, BMEN, CM, BPP, ISRGB, IGNTP)
+#define DRBG_FN_AT_CM(BMEN, CM, BPP, ISRGB)               DRBG_ENUM_IG(DRBG_FN_AT_IG, BMEN, CM, BPP, ISRGB)
+#define DRBG_FN_AT_BM(BMEN)                               DRBG_ENUM_CM(DRBG_FN_AT_CM, BMEN)
+
+DRBG_FN_AT_BM(0)
+DRBG_FN_AT_BM(1)
+
+/* Table composition: same descent but each non-leaf wraps its inner
+ * expansion in braces, producing the nested [2][5][2][3][4] initializer. */
+#define DRBG_TBL_AT_CC(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, CCMODE) T_DrawRBG_NAME(BMEN, CM, IGNTP, PMODE, CCMODE),
+#define DRBG_TBL_AT_PM(BMEN, CM, BPP, ISRGB, IGNTP, PMODE) { DRBG_ENUM_CC(DRBG_TBL_AT_CC, BMEN, CM, BPP, ISRGB, IGNTP, PMODE) },
+#define DRBG_TBL_AT_IG(BMEN, CM, BPP, ISRGB, IGNTP)        { DRBG_ENUM_PM(DRBG_TBL_AT_PM, BMEN, CM, BPP, ISRGB, IGNTP) },
+#define DRBG_TBL_AT_CM(BMEN, CM, BPP, ISRGB)               { DRBG_ENUM_IG(DRBG_TBL_AT_IG, BMEN, CM, BPP, ISRGB) },
+#define DRBG_TBL_AT_BM(BMEN)                               { DRBG_ENUM_CM(DRBG_TBL_AT_CM, BMEN) },
+
+static void (*DrawRBG[2 /*bitmap enable*/][5/*col mode*/][2/*igntp*/][3/*priomode*/][4/*ccmode*/])(const bool rn, uint64_t* bgbuf, const unsigned w, const uint32_t pix_base_or) =
+{
+ DRBG_TBL_AT_BM(0)
+ DRBG_TBL_AT_BM(1)
+};
+
+#undef DRBG_TBL_AT_BM
+#undef DRBG_TBL_AT_CM
+#undef DRBG_TBL_AT_IG
+#undef DRBG_TBL_AT_PM
+#undef DRBG_TBL_AT_CC
+#undef DRBG_FN_AT_BM
+#undef DRBG_FN_AT_CM
+#undef DRBG_FN_AT_IG
+#undef DRBG_FN_AT_PM
+#undef DRBG_ENUM_CM
+#undef DRBG_ENUM_IG
+#undef DRBG_ENUM_PM
+#undef DRBG_ENUM_CC
+#undef DEFINE_T_DrawRBG
+#undef T_DrawRBG_NAME
+#undef T_DrawRBG_BODY
+
+//
+// Constant-AB specialization of T_DrawRBG.
+//
+// When SetupRotVars fills LB.rotabsel[] with a single rotation-param
+// index that doesn't change for the rest of the scanline -- which is
+// the common case for any 3D game using single-parameter rotation
+// (RPMD 0 or 1, EffRPMD < 2) and also the only mode RBG1 ever uses --
+// the per-pixel byte-load of LB.rotabsel[i], the dependent pointer
+// indirection into LB.rotv[ab], and the four-to-eight scalar field
+// loads off `r` are all loop-invariant. The base T_DrawRBG template
+// can't see that through the rotabsel pointer, so every pixel pays for
+// the chain. Specializing on "ab is line-constant" lets us hoist `r`
+// and its scalars out of the loop once, leaving the per-pixel body
+// with just the rotation math, the Fetch, the rotabsel writeback (RBGPP
+// at line 2115 reads it for transparency), and the MakeNBGRBGPix call.
+//
+// Generated via C macros rather than another C++ template parameter
+// because the existing dispatch table is already 240 entries; pulling
+// another bool dimension in via templates would double the
+// hand-written initializer list, which is the worst part of the file.
+// The macro approach instantiates only the new 240-entry parallel
+// table and keeps the existing T_DrawRBG / DrawRBG path untouched.
+//
+// The (bpp, isrgb) pair isn't a free 2x5 Cartesian product, it's the
+// same five (4,0)/(8,0)/(16,0)/(16,1)/(32,1) tuples the existing
+// table uses, indexed by colornum 0..4. The COLORMODE fold macro
+// encodes that mapping.
+//
+#define T_DrawRBG_CAB_BODY(BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE)                                    \
+{                                                                                                     \
+ int16_t sfcode_lut[8];                                                                                 \
+                                                                                                      \
+ MAKE_SFCODE_LUT(PMODE, CCMODE, (rn ? 0 : 4), sfcode_lut);                                              \
+                                                                                                      \
+ struct RotVars*         r       = &LB.rotv[const_ab];                                                \
+ struct TileFetcher_Rot* tf      = &r->tf;                                                            \
+ const int32_t  r_Xp     = r->Xp;                                                                       \
+ const int32_t  r_Yp     = r->Yp;                                                                       \
+ const int32_t  r_Xsp    = r->Xsp;                                                                      \
+ const int32_t  r_Ysp    = r->Ysp;                                                                      \
+ const int32_t  r_dX     = r->dX;                                                                       \
+ const int32_t  r_dY     = r->dY;                                                                       \
+ const int32_t  r_kx0    = r->kx;                                                                       \
+ const int32_t  r_ky0    = r->ky;                                                                       \
+ const bool   r_use_co = r->use_coeff;                                                                \
+ const uint32_t r_base_c = r->base_coeff;                                                               \
+ const uint8_t  ktctl_md = (KTCTL[const_ab] >> 2) & 0x3;                                                \
+                                                                                                      \
+ /* CACHE FIX (#71): see SetupRotVars sibling above. */                                                 \
+ uint32_t prev_celli    = ~0u;                                                                         \
+ uint32_t prev_iy       = ~0u;                                                                         \
+ bool     prev_rot_tp_f = false;                                                                       \
+                                                                                                      \
+ /* Strength-reduce the per-pixel (r_dX * i) / (r_dY * i) into running                                  \
+  * unsigned-modular adds; this matches the original                                                  \
+  *   (int32_t)((uint32_t)r_Xsp + (uint32_t)r_dX * (uint32_t)i)                                       \
+  * wrap behavior exactly (uint32 add wraps at 2^32, then the int32 cast                              \
+  * reinterprets bits).  Saves the inner MUL per pixel; the outer SMULL                               \
+  * stays because the full (int64)kx * (Xsp + dX*N) accumulator would                                 \
+  * disagree with the original at the int32 overflow boundary (extreme                                \
+  * zoom-in: |dX*N| can exceed 2^31). */                                                              \
+ uint32_t arg_x_u = (uint32_t)r_Xsp;                                                                   \
+ uint32_t arg_y_u = (uint32_t)r_Ysp;                                                                   \
+ const uint32_t r_dX_u = (uint32_t)r_dX;                                                               \
+ const uint32_t r_dY_u = (uint32_t)r_dY;                                                               \
+                                                                                                      \
+ for(unsigned i = 0; MDFN_LIKELY(i < w); i++)                                                         \
+ {                                                                                                    \
+  uint32_t Xp = r_Xp;                                                                                   \
+  int32_t  kx = r_kx0;                                                                                  \
+  int32_t  ky = r_ky0;                                                                                  \
+  bool   rot_tp = false;                                                                              \
+                                                                                                      \
+  if(r_use_co)                                                                                        \
+  {                                                                                                   \
+   const uint32_t coeff = (rn ? r_base_c : LB.rotcoeff[i]);                                             \
+                                                                                                      \
+   rot_tp = ((int32_t)coeff < 0);                                                                       \
+                                                                                                      \
+   const uint32_t sext = sign_x_to_s32(24, coeff);                                                      \
+                                                                                                      \
+   switch(ktctl_md)                                                                                   \
+   {                                                                                                  \
+    case 0: kx = ky = sext; break;                                                                    \
+    case 1: kx = sext; break;                                                                         \
+    case 2: ky = sext; break;                                                                         \
+    case 3: Xp = sext << 2; break;                                                                    \
+   }                                                                                                  \
+  }                                                                                                   \
+                                                                                                      \
+  const uint32_t ix = (  Xp + (uint32_t)(((int64_t)kx * (int32_t)arg_x_u) >> 16)) >> 10;               \
+  const uint32_t iy = (r_Yp + (uint32_t)(((int64_t)ky * (int32_t)arg_y_u) >> 16)) >> 10;               \
+                                                                                                      \
+  arg_x_u += r_dX_u;                                                                                  \
+  arg_y_u += r_dY_u;                                                                                  \
+                                                                                                      \
+  const uint32_t celli = ix >> 3;                                                                     \
+                                                                                                      \
+  if(BMEN || celli != prev_celli || iy != prev_iy)                                                    \
+  {                                                                                                   \
+   prev_celli    = celli;                                                                             \
+   prev_iy       = iy;                                                                                \
+   prev_rot_tp_f = TF_ROT_FETCH(tf, BPP, BMEN, ix, iy);                                               \
+  }                                                                                                   \
+  rot_tp |= prev_rot_tp_f;                                                                            \
+                                                                                                      \
+  LB.rotabsel[i] = rot_tp;                                                                            \
+  MAKE_NBGRBG_PIX(bgbuf[i], BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE, tf, pix_base_or, sfcode_lut, ix, iy);\
+ }                                                                                                    \
+}
+
+#define T_DrawRBG_CAB_NAME(BMEN, CM, IGNTP, PMODE, CCMODE) \
+ T_DrawRBG_CAB_##BMEN##_##CM##_##IGNTP##_##PMODE##_##CCMODE
+
+#define DEFINE_T_DrawRBG_CAB(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, CCMODE)                              \
+ static void T_DrawRBG_CAB_NAME(BMEN, CM, IGNTP, PMODE, CCMODE)(                                      \
+   const bool rn, const unsigned const_ab,                                                            \
+   uint64_t* bgbuf, const unsigned w, const uint32_t pix_base_or)                                         \
+ T_DrawRBG_CAB_BODY(BMEN, BPP, ISRGB, IGNTP, PMODE, CCMODE)
+
+// One-level enumerators. Each calls M once per value at its dimension
+// and threads the supplied prefix args through. Two different
+// composition trees are built below: one for function definitions
+// (bottoms out at the 7-arg DEFINE), one for the table initializer
+// (which wraps each non-leaf level in braces).
+#define DRBG_ENUM_CC(M, BMEN, CM, BPP, ISRGB, IGNTP, PMODE) \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 0)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 1)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 2)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, 3)
+
+#define DRBG_ENUM_PM(M, BMEN, CM, BPP, ISRGB, IGNTP) \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, 0)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, 1)                   \
+ M(BMEN, CM, BPP, ISRGB, IGNTP, 2)
+
+#define DRBG_ENUM_IG(M, BMEN, CM, BPP, ISRGB) \
+ M(BMEN, CM, BPP, ISRGB, 0)                   \
+ M(BMEN, CM, BPP, ISRGB, 1)
+
+#define DRBG_ENUM_CM(M, BMEN) \
+ M(BMEN, 0, 4,  0)            \
+ M(BMEN, 1, 8,  0)            \
+ M(BMEN, 2, 16, 0)            \
+ M(BMEN, 3, 16, 1)            \
+ M(BMEN, 4, 32, 1)
+
+// Function-definition composition: descend through every level,
+// invoking DEFINE_T_DrawRBG_CAB at the leaf.
+#define DRBG_FN_AT_PM(BMEN, CM, BPP, ISRGB, IGNTP, PMODE) DRBG_ENUM_CC(DEFINE_T_DrawRBG_CAB, BMEN, CM, BPP, ISRGB, IGNTP, PMODE)
+#define DRBG_FN_AT_IG(BMEN, CM, BPP, ISRGB, IGNTP)        DRBG_ENUM_PM(DRBG_FN_AT_PM, BMEN, CM, BPP, ISRGB, IGNTP)
+#define DRBG_FN_AT_CM(BMEN, CM, BPP, ISRGB)               DRBG_ENUM_IG(DRBG_FN_AT_IG, BMEN, CM, BPP, ISRGB)
+#define DRBG_FN_AT_BM(BMEN)                               DRBG_ENUM_CM(DRBG_FN_AT_CM, BMEN)
+
+DRBG_FN_AT_BM(0)
+DRBG_FN_AT_BM(1)
+
+// Table composition: same descent but each non-leaf wraps its inner
+// expansion in braces, producing the nested [2][5][2][3][4] initializer.
+#define DRBG_TBL_AT_CC(BMEN, CM, BPP, ISRGB, IGNTP, PMODE, CCMODE) T_DrawRBG_CAB_NAME(BMEN, CM, IGNTP, PMODE, CCMODE),
+#define DRBG_TBL_AT_PM(BMEN, CM, BPP, ISRGB, IGNTP, PMODE) { DRBG_ENUM_CC(DRBG_TBL_AT_CC, BMEN, CM, BPP, ISRGB, IGNTP, PMODE) },
+#define DRBG_TBL_AT_IG(BMEN, CM, BPP, ISRGB, IGNTP)        { DRBG_ENUM_PM(DRBG_TBL_AT_PM, BMEN, CM, BPP, ISRGB, IGNTP) },
+#define DRBG_TBL_AT_CM(BMEN, CM, BPP, ISRGB)               { DRBG_ENUM_IG(DRBG_TBL_AT_IG, BMEN, CM, BPP, ISRGB) },
+#define DRBG_TBL_AT_BM(BMEN)                               { DRBG_ENUM_CM(DRBG_TBL_AT_CM, BMEN) },
+
+static void (*DrawRBG_ConstAB[2 /*bitmap enable*/][5 /*col mode*/][2 /*igntp*/][3 /*priomode*/][4 /*ccmode*/])(const bool rn, const unsigned const_ab, uint64_t* bgbuf, const unsigned w, const uint32_t pix_base_or) =
+{
+ DRBG_TBL_AT_BM(0)
+ DRBG_TBL_AT_BM(1)
+};
+
+#undef DRBG_TBL_AT_BM
+#undef DRBG_TBL_AT_CM
+#undef DRBG_TBL_AT_IG
+#undef DRBG_TBL_AT_PM
+#undef DRBG_TBL_AT_CC
+#undef DRBG_FN_AT_BM
+#undef DRBG_FN_AT_CM
+#undef DRBG_FN_AT_IG
+#undef DRBG_FN_AT_PM
+#undef DRBG_ENUM_CM
+#undef DRBG_ENUM_IG
+#undef DRBG_ENUM_PM
+#undef DRBG_ENUM_CC
+#undef DEFINE_T_DrawRBG_CAB
+#undef T_DrawRBG_CAB_NAME
+#undef T_DrawRBG_CAB_BODY
+
+/* Doubleize: was `template<typename T> static INLINE void Doubleize(T* ptr,
+ * const int orig_len)`.  Walks the array high-to-low and writes each
+ * source element to two adjacent destination slots, expanding a length-N
+ * region to length-2N in place.  The two call sites pass uint64_t* and
+ * uint8_t*; provide a thin wrapper per element type so the macro body
+ * sees an explicit type token (no __typeof__ / decltype / auto), making
+ * the construct valid under MSVC and any other strict-C compiler.
+ *
+ * Same body-macro pattern as MEMW_BODY higher up in this file: shared
+ * DOUBLEIZE_BODY parametrised by the element type, with DOUBLEIZE_U64
+ * and DOUBLEIZE_U8 as one-line wrappers that plug in the type.
+ *
+ * Macro arg `ptr` is bound once to DUB_p, so call-site side effects
+ * are single-evaluated; `orig_len` likewise to DUB_len.  do/while(0)
+ * so the macro tolerates if/else nesting at the call site.
+ *
+ * Two-pass form (stage to stack scratch, then doubling-store): the
+ * original single-pass walked high-to-low and read DUB_p[i] while
+ * writing DUB_p[2i..2i+1] in the same buffer, which is correct in
+ * sequence but defeats GCC's autovec because the source and dest
+ * pointers alias.  Staging into DUB_src up front gives the doubling
+ * loop a source pointer GCC can prove disjoint from the dest, so it
+ * SLP-packs the read and emits an interleaved store (vst2 on NEON,
+ * unpack+store on amd64).  rbg_w is bounded at 352 by the only
+ * caller chain (vdp2_render line 4035: 320 or 352), and both
+ * elem_t instantiations (uint64_t and uint8_t) at 352 entries are
+ * cheap on the stack (2816 B and 352 B respectively). */
+#define DOUBLEIZE_BODY(elem_t, ptr, orig_len) do {                                 \
+ elem_t* DUB_p = (ptr);                                                            \
+ const int DUB_len = (orig_len);                                                   \
+ /* In-place, iterating backward: at step DUB_i the writes land at        \
+  * indices (DUB_i << 1) and (DUB_i << 1) + 1, both >= DUB_i + 1 for     \
+  * DUB_i >= 1 (and step 0 reads its source before writing it), so no    \
+  * not-yet-read source element is ever clobbered.  Replaces a copy      \
+  * through a 2816-byte stack buffer (the old elem_t DUB_src[352]),      \
+  * which accounted for nearly all of RBGPP's 2848-byte stack frame.  */ \
+ for(int DUB_i = DUB_len - 1; MDFN_LIKELY(DUB_i >= 0); DUB_i--)                    \
+ {                                                                                 \
+  const elem_t DUB_tmp = DUB_p[DUB_i];                                             \
+                                                                                   \
+  DUB_p[(DUB_i << 1) + 0] = DUB_tmp;                                               \
+  DUB_p[(DUB_i << 1) + 1] = DUB_tmp;                                               \
+ }                                                                                 \
+} while(0)
+
+#define DOUBLEIZE_U64(ptr, orig_len) DOUBLEIZE_BODY(uint64_t, (ptr), (orig_len))
+#define DOUBLEIZE_U8(ptr,  orig_len) DOUBLEIZE_BODY(uint8_t,  (ptr), (orig_len))
+
+static void RBGPP(const unsigned layer, uint64_t* buf, const unsigned rbg_w)
+{
+ ApplyHMosaic(layer, buf, rbg_w);
+
+ for(unsigned i = 0; i < rbg_w; i++)
+ {
+  uint64_t tmp = buf[i];
+
+  if(LB.rotabsel[i])
+   tmp &= ~(uint64_t)0xFFFFFFFF;
+
+  buf[i] = tmp;
+ }
+
+ if(HRes & 0x2)
+  DOUBLEIZE_U64(buf, rbg_w);
+
+ ApplyWin(layer, buf);
+}
+
+// Call before DrawSpriteData()
+static INLINE void MakeSpriteCCLUT(void)
+{
+ const bool cce = ((CCCTL >> 6) & 1);
+
+ for(unsigned pr = 0; pr < 8; pr++)
+ {
+  bool mask = false;
+
+  switch(SpriteCCCond)
+  {
+   case 0: mask = (SpritePrioNum[pr] <= SpriteCCNum); break;
+   case 1: mask = (SpritePrioNum[pr] == SpriteCCNum); break;
+   case 2: mask = (SpritePrioNum[pr] >= SpriteCCNum); break;
+  }
+  SpriteCCLUT[pr] = (cce & mask) << PIX_CCE_SHIFT;
+ }
+
+ SpriteCC3Mask = 0;
+ if(SpriteCCCond == 3 && cce)
+  SpriteCC3Mask = 1U << PIX_CCE_SHIFT;
+}
+
+/* T_DrawSpriteData: was `template<bool TA_HiRes, bool TA_TPShadSel,
+ * unsigned TA_SPCTL_Low> static void T_DrawSpriteData(const
+ * uint16_t* vdp1sb, const bool vdp1_hires8, unsigned w)`.
+ * 256 specs: HIRES in {0,1}, TPSS in {0,1}, SPCTL in {0x00..0x3f}.
+ * Table layout [2][2][0x40] unchanged.
+ *
+ * Converted via the same X-macro pattern as T_DrawRBG_ConstAB /
+ * T_DrawNBG / T_DrawNBG23 / T_DrawRBG, with one new feature:
+ * the third dimension is a wide hex range (64 values).  The hex
+ * tokens (0x00..0x3f) paste-concatenate cleanly into the function-
+ * name suffix (e.g. T_DrawSpriteData_0_1_0x3f) -- pp-numbers are
+ * a single token and the resulting identifier is well-formed.
+ *
+ * Per-spec, the body only references each template arg a small
+ * number of times: TA_HiRes 2x, TA_TPShadSel 1x, TA_SPCTL_Low 3x.
+ * Most of the body uses local consts (SpriteType, SpriteWinEn,
+ * SpriteColorMode) derived from TA_SPCTL_Low at function entry --
+ * those derivations stay; with the macro form SPCTL is a literal
+ * so the constant-folding is identical to the template.
+ *
+ * Line-comments rewritten as block-comments for line-spliced
+ * macro safety, same convention as prior phases. */
+#define T_DrawSpriteData_BODY(HIRES, TPSS, SPCTL) \
+{                                                                                                                                           \
+ const unsigned SpriteType = ((SPCTL) & 0xF);                                                                                               \
+ const bool SpriteWinEn = ((SPCTL) & 0x10);                                                                                                 \
+ const bool SpriteColorMode = ((SPCTL) & 0x20);                                                                                             \
+/* */                                                                                                                                       \
+ const size_t cao = CRAMAddrOffs_Sprite << 8;                                                                                               \
+ uint32_t spix_base_or = 0;                                                                                                                 \
+                                                                                                                                           \
+ spix_base_or |= ((ColorOffsEn >> 6) & 1) << PIX_COE_SHIFT;                                                                                 \
+ spix_base_or |= ((ColorOffsSel >> 6) & 1) << PIX_COSEL_SHIFT;                                                                              \
+ spix_base_or |= ((LineColorEn >> 5/*5 here, not 6*/) & 1) << PIX_LCE_SHIFT;                                                                \
+ spix_base_or |= (((CCCTL >> 12) & 0x7) == 0x0) << PIX_GRAD_SHIFT;                                                                          \
+ spix_base_or |= ((CCCTL >> 6) & 1) << PIX_LAYER_CCE_SHIFT;                                                                                 \
+                                                                                                                                           \
+ for(unsigned i = 0; MDFN_LIKELY(i < w); i++)                                                                                               \
+ {                                                                                                                                          \
+  unsigned src;                                                                                                                             \
+  unsigned pr = 0, cc = 0;                                                                                                                  \
+  bool tp = false;                                                                                                                          \
+  uint64_t spix;                                                                                                                            \
+                                                                                                                                           \
+  src = vdp1sb[i >> (HIRES)];                                                                                                               \
+                                                                                                                                           \
+  if(vdp1_hires8)                                                                                                                           \
+  {                                                                                                                                         \
+   if((HIRES))                                                                                                                              \
+    src = 0xFF00 | (src >> (((i & 1) ^ 1) << 3));                                                                                           \
+   else                                                                                                                                     \
+    src = 0xFF00 | (src >> 8);                                                                                                              \
+  }                                                                                                                                         \
+                                                                                                                                           \
+  if(SpriteColorMode && (src & 0x8000))                                                                                                     \
+  {                                                                                                                                         \
+   spix = (uint64_t)rgb15_to_rgb24(src) << PIX_RGB_SHIFT;                                                                                   \
+   spix |= 1U << PIX_ISRGB_SHIFT;                                                                                                           \
+   spix |= SpriteCC3Mask;                                                                                                                   \
+                                                                                                                                           \
+   if(SpriteType & 0x8)                                                                                                                     \
+    tp = !(src & 0xFF);                                                                                                                     \
+   else if(SpriteWinEn)                                                                                                                     \
+   {                                                                                                                                        \
+    if(SpriteType >= 0x2 && SpriteType <= 0x7)                                                                                              \
+     tp = !(src & 0x7FFF);                                                                                                                  \
+   }                                                                                                                                        \
+  }                                                                                                                                         \
+  else                                                                                                                                      \
+  {                                                                                                                                         \
+   bool nshad = false;                                                                                                                      \
+   bool sd = false;                                                                                                                         \
+   unsigned dc;                                                                                                                             \
+                                                                                                                                           \
+   if(SpriteType & 0x8)                                                                                                                     \
+    src &= 0xFF;                                                                                                                            \
+                                                                                                                                           \
+   tp = !src;                                                                                                                               \
+                                                                                                                                           \
+   switch(SpriteType)                                                                                                                       \
+   {                                                                                                                                        \
+     case 0x0:                                                                                                                              \
+	pr = (src >> 14) & 0x3;                                                                                                                    \
+	cc = (src >> 11) & 0x7;                                                                                                                    \
+	dc = src & 0x7FF;                                                                                                                          \
+	nshad = (dc == 0x7FE);                                                                                                                     \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0x1:                                                                                                                              \
+	pr = (src >> 13) & 0x7;                                                                                                                    \
+	cc = (src >> 11) & 0x3;                                                                                                                    \
+	dc = src & 0x7FF;                                                                                                                          \
+	nshad = (dc == 0x7FE);                                                                                                                     \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0x2:                                                                                                                              \
+	sd = (src >> 15) & 0x1;                                                                                                                    \
+	pr = (src >> 14) & 0x1;                                                                                                                    \
+	cc = (src >> 11) & 0x7;                                                                                                                    \
+	dc = src & 0x7FF;                                                                                                                          \
+	nshad = (dc == 0x7FE);                                                                                                                     \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0x3:                                                                                                                              \
+	sd = (src >> 15) & 0x1;                                                                                                                    \
+	pr = (src >> 13) & 0x3;                                                                                                                    \
+	cc = (src >> 11) & 0x3;                                                                                                                    \
+	dc = src & 0x7FF;                                                                                                                          \
+	nshad = (dc == 0x7FE);                                                                                                                     \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0x4:                                                                                                                              \
+	sd = (src >> 15) & 0x1;                                                                                                                    \
+	pr = (src >> 13) & 0x3;                                                                                                                    \
+	cc = (src >> 10) & 0x7;                                                                                                                    \
+	dc = src & 0x3FF;                                                                                                                          \
+	nshad = (dc == 0x3FE);                                                                                                                     \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0x5:                                                                                                                              \
+	sd = (src >> 15) & 0x1;                                                                                                                    \
+	pr = (src >> 12) & 0x7;                                                                                                                    \
+	cc = (src >> 11) & 0x1;                                                                                                                    \
+	dc = src & 0x7FF;                                                                                                                          \
+	nshad = (dc == 0x7FE);                                                                                                                     \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0x6:                                                                                                                              \
+	sd = (src >> 15) & 0x1;                                                                                                                    \
+	pr = (src >> 12) & 0x7;                                                                                                                    \
+	cc = (src >> 10) & 0x3;                                                                                                                    \
+	dc = src & 0x3FF;                                                                                                                          \
+	nshad = (dc == 0x3FE);                                                                                                                     \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0x7:                                                                                                                              \
+	sd = (src >> 15) & 0x1;                                                                                                                    \
+	pr = (src >> 12) & 0x7;                                                                                                                    \
+	cc = (src >>  9) & 0x7;                                                                                                                    \
+	dc = src & 0x1FF;                                                                                                                          \
+	nshad = (dc == 0x1FE);                                                                                                                     \
+	break;                                                                                                                                     \
+/* */                                                                                                                                       \
+/* */                                                                                                                                       \
+/* */                                                                                                                                       \
+     case 0x8:                                                                                                                              \
+	pr = (src >> 7) & 0x1;                                                                                                                     \
+	dc = src & 0x7F;                                                                                                                           \
+	nshad = (dc == 0x7E);                                                                                                                      \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0x9:                                                                                                                              \
+	pr = (src >> 7) & 0x1;                                                                                                                     \
+	cc = (src >> 6) & 0x1;                                                                                                                     \
+	dc = src & 0x3F;                                                                                                                           \
+	nshad = (dc == 0x3E);                                                                                                                      \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0xA:                                                                                                                              \
+	pr = (src >> 6) & 0x3;                                                                                                                     \
+	dc = src & 0x3F;                                                                                                                           \
+	nshad = (dc == 0x3E);                                                                                                                      \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0xB:                                                                                                                              \
+	cc = (src >> 6) & 0x3;                                                                                                                     \
+	dc = src & 0x3F;                                                                                                                           \
+	nshad = (dc == 0x3E);                                                                                                                      \
+	break;                                                                                                                                     \
+/* */                                                                                                                                       \
+     case 0xC:                                                                                                                              \
+	pr = (src >> 7) & 0x1;                                                                                                                     \
+	dc = src & 0xFF;                                                                                                                           \
+	nshad = (dc == 0xFE);                                                                                                                      \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0xD:                                                                                                                              \
+	pr = (src >> 7) & 0x1;                                                                                                                     \
+	cc = (src >> 6) & 0x1;                                                                                                                     \
+	dc = src & 0xFF;                                                                                                                           \
+	nshad = (dc == 0xFE);                                                                                                                      \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0xE:                                                                                                                              \
+	pr = (src >> 6) & 0x3;                                                                                                                     \
+	dc = src & 0xFF;                                                                                                                           \
+	nshad = (dc == 0xFE);                                                                                                                      \
+	break;                                                                                                                                     \
+                                                                                                                                           \
+     case 0xF:                                                                                                                              \
+	cc = (src >> 6) & 0x3;                                                                                                                     \
+	dc = src & 0xFF;                                                                                                                           \
+	nshad = (dc == 0xFE);                                                                                                                      \
+	break;                                                                                                                                     \
+   }                                                                                                                                        \
+/* */                                                                                                                                       \
+/* */                                                                                                                                       \
+/* */                                                                                                                                       \
+   uint32_t rgb24 = ColorCache[(cao + dc) & 0x7FF];                                                                                         \
+                                                                                                                                           \
+   spix = (uint64_t)rgb24 << PIX_RGB_SHIFT;                                                                                                 \
+                                                                                                                                           \
+   spix |= ((int32_t)rgb24 >> 31) & SpriteCC3Mask;                                                                                          \
+                                                                                                                                           \
+   if(SpriteWinEn) /* Sprite window enable */                                                                                               \
+    spix |= ((uint64_t)sd << PIX_SWBIT_SHIFT);                                                                                              \
+                                                                                                                                           \
+   if(nshad)                                                                                                                                \
+    spix |= 1 << PIX_DOSHAD_SHIFT;                                                                                                          \
+   else                                                                                                                                     \
+   {                                                                                                                                        \
+    if(SpriteWinEn)                                                                                                                         \
+    {                                                                                                                                       \
+     if(SpriteType >= 0x2 && SpriteType <= 0x7)                                                                                             \
+      tp = !(src & 0x7FFF);                                                                                                                 \
+    }                                                                                                                                       \
+    else if(sd)                                                                                                                             \
+    {                                                                                                                                       \
+     if(src & 0x7FFF)                                                                                                                       \
+      spix |= 1 << PIX_SELFSHAD_SHIFT;                                                                                                      \
+     else if((TPSS))                                                                                                                        \
+      spix |= 1 << PIX_DOSHAD_SHIFT;                                                                                                        \
+     else                                                                                                                                   \
+      tp = true;                                                                                                                            \
+    }                                                                                                                                       \
+   }                                                                                                                                        \
+  }                                                                                                                                         \
+                                                                                                                                           \
+  spix |= spix_base_or;                                                                                                                     \
+  spix |= (tp ? 0 : SpritePrioNum[pr]) << PIX_PRIO_SHIFT;                                                                                   \
+  spix |= SpriteCCRatio[cc] << PIX_CCRATIO_SHIFT;                                                                                           \
+  spix |= SpriteCCLUT[pr];                                                                                                                  \
+                                                                                                                                           \
+  LB.spr[i] = spix;                                                                                                                         \
+ }                                                                                                                                          \
+}
+
+#define T_DrawSpriteData_NAME(HIRES, TPSS, SPCTL) \
+ T_DrawSpriteData_##HIRES##_##TPSS##_##SPCTL
+
+#define DEFINE_T_DrawSpriteData(HIRES, TPSS, SPCTL)                                                            \
+ static void T_DrawSpriteData_NAME(HIRES, TPSS, SPCTL)(const uint16_t* __restrict__ vdp1sb,                     \
+                                                       const bool vdp1_hires8,                                  \
+                                                       unsigned w)                                              \
+ T_DrawSpriteData_BODY(HIRES, TPSS, SPCTL)
+
+/* SPCTL enumeration: 64 values, explicit list (cleanest given the
+ * width and the need for literal hex tokens for ## pasting). */
+#define DSD_ENUM_SP(M, HIRES, TPSS)                                                                                                  \
+ M(HIRES, TPSS, 0x00) M(HIRES, TPSS, 0x01) M(HIRES, TPSS, 0x02) M(HIRES, TPSS, 0x03) M(HIRES, TPSS, 0x04) M(HIRES, TPSS, 0x05) M(HIRES, TPSS, 0x06) M(HIRES, TPSS, 0x07) \
+ M(HIRES, TPSS, 0x08) M(HIRES, TPSS, 0x09) M(HIRES, TPSS, 0x0a) M(HIRES, TPSS, 0x0b) M(HIRES, TPSS, 0x0c) M(HIRES, TPSS, 0x0d) M(HIRES, TPSS, 0x0e) M(HIRES, TPSS, 0x0f) \
+ M(HIRES, TPSS, 0x10) M(HIRES, TPSS, 0x11) M(HIRES, TPSS, 0x12) M(HIRES, TPSS, 0x13) M(HIRES, TPSS, 0x14) M(HIRES, TPSS, 0x15) M(HIRES, TPSS, 0x16) M(HIRES, TPSS, 0x17) \
+ M(HIRES, TPSS, 0x18) M(HIRES, TPSS, 0x19) M(HIRES, TPSS, 0x1a) M(HIRES, TPSS, 0x1b) M(HIRES, TPSS, 0x1c) M(HIRES, TPSS, 0x1d) M(HIRES, TPSS, 0x1e) M(HIRES, TPSS, 0x1f) \
+ M(HIRES, TPSS, 0x20) M(HIRES, TPSS, 0x21) M(HIRES, TPSS, 0x22) M(HIRES, TPSS, 0x23) M(HIRES, TPSS, 0x24) M(HIRES, TPSS, 0x25) M(HIRES, TPSS, 0x26) M(HIRES, TPSS, 0x27) \
+ M(HIRES, TPSS, 0x28) M(HIRES, TPSS, 0x29) M(HIRES, TPSS, 0x2a) M(HIRES, TPSS, 0x2b) M(HIRES, TPSS, 0x2c) M(HIRES, TPSS, 0x2d) M(HIRES, TPSS, 0x2e) M(HIRES, TPSS, 0x2f) \
+ M(HIRES, TPSS, 0x30) M(HIRES, TPSS, 0x31) M(HIRES, TPSS, 0x32) M(HIRES, TPSS, 0x33) M(HIRES, TPSS, 0x34) M(HIRES, TPSS, 0x35) M(HIRES, TPSS, 0x36) M(HIRES, TPSS, 0x37) \
+ M(HIRES, TPSS, 0x38) M(HIRES, TPSS, 0x39) M(HIRES, TPSS, 0x3a) M(HIRES, TPSS, 0x3b) M(HIRES, TPSS, 0x3c) M(HIRES, TPSS, 0x3d) M(HIRES, TPSS, 0x3e) M(HIRES, TPSS, 0x3f)
+
+#define DSD_ENUM_TPSS(M, HIRES) \
+ M(HIRES, 0)                   \
+ M(HIRES, 1)
+
+#define DSD_ENUM_HIRES(M) \
+ M(0)                    \
+ M(1)
+
+/* Function-definition composition. */
+#define DSD_FN_AT_TPSS(HIRES, TPSS) DSD_ENUM_SP(DEFINE_T_DrawSpriteData, HIRES, TPSS)
+#define DSD_FN_AT_HIRES(HIRES)      DSD_ENUM_TPSS(DSD_FN_AT_TPSS, HIRES)
+
+DSD_FN_AT_HIRES(0)
+DSD_FN_AT_HIRES(1)
+
+/* Table composition: each non-leaf level wraps in braces. */
+#define DSD_TBL_AT_SP(HIRES, TPSS, SPCTL)  T_DrawSpriteData_NAME(HIRES, TPSS, SPCTL),
+#define DSD_TBL_AT_TPSS(HIRES, TPSS)       { DSD_ENUM_SP(DSD_TBL_AT_SP, HIRES, TPSS) },
+#define DSD_TBL_AT_HIRES(HIRES)            { DSD_ENUM_TPSS(DSD_TBL_AT_TPSS, HIRES) },
+
+static void (*DrawSpriteData[2][2][0x40])(const uint16_t* vdp1sb, const bool vdp1_hires8, unsigned w) =
+{
+ DSD_TBL_AT_HIRES(0)
+ DSD_TBL_AT_HIRES(1)
+};
+
+#undef DSD_TBL_AT_HIRES
+#undef DSD_TBL_AT_TPSS
+#undef DSD_TBL_AT_SP
+#undef DSD_FN_AT_HIRES
+#undef DSD_FN_AT_TPSS
+#undef DSD_ENUM_HIRES
+#undef DSD_ENUM_TPSS
+#undef DSD_ENUM_SP
+#undef DEFINE_T_DrawSpriteData
+#undef T_DrawSpriteData_NAME
+#undef T_DrawSpriteData_BODY
+
+// Don't change these constants without also updating the template variable
+// setup for the call into MixIt(and the contents of MixIt itself...).
+enum
+{
+ MIXIT_SPECIAL_NONE = 0x0,
+ MIXIT_SPECIAL_GRAD = 0x1,
+ MIXIT_SPECIAL_EXCC_CRAM0 = 0x2,
+ MIXIT_SPECIAL_EXCC_CRAM12 = 0x3,
+ MIXIT_SPECIAL_EXCC_LINE_CRAM0 = 0x4,
+ MIXIT_SPECIAL_EXCC_LINE_CRAM12 = 0x5,
+ MIXIT_SPECIAL_HIRES_CRAM12 = 0x6
+};
+
+#ifdef MSB_FIRST
+#define MIXIT_TO_SURFACE(v) (((uint32_t)(v)) >> 8)
+#else
+#define MIXIT_TO_SURFACE(v) (__builtin_bswap32((uint32_t)(v)) >> 8)
+#endif
+
+/* MixIt layer fetch, pointer-gather form.
+ *
+ * The old form materialized a uint64_t tmp_pix[8] on the stack every
+ * pixel purely so the lzcount-derived layer index could variably index
+ * it -- 64 bytes of stores per pixel before any mixing.  Instead keep a
+ * loop-invariant table of layer base pointers and fetch the selected
+ * pixel straight from the line buffers; the selected pixel's line is
+ * already hot from the priority loads.  Index 6 (null) reads a
+ * never-written static zero row; index 7 (back) reads the zero row as a
+ * harmless dummy and is patched to back_pix with a branchless select.
+ *
+ * Measured on the extracted select kernel (352px lines, realistic layer
+ * occupancy/shadow/CC mix, checksum-identical output): 3.53 -> 2.39
+ * ns/px (-32%) vs the stack form on Skylake-class x86-64.  A keyed
+ * SSE4.2 max-tournament variant measured 2x slower than scalar
+ * (per-pixel GPR->vector key marshalling), so the gather form is also
+ * the measured answer to the SIMD question at this LB pixel format.
+ */
+static const uint64_t MixIt_NullRow[704] = { 0 };
+
+static INLINE uint64_t MixIt_Fetch(const uint64_t* const* bases, const uint32_t i, const unsigned st, const uint64_t back_pix)
+{
+ const unsigned idx = st & 0x7;
+ const uint64_t v = bases[idx][i];
+
+ return (idx == 0x7) ? back_pix : v;
+}
+
+/* Per-pixel RGB24 channel kernels used by T_MixIt's color-calc and
+ * color-offset stages.  Each takes scalar uint32_t RGB inputs (R in byte 0,
+ * G in byte 1, B in byte 2) and returns scalar uint32_t RGB.  On aarch64
+ * the body uses NEON byte ops to do the three channels in one shot; on
+ * other targets it falls back to the original scalar per-channel expression
+ * (preserves amd64 codegen byte-identical to before this change). */
+
+static MDFN_FORCE_INLINE uint32_t MixIt_satadd_rgb24(uint32_t fore_rgb, uint32_t sec_rgb)
+{
+#if defined(__aarch64__)
+ const uint8x8_t f = vreinterpret_u8_u32(vdup_n_u32(fore_rgb));
+ const uint8x8_t s = vreinterpret_u8_u32(vdup_n_u32(sec_rgb));
+ const uint8x8_t r = vqadd_u8(f, s);
+ return vget_lane_u32(vreinterpret_u32_u8(r), 0) & 0xFFFFFFu;
+#else
+ uint32_t r;
+ r  = ((unsigned)(0x0000FF) < (unsigned)((fore_rgb & 0x0000FF) + (sec_rgb & 0x0000FF)) ? (unsigned)(0x0000FF) : (unsigned)((fore_rgb & 0x0000FF) + (sec_rgb & 0x0000FF)));
+ r |= ((unsigned)(0x00FF00) < (unsigned)((fore_rgb & 0x00FF00) + (sec_rgb & 0x00FF00)) ? (unsigned)(0x00FF00) : (unsigned)((fore_rgb & 0x00FF00) + (sec_rgb & 0x00FF00)));
+ r |= ((unsigned)(0xFF0000) < (unsigned)((fore_rgb & 0xFF0000) + (sec_rgb & 0xFF0000)) ? (unsigned)(0xFF0000) : (unsigned)((fore_rgb & 0xFF0000) + (sec_rgb & 0xFF0000)));
+ return r;
+#endif
+}
+
+/* fore_ratio + sec_ratio is always 0x20, ratio inputs are in [0, 0x1F].  Per-
+ * channel max product fits in 13 bits, so the uint8*uint8 widening (UMULL +
+ * UMLAL) sums never overflow u16, and the post-shift right by 5 narrows back
+ * to a byte. */
+static MDFN_FORCE_INLINE uint32_t MixIt_blend_rgb24(uint32_t fore_rgb, uint32_t sec_rgb,
+                                                    unsigned fore_ratio, unsigned sec_ratio)
+{
+#if defined(__aarch64__)
+ const uint8x8_t f = vreinterpret_u8_u32(vdup_n_u32(fore_rgb));
+ const uint8x8_t s = vreinterpret_u8_u32(vdup_n_u32(sec_rgb));
+ uint16x8_t prod = vmull_u8(f, vdup_n_u8((uint8_t)fore_ratio));
+ prod = vmlal_u8(prod, s, vdup_n_u8((uint8_t)sec_ratio));
+ const uint8x8_t narrow = vshrn_n_u16(prod, 5);
+ return vget_lane_u32(vreinterpret_u32_u8(narrow), 0) & 0xFFFFFFu;
+#else
+ uint32_t r;
+ r  = ((((fore_rgb & 0x0000FF) * fore_ratio) + ((sec_rgb & 0x0000FF) * sec_ratio)) >> 5);
+ r |= ((((fore_rgb & 0x00FF00) * fore_ratio) + ((sec_rgb & 0x00FF00) * sec_ratio)) >> 5) & 0x00FF00;
+ r |= ((((fore_rgb & 0xFF0000) * fore_ratio) + ((sec_rgb & 0xFF0000) * sec_ratio)) >> 5) & 0xFF0000;
+ return r;
+#endif
+}
+
+/* off_r is a sign-extended 9-bit offset in the low bits; off_g_shifted is
+ * already pre-shifted by 8 (so it occupies bits 0..16, range [-0xFF00,
+ * +0xFF00]); off_b_shifted by 16.  We reverse those shifts to recover a
+ * per-channel int16 offset, then do one 4-lane signed add + saturated narrow
+ * to u8. */
+static MDFN_FORCE_INLINE uint32_t MixIt_coloroffs_rgb24(uint32_t rgb_tmp,
+                                                        int32_t off_r,
+                                                        int32_t off_g_shifted,
+                                                        int32_t off_b_shifted)
+{
+#if defined(__aarch64__)
+ const int16x4_t offs = {
+  (int16_t)off_r,
+  (int16_t)(off_g_shifted >> 8),
+  (int16_t)(off_b_shifted >> 16),
+  0
+ };
+ const uint8x8_t rgb_lo = vreinterpret_u8_u32(vdup_n_u32(rgb_tmp));
+ const int16x4_t rgb_4  = vreinterpret_s16_u16(vget_low_u16(vmovl_u8(rgb_lo)));
+ const int16x4_t sum    = vadd_s16(rgb_4, offs);
+ const int16x8_t sum8   = vcombine_s16(sum, vdup_n_s16(0));
+ const uint8x8_t narrow = vqmovun_s16(sum8);
+ return vget_lane_u32(vreinterpret_u32_u8(narrow), 0) & 0xFFFFFFu;
+#else
+ int32_t rt = off_r + (int32_t)(rgb_tmp & 0x000000FFu);
+ if(rt < 0) rt = 0;
+ if(rt > 0x000000FF) rt = 0x000000FF;
+ int32_t gt = off_g_shifted + (int32_t)(rgb_tmp & 0x0000FF00u);
+ if(gt < 0) gt = 0;
+ if(gt > 0x0000FF00) gt = 0x0000FF00;
+ int32_t bt = off_b_shifted + (int32_t)(rgb_tmp & 0x00FF0000u);
+ if(bt < 0) bt = 0;
+ if(bt > 0x00FF0000) bt = 0x00FF0000;
+ return (uint32_t)(rt | gt | bt);
+#endif
+}
+
+/* T_MixIt: was `template<bool TA_rbgdualen, unsigned TA_Special,
+ * bool TA_CCRTMD, bool TA_CCMD> static void T_MixIt(uint32_t*
+ * target, const unsigned vdp2_line, const unsigned w, const
+ * uint32_t back_rgb24, const uint64_t* blursrc)`.  56 specs:
+ * DUALEN in {0,1}, SPECIAL in {0..6} (the MIXIT_SPECIAL_*
+ * enum range), CCRTMD in {0,1}, CCMD in {0,1}.  Table layout
+ * [2][7][2][2] unchanged.
+ *
+ * Converted via the same X-macro pattern as the prior phase-3
+ * function-table conversions (T_DrawRBG_ConstAB / T_DrawNBG23
+ * / T_DrawNBG / T_DrawRBG / T_DrawSpriteData).  Four-dimensional
+ * descent: DUALEN -> SPECIAL -> CCRTMD -> CCMD.
+ *
+ * Body has 13 template-arg references across 265 lines: mostly
+ * `if(TA_Special == MIXIT_SPECIAL_XX)` branches and a couple of
+ * `if(TA_CCRTMD)` / `if(TA_CCMD)` / `if(TA_rbgdualen)` checks.
+ * With the macro form each becomes a literal constant after
+ * substitution, folding identically to the template form.
+ *
+ * Line-comments rewritten as block-comments for line-spliced
+ * macro safety; same convention as prior phases. */
+#define T_MixIt_BODY(DUALEN, SPECIAL, CCRTMD, CCMD) \
+{                                                                                                                                           \
+ const uint32_t* lclut = &ColorCache[CurLCColor &~ 0x7F];                                                                                   \
+ uint32_t blurprev[2];                                                                                                                      \
+                                                                                                                                           \
+ if((SPECIAL) == MIXIT_SPECIAL_GRAD)                                                                                                        \
+  blurprev[0] = blurprev[1] = *blursrc >> PIX_RGB_SHIFT;                                                                                    \
+                                                                                                                                           \
+ uint32_t line_pix_l;                                                                                                                       \
+ {                                                                                                                                          \
+  line_pix_l = 0U << PIX_ISRGB_SHIFT;                                                                                                       \
+  line_pix_l |= LineColorCCRatio << PIX_CCRATIO_SHIFT;                                                                                      \
+  line_pix_l |= ((CCCTL >> 5) & 1) << PIX_CCE_SHIFT;                                                                                        \
+  line_pix_l |= ((CCCTL >> 5) & 1) << PIX_LAYER_CCE_SHIFT;                                                                                  \
+ }                                                                                                                                          \
+                                                                                                                                           \
+/* */                                                                                                                                       \
+/* */                                                                                                                                       \
+ uint64_t back_pix;                                                                                                                         \
+ {                                                                                                                                          \
+  back_pix = (uint64_t)back_rgb24 << PIX_RGB_SHIFT;                                                                                         \
+  back_pix |= 1U << PIX_ISRGB_SHIFT;                                                                                                        \
+  back_pix |= ((ColorOffsEn >> 5) & 1) << PIX_COE_SHIFT;                                                                                    \
+  back_pix |= ((ColorOffsSel >> 5) & 1) << PIX_COSEL_SHIFT;                                                                                 \
+  back_pix |= ((SDCTL >> 5) & 1) << PIX_SHADEN_SHIFT;                                                                                       \
+  back_pix |= BackCCRatio << PIX_CCRATIO_SHIFT;                                                                                             \
+ }                                                                                                                                          \
+                                                                                                                                           \
+ /* Loop-invariant layer base pointers, indexed by the same 0..7 layer
+  * ids the priority bitboard produces.  DUALEN folds the disabled
+  * layers to the null row at compile time, matching the old zeroed
+  * array slots. */                                                                                                                         \
+ const uint64_t* const mix_bases[8] =                                                                                                       \
+ {                                                                                                                                          \
+  ((DUALEN) ? MixIt_NullRow : (LB.nbg[3] + 8)),                                                                                             \
+  ((DUALEN) ? MixIt_NullRow : (LB.nbg[2] + 8)),                                                                                             \
+  ((DUALEN) ? MixIt_NullRow : (LB.nbg[1] + 8)),                                                                                             \
+  (LB.nbg[0] + 8),                                                                                                                          \
+  LB.rbg0,                                                                                                                                  \
+  LB.spr,                                                                                                                                   \
+  MixIt_NullRow,                                                                                                                            \
+  MixIt_NullRow /* dummy read; index 7 is patched to back_pix */                                                                            \
+ };                                                                                                                                         \
+                                                                                                                                           \
+ for(uint32_t i = 0; MDFN_LIKELY(i < w); i++)                                                                                               \
+ {                                                                                                                                          \
+  uint64_t pix = back_pix;                                                                                                                  \
+  uint32_t blurcake;                                                                                                                        \
+                                                                                                                                           \
+/* */                                                                                                                                       \
+/* Listed from lowest priority to greatest priority when prio levels are equal(back pixel has prio level of 0, */                           \
+/* and should display on "top" of any other layers). */                                                                                     \
+/* */                                                                                                                                       \
+  uint64_t pt;                                                                                                                              \
+  unsigned st;                                                                                                                              \
+                                                                                                                                           \
+  const uint64_t mp_nbg3 = mix_bases[0][i], mp_nbg2 = mix_bases[1][i];                                                                     \
+  const uint64_t mp_nbg1 = mix_bases[2][i], mp_nbg0 = mix_bases[3][i];                                                                      \
+  const uint64_t mp_rbg0 = mix_bases[4][i], mp_spr  = mix_bases[5][i];                                                                      \
+  pt  = 0x01ULL << (uint8_t)(mp_nbg3 >> PIX_PRIO_TEST_SHIFT);                                                                            \
+  pt |= 0x02ULL << (uint8_t)(mp_nbg2 >> PIX_PRIO_TEST_SHIFT);                                                                            \
+  pt |= 0x04ULL << (uint8_t)(mp_nbg1 >> PIX_PRIO_TEST_SHIFT);                                                                            \
+  pt |= 0x08ULL << (uint8_t)(mp_nbg0 >> PIX_PRIO_TEST_SHIFT);                                                                            \
+  pt |= 0x10ULL << (uint8_t)(mp_rbg0 >> PIX_PRIO_TEST_SHIFT);                                                                            \
+  pt |= 0x20ULL << (uint8_t)(mp_spr >> PIX_PRIO_TEST_SHIFT);                                                                            \
+  pt |= 0xC0ULL; /* Back pixel(0x80) and null pixel(0x40) */                                                                                \
+                                                                                                                                           \
+  st = 63 ^ MDFN_lzcount64_0UD(pt);                                                                                                         \
+  pt ^= 1ULL << st;                                                                                                                         \
+  pt |= 0x40; /* Restore the null! */                                                                                                       \
+  pix = MixIt_Fetch(mix_bases, i, st, back_pix);                                                                                                                  \
+                                                                                                                                           \
+  if(pix & (1U << PIX_DOSHAD_SHIFT))                                                                                                        \
+  {                                                                                                                                         \
+   st = 63 ^ MDFN_lzcount64_0UD(pt);                                                                                                        \
+   pt ^= 1ULL << st;                                                                                                                        \
+   pt |= 0x40; /* Restore the null! */                                                                                                      \
+   pix = MixIt_Fetch(mix_bases, i, st, back_pix);                                                                                                                 \
+   pix |= (1U << PIX_DOSHAD_SHIFT);                                                                                                         \
+  }                                                                                                                                         \
+                                                                                                                                           \
+/* */                                                                                                                                       \
+/* Prevent blending with a transparent sprite shadow pixel beneath the topmost layer: */                                                    \
+/* */                                                                                                                                       \
+/*if(mp_spr & (1U << PIX_DOSHAD_SHIFT)) */                                                                                              \
+/* pt &= ~0x2020202020202020ULL; */                                                                                                         \
+/* PIX_DOSHAD_SHIFT compile-time check via negative-array-bound trick */                                                                    \
+/* (no static_assert / _Static_assert dependence; works in both C and */                                                                    \
+/* C++ -- C++ has its own static_assert, C99 doesn't get _Static_assert */                                                                  \
+/* until C11, and GCC's C++ mode rejects _Static_assert without */                                                                          \
+/* -fpermissive).  Triggers `size of unnamed array is negative` on */                                                                       \
+/* mismatch.  The typedef is named to allow grep'ing for the assert. */                                                                     \
+  typedef char VDP2REND_PIX_DOSHAD_SHIFT_check[                                                                                             \
+   1 - 2*!((1U << PIX_DOSHAD_SHIFT) == 0x40)];                                                                                              \
+  (void)sizeof(VDP2REND_PIX_DOSHAD_SHIFT_check);                                                                                            \
+  pt &= ~((((mp_spr >> 1) & 0x20) << (uint8_t)(mp_spr >> PIX_PRIO_TEST_SHIFT)));                                                    \
+                                                                                                                                           \
+                                                                                                                                           \
+  if((SPECIAL) == MIXIT_SPECIAL_GRAD)                                                                                                       \
+  {                                                                                                                                         \
+   const uint32_t blurpie = blursrc[i] >> PIX_RGB_SHIFT;                                                                                    \
+                                                                                                                                           \
+   blurcake = ((blurprev[0] + blurprev[1]) - ((blurprev[0] ^ blurprev[1]) & 0x01010101)) >> 1;                                              \
+   blurcake = ((blurcake + blurpie) - ((blurcake ^ blurpie) & 0x01010101)) >> 1;                                                            \
+   blurprev[0] = blurprev[1];                                                                                                               \
+   blurprev[1] = blurpie;                                                                                                                   \
+  }                                                                                                                                         \
+                                                                                                                                           \
+/* */                                                                                                                                       \
+/* Color calculation */                                                                                                                     \
+/* */                                                                                                                                       \
+  if(pix & (1U << PIX_CCE_SHIFT))                                                                                                           \
+  {                                                                                                                                         \
+   uint64_t pix2, pix3;                                                                                                                     \
+                                                                                                                                           \
+   st = 63 ^ MDFN_lzcount64_0UD(pt);                                                                                                        \
+   pt ^= 1ULL << st;                                                                                                                        \
+   pt |= 0x40; /* Restore the null! */                                                                                                      \
+   pix2 = MixIt_Fetch(mix_bases, i, st, back_pix);                                                                                                                \
+                                                                                                                                           \
+   st = 63 ^ MDFN_lzcount64_0UD(pt);                                                                                                        \
+   pt ^= 1ULL << st;                                                                                                                        \
+   pt |= 0x40; /* Restore the null! */                                                                                                      \
+   pix3 = MixIt_Fetch(mix_bases, i, st, back_pix);                                                                                                                \
+                                                                                                                                           \
+   if((SPECIAL) == MIXIT_SPECIAL_GRAD)                                                                                                      \
+   {                                                                                                                                        \
+    if((pix | pix2) & (1U << PIX_GRAD_SHIFT))                                                                                               \
+     pix2 = (uint32_t)pix2 | ((uint64_t)blurcake << PIX_RGB_SHIFT); /* Be sure to preserve the color calc ratio, at least. */               \
+   }                                                                                                                                        \
+   else if(pix & (1U << PIX_LCE_SHIFT))                                                                                                     \
+   {                                                                                                                                        \
+/* */                                                                                                                                       \
+/* Line color */                                                                                                                            \
+/* */                                                                                                                                       \
+    const uint64_t pix4 = pix3;                                                                                                             \
+    const uint32_t line_pix_rgb = lclut[LB.lc[i]];                                                                                          \
+    pix3 = pix2;                                                                                                                            \
+    pix2 = line_pix_l | ((uint64_t)line_pix_rgb << PIX_RGB_SHIFT);                                                                          \
+                                                                                                                                           \
+    if((SPECIAL) == MIXIT_SPECIAL_EXCC_LINE_CRAM0)                                                                                          \
+    {                                                                                                                                       \
+     uint32_t sec_rgb = line_pix_rgb;                                                                                                       \
+     uint32_t third_rgb = (pix3 >> PIX_RGB_SHIFT);                                                                                          \
+                                                                                                                                           \
+     if(pix3 & (1U << PIX_LAYER_CCE_SHIFT))                                                                                                 \
+      third_rgb = (third_rgb >> 1) & 0x7F7F7F;                                                                                              \
+                                                                                                                                           \
+     sec_rgb = ((sec_rgb + third_rgb) - ((sec_rgb ^ third_rgb) & 0x01010101)) >> 1;                                                         \
+     pix2 = (uint32_t)pix2 | ((uint64_t)sec_rgb << PIX_RGB_SHIFT);                                                                          \
+    }                                                                                                                                       \
+    else if((SPECIAL) == MIXIT_SPECIAL_EXCC_LINE_CRAM12)                                                                                    \
+    {                                                                                                                                       \
+     uint32_t sec_rgb = line_pix_rgb;                                                                                                       \
+     uint32_t third_rgb = (pix3 >> PIX_RGB_SHIFT);                                                                                          \
+                                                                                                                                           \
+     if(pix3 & (1U << PIX_ISRGB_SHIFT))                                                                                                     \
+     {                                                                                                                                      \
+      if((pix3 & (1U << PIX_LAYER_CCE_SHIFT)) && (pix4 & (1U << PIX_ISRGB_SHIFT)))                                                          \
+      {                                                                                                                                     \
+       const uint32_t fourth_rgb = (pix4 >> PIX_RGB_SHIFT);                                                                                 \
+       third_rgb = ((third_rgb + fourth_rgb) - ((third_rgb ^ fourth_rgb) & 0x01010101)) >> 1;                                               \
+      }                                                                                                                                     \
+                                                                                                                                           \
+      sec_rgb = ((sec_rgb + third_rgb) - ((sec_rgb ^ third_rgb) & 0x01010101)) >> 1;                                                        \
+      pix2 = (uint32_t)pix2 | ((uint64_t)sec_rgb << PIX_RGB_SHIFT);                                                                         \
+     }                                                                                                                                      \
+    }                                                                                                                                       \
+   }                                                                                                                                        \
+   else                                                                                                                                     \
+   {                                                                                                                                        \
+    if((SPECIAL) == MIXIT_SPECIAL_EXCC_CRAM0 || (SPECIAL) == MIXIT_SPECIAL_EXCC_CRAM12 || (SPECIAL) == MIXIT_SPECIAL_EXCC_LINE_CRAM0 || (SPECIAL) == MIXIT_SPECIAL_EXCC_LINE_CRAM12)\
+    {                                                                                                                                       \
+     if(pix2 & (1U << PIX_LAYER_CCE_SHIFT))                                                                                                 \
+     {                                                                                                                                      \
+      if((SPECIAL) == MIXIT_SPECIAL_EXCC_CRAM0 || (SPECIAL) == MIXIT_SPECIAL_EXCC_LINE_CRAM0 || (pix3 & (1U << PIX_ISRGB_SHIFT)))           \
+      {                                                                                                                                     \
+       uint32_t sec_rgb = pix2 >> PIX_RGB_SHIFT;                                                                                            \
+       const uint32_t third_rgb = (pix3 >> PIX_RGB_SHIFT);                                                                                  \
+                                                                                                                                           \
+       sec_rgb = ((sec_rgb + third_rgb) - ((sec_rgb ^ third_rgb) & 0x01010101)) >> 1;                                                       \
+       pix2 = (uint32_t)pix2 | ((uint64_t)sec_rgb << PIX_RGB_SHIFT);                                                                        \
+      }                                                                                                                                     \
+     }                                                                                                                                      \
+    }                                                                                                                                       \
+   }                                                                                                                                        \
+                                                                                                                                           \
+   uint32_t fore_rgb = pix >> PIX_RGB_SHIFT;                                                                                                \
+   uint32_t sec_rgb = pix2 >> PIX_RGB_SHIFT;                                                                                                \
+   uint32_t new_rgb;                                                                                                                        \
+                                                                                                                                           \
+   if((SPECIAL) == MIXIT_SPECIAL_HIRES_CRAM12 && !(pix2 & (1U << PIX_ISRGB_SHIFT)))                                                         \
+    sec_rgb = fore_rgb;                                                                                                                     \
+                                                                                                                                           \
+   if((CCMD)) /* Ignore ratio, add as-is. */                                                                                                \
+   {                                                                                                                                        \
+    new_rgb = MixIt_satadd_rgb24(fore_rgb, sec_rgb);                                                                                         \
+   }                                                                                                                                        \
+   else                                                                                                                                     \
+   {                                                                                                                                        \
+    unsigned fore_ratio = ((uint32_t)((CCRTMD) ? pix2 : pix) >> PIX_CCRATIO_SHIFT) ^ 0x1F;                                                  \
+    unsigned sec_ratio = 0x20 - fore_ratio;                                                                                                 \
+                                                                                                                                           \
+    new_rgb = MixIt_blend_rgb24(fore_rgb, sec_rgb, fore_ratio, sec_ratio);                                                                  \
+   }                                                                                                                                        \
+   pix = ((uint64_t)new_rgb << 32) | (uint32_t)pix;                                                                                         \
+  }                                                                                                                                         \
+                                                                                                                                           \
+/* */                                                                                                                                       \
+/* Color offset */                                                                                                                          \
+/* */                                                                                                                                       \
+  if(pix & (1U << PIX_COE_SHIFT))                                                                                                           \
+  {                                                                                                                                         \
+   const unsigned sel = (pix >> PIX_COSEL_SHIFT) & 1;                                                                                       \
+   const uint32_t rgb_tmp = pix >> PIX_RGB_SHIFT;                                                                                           \
+   const uint32_t coff = MixIt_coloroffs_rgb24(rgb_tmp,                                                                                     \
+                                               ColorOffs[sel][0],                                                                           \
+                                               ColorOffs[sel][1],                                                                           \
+                                               ColorOffs[sel][2]);                                                                          \
+   pix = (uint32_t)pix | ((uint64_t)coff << PIX_RGB_SHIFT);                                                                                 \
+  }                                                                                                                                         \
+                                                                                                                                           \
+/* */                                                                                                                                       \
+/* Sprite shadow */                                                                                                                         \
+/* */                                                                                                                                       \
+  if((uint8_t)pix >= PIX_SHADHALVTEST8_VAL)                                                                                                 \
+   pix = (uint32_t)pix | ((pix >> 1) & 0x7F7F7F00000000ULL);                                                                                \
+                                                                                                                                           \
+/* MixIt's internal pixel format keeps R at byte 0, G at byte 1, B at */                                                                    \
+/* byte 2 (matches rgb15_to_rgb24's output and lets all the colour- */                                                                      \
+/* offset / blend / shadow math above use byte-aligned 0x0000FF / */                                                                        \
+/* 0x00FF00 / 0xFF0000 masks). The libretro surface wants R at byte 2 */                                                                    \
+/* (RED_SHIFT=16), G at byte 1 (GREEN_SHIFT=8), B at byte 0 */                                                                              \
+/* (BLUE_SHIFT=0) -- exactly the byte-swap-and-drop-high-byte that */                                                                       \
+/* ReorderRGB used to do as a separate post-pass over the same row. */                                                                      \
+/* */                                                                                                                                       \
+/* Folding it inline here costs ~2 extra instructions per pixel */                                                                          \
+/* (bswap + shr) at a register that already holds the value, and */                                                                         \
+/* eliminates the entire ReorderRGB pass's read-modify-write of the */                                                                      \
+/* active row (8 bytes/pixel of memory traffic, ~3 ops/pixel). */                                                                           \
+/* Border pixels are written by the border-fill loops in DrawLine */                                                                        \
+/* already in output format, so they don't need any swap. */                                                                                \
+/* Mesh-improved-transparency occlusion gate: record the priority of */                                                                     \
+/* the layer whose pix won this output pixel. ApplyMeshOverlay reads */                                                                     \
+/* this to suppress mesh blending where a higher-priority VDP2 layer */                                                                     \
+/* already occludes the would-be VDP1 sprite (matches Kronos's */                                                                           \
+/* `if (i <= FBMeshPrio)` rule). PIX_PRIO_SHIFT holds the resolved */                                                                       \
+/* priority value (0..7); one byte store per output pixel. */                                                                               \
+/* */                                                                                                                                       \
+/* Gated on the runtime MeshImproved flag rather than written */                                                                            \
+/* unconditionally: the flag flips only via the libretro option- */                                                                         \
+/* update path so the branch is ~100% predictable across a frame, */                                                                        \
+/* and gating keeps MixIt's default-off cost identical to before */                                                                         \
+/* this feature existed. */                                                                                                                 \
+  if(VDP1_MeshImproved)                                                                                                                     \
+   LIB[vdp2_line].vdp1_winprio[i] = (pix >> PIX_PRIO_SHIFT) & 0x7;                                                                          \
+  target[i] = MIXIT_TO_SURFACE(pix >> PIX_RGB_SHIFT);                                                                                       \
+ }                                                                                                                                          \
+}
+
+#define T_MixIt_NAME(DUALEN, SPECIAL, CCRTMD, CCMD) \
+ T_MixIt_##DUALEN##_##SPECIAL##_##CCRTMD##_##CCMD
+
+#define DEFINE_T_MixIt(DUALEN, SPECIAL, CCRTMD, CCMD)                                                          \
+ static void T_MixIt_NAME(DUALEN, SPECIAL, CCRTMD, CCMD)(uint32_t* target, const unsigned vdp2_line,            \
+                                                         const unsigned w, const uint32_t back_rgb24,           \
+                                                         const uint64_t* blursrc)                               \
+ T_MixIt_BODY(DUALEN, SPECIAL, CCRTMD, CCMD)
+
+/* One-level enumerators. */
+#define DMI_ENUM_CCMD(M, DUALEN, SPECIAL, CCRTMD) \
+ M(DUALEN, SPECIAL, CCRTMD, 0)                    \
+ M(DUALEN, SPECIAL, CCRTMD, 1)
+
+#define DMI_ENUM_CCRTMD(M, DUALEN, SPECIAL) \
+ M(DUALEN, SPECIAL, 0)                     \
+ M(DUALEN, SPECIAL, 1)
+
+#define DMI_ENUM_SPECIAL(M, DUALEN) \
+ M(DUALEN, 0)                      \
+ M(DUALEN, 1)                      \
+ M(DUALEN, 2)                      \
+ M(DUALEN, 3)                      \
+ M(DUALEN, 4)                      \
+ M(DUALEN, 5)                      \
+ M(DUALEN, 6)
+
+#define DMI_ENUM_DUALEN(M) \
+ M(0)                     \
+ M(1)
+
+/* Function-definition composition. */
+#define DMI_FN_AT_CCRTMD(DUALEN, SPECIAL, CCRTMD) DMI_ENUM_CCMD(DEFINE_T_MixIt, DUALEN, SPECIAL, CCRTMD)
+#define DMI_FN_AT_SPECIAL(DUALEN, SPECIAL)        DMI_ENUM_CCRTMD(DMI_FN_AT_CCRTMD, DUALEN, SPECIAL)
+#define DMI_FN_AT_DUALEN(DUALEN)                  DMI_ENUM_SPECIAL(DMI_FN_AT_SPECIAL, DUALEN)
+
+DMI_FN_AT_DUALEN(0)
+DMI_FN_AT_DUALEN(1)
+
+/* Table composition: each non-leaf level wraps in braces. */
+#define DMI_TBL_AT_CCMD(DUALEN, SPECIAL, CCRTMD, CCMD)  T_MixIt_NAME(DUALEN, SPECIAL, CCRTMD, CCMD),
+#define DMI_TBL_AT_CCRTMD(DUALEN, SPECIAL, CCRTMD)      { DMI_ENUM_CCMD(DMI_TBL_AT_CCMD, DUALEN, SPECIAL, CCRTMD) },
+#define DMI_TBL_AT_SPECIAL(DUALEN, SPECIAL)             { DMI_ENUM_CCRTMD(DMI_TBL_AT_CCRTMD, DUALEN, SPECIAL) },
+#define DMI_TBL_AT_DUALEN(DUALEN)                       { DMI_ENUM_SPECIAL(DMI_TBL_AT_SPECIAL, DUALEN) },
+
+static void (*MixIt[2][7][2][2])(uint32_t* target, const unsigned vdp2_line, const unsigned w, const uint32_t back_rgb24, const uint64_t* blursrc) =
+{
+ DMI_TBL_AT_DUALEN(0)
+ DMI_TBL_AT_DUALEN(1)
+};
+
+#undef DMI_TBL_AT_DUALEN
+#undef DMI_TBL_AT_SPECIAL
+#undef DMI_TBL_AT_CCRTMD
+#undef DMI_TBL_AT_CCMD
+#undef DMI_FN_AT_DUALEN
+#undef DMI_FN_AT_SPECIAL
+#undef DMI_FN_AT_CCRTMD
+#undef DMI_ENUM_DUALEN
+#undef DMI_ENUM_SPECIAL
+#undef DMI_ENUM_CCRTMD
+#undef DMI_ENUM_CCMD
+#undef DEFINE_T_MixIt
+#undef T_MixIt_NAME
+#undef T_MixIt_BODY
+
+// Apply the improved-mesh-transparency overlay to a freshly-composited
+// scanline. For each pixel where the mesh side-buffer has a non-zero
+// texel, decode it (RGB direct or paletted-via-CRAM, the same way
+// VDP2's sprite layer would decode the same texel from FB) and 50%-
+// blend the resulting colour into the surface pixel.
+//
+// This is the late-composite half of the Kronos "improved mesh"
+// mechanism. PlotPixel routes mesh writes to MeshFB instead of the
+// main FB, so prior VDP1 content underneath stays in the main FB
+// and ends up correctly visible after VDP2 layer composition. The
+// blend in this function then tints those final pixels with the mesh
+// colour.
+//
+// Crucial: the value PlotPixel writes is the RAW texel that VDP1's
+// TexFetch produced -- a Saturn 15-bit RGB code in modes 5/6/7,
+// or a CRAM offset packed with priority/cc bits in modes 0-4. We
+// can't just expand it as RGB555 unconditionally: paletted texels
+// reinterpreted as RGB555 produce garbage colours (e.g. yellow Mega
+// Man X4 cones came out bright green because the cone polygon uses
+// paletted mode and its color-bank + index pattern, sliced as if it
+// were RGB555 in five-bit fields, lands in the green range). The
+// branch below matches the VDP2 sprite-layer decode: in
+// SpriteColorMode the MSB bit selects RGB-direct, otherwise / when
+// MSB is clear we mask out the dot-code bits per SpriteType and
+// look up ColorCache at the same `cao + dc` offset the sprite path
+// uses.
+//
+// 0 means "no mesh pixel here" (matches the lockstep MeshFB erase
+// and the non-mesh-primitive clear in PlotPixel). When MeshImproved
+// is off, MeshFB never gets written, so mesh_line is all zeros and
+// the test rejects every entry on the first compare.
+//
+// Blend formula: per-byte SWAR 50% blend with carry strip across byte
+// boundaries:
+//   result = ((a & 0xFEFEFEFE) >> 1) + ((b & 0xFEFEFEFE) >> 1)
+//          + (a & b & 0x01010101)
+// Each byte position gets (a_byte + b_byte) >> 1 without cross-byte
+// bleed. Same formula used by ApplyHBlend below.
+static INLINE void ApplyMeshOverlay(uint32_t* target, const uint16_t* mesh_line, const uint8_t* winprio, unsigned w, unsigned hires_shift)
+{
+ // dc-mask per SpriteType -- mirrors the switch in T_DrawSpriteData
+ // (SpriteType 0-3,5: 11 bits; 4,6: 10 bits; 7: 9 bits; 8,A: 6 bits
+ //  -> mask 0x3F; 9,B: 6 bits; C-F: 8 bits).
+ static const uint16_t SpriteType_DcMask[16] = {
+  0x7FF, 0x7FF, 0x7FF, 0x7FF,   // 0-3
+  0x3FF, 0x7FF, 0x3FF, 0x1FF,   // 4-7
+  0x7F,  0x3F,  0x3F,  0x3F,    // 8-B
+  0xFF,  0xFF,  0xFF,  0xFF,    // C-F
+ };
+ // Priority-bit (shift, mask) per SpriteType, mirroring the switch
+ // in T_DrawSpriteData. Used to extract the mesh texel's would-be
+ // sprite-priority slot for the SpritePrioNum[] lookup. Types 0xB
+ // and 0xF have no priority bits in the texel (they encode CC only),
+ // so they fall back to slot 0 -- the same default T_DrawSpriteData
+ // leaves `pr` at for those types.
+ static const uint8_t SpriteType_PrShift[16] = {
+  14, 13, 14, 13,  13, 12, 12, 12,
+   7,  7,  6,  0,   7,  7,  6,  0,
+ };
+ static const uint8_t SpriteType_PrMask[16] = {
+  0x3, 0x7, 0x1, 0x3,  0x3, 0x7, 0x7, 0x7,
+  0x1, 0x1, 0x3, 0x0,  0x1, 0x1, 0x3, 0x0,
+ };
+ const unsigned SpriteType   = SPCTL_Low & 0xF;
+ const bool     SpriteColorMode = SPCTL_Low & 0x20;
+ const unsigned dc_mask      = SpriteType_DcMask[SpriteType];
+ const unsigned pr_shift     = SpriteType_PrShift[SpriteType];
+ const unsigned pr_mask      = SpriteType_PrMask[SpriteType];
+ const unsigned cao          = (unsigned)CRAMAddrOffs_Sprite << 8;
+
+ for(unsigned i = 0; i < w; i++)
+ {
+  // In hires output, the sprite/mesh source has half the width of the
+  // VDP2 output, so each source pixel maps to two output pixels --
+  // mirrors T_DrawSpriteData's `vdp1sb[i >> TA_HiRes]`. Without this,
+  // i >= source-width reads off the end of vdp1_mesh_line into the
+  // next LIB struct's fields and the `m != 0` test fires on whatever
+  // happens to be there, producing a vertical seam at x=source-width
+  // regardless of MeshImproved's state (the bounds violation happens
+  // even when the buffer is all zeros, because the bytes past the
+  // array are not zero).
+  const uint16_t m = mesh_line[i >> hires_shift];
+
+  if(MDFN_UNLIKELY(m != 0))
+  {
+   // Priority occlusion. The mesh texel carries its own sprite-priority
+   // slot in the same bit positions T_DrawSpriteData uses, looked up in
+   // SpritePrioNum[] to a 0..7 priority value. If a higher-priority
+   // VDP2 layer won this output pixel, the would-be VDP1 sprite is
+   // hidden by it and the mesh must not tint -- otherwise the mesh
+   // colour bleeds through foreground NBGs (the visible bug: in
+   // Mega Man X4, the flashlight cone tint appeared on top of the
+   // tall foreground building, instead of being occluded by it).
+   const unsigned mesh_pr   = (m >> pr_shift) & pr_mask;
+   const unsigned mesh_prio = SpritePrioNum[mesh_pr];
+   if(winprio[i] > mesh_prio)
+    continue;
+
+   uint32_t mesh_rgb24;
+
+   if(SpriteColorMode && (m & 0x8000))
+   {
+    // RGB-direct: m is a Saturn 15-bit RGB555 + MSB opaque marker.
+    // Expand through rgb15_to_rgb24, exactly as T_DrawSpriteData does
+    // for the same framebuffer halfword.  VDP2 places the 5-bit
+    // channels in the top bits of its internal 8-bit color bus with
+    // the low 3 bits zero (so 555 full-scale is 0xF8, not 0xFF); the
+    // previous hand-rolled expansion here bit-replicated instead,
+    // making RGB-direct mesh texels up to 7/255 per channel brighter
+    // than both the non-mesh rendering of the same texel and the
+    // paletted mesh texels below (ColorCache also zero-fills).
+    mesh_rgb24 = rgb15_to_rgb24(m);
+   }
+   else
+   {
+    // Paletted: same CRAM lookup the sprite layer would do for
+    // this texel, including the per-SpriteType dc-mask and the
+    // sprite CRAM address offset.
+    const unsigned dc = m & dc_mask;
+    mesh_rgb24 = ColorCache[(cao + dc) & 0x7FF];
+   }
+
+   const uint32_t mesh_surf = MIXIT_TO_SURFACE(mesh_rgb24);
+   const uint32_t a = target[i];
+   const uint32_t b = mesh_surf;
+
+   target[i] = ((a & 0xFEFEFEFE) >> 1) + ((b & 0xFEFEFEFE) >> 1) + (a & b & 0x01010101);
+  }
+ }
+}
+
+static int32_t ApplyHBlend(uint32_t* const target, int32_t w)
+{
+ #define BHALF(m, n) ((((uint64_t)(m) + (n)) - (((m) ^ (n)) & 0x01010101)) >> 1)
+
+ /* The blend kernel below indexes target[w-2] (read) and target[(w-1)*2+1]
+  * (write) -- both are out of bounds for w < 4 (the high-res branch
+  * needs target[w-2]; the low-res branch needs both).  Real Saturn
+  * modes have w >= 320, but a game putting the VDP2 into an off-spec
+  * line-width state could push w below 4 and walk us into target[-1]
+  * (a read backwards into the prior scanline's tail or border-fill
+  * memory).  Skip the blend in that case and pass w through. */
+ if(MDFN_UNLIKELY(w < 4))
+  return w;
+
+ if(!(HRes & 0x2))
+ {
+  target[(w - 1) * 2 + 1] = target[w - 1];
+  target[(w - 1) * 2 + 0] = BHALF(BHALF(target[w - 2], target[w - 1]), target[w - 1]);
+
+  for(int32_t x = w - 2; x > 0; x--)
+  {
+   uint32_t ptxm1 = target[x - 1];
+   uint32_t ptx = target[x];
+   uint32_t ptxp1 = target[x + 1];
+   uint32_t ptxm1_ptx = BHALF(ptxm1, ptx);
+   uint32_t ptx_ptxp1 = BHALF(ptx, ptxp1);
+
+   target[x * 2 + 0] = BHALF(ptxm1_ptx, ptx);
+   target[x * 2 + 1] = BHALF(ptx_ptxp1, ptx);
+  }
+
+  target[1] = BHALF(BHALF(target[0], target[1]), target[0]);
+  target[0] = target[0];
+
+  return w << 1;
+ }
+ else
+ {
+  uint32_t a = target[0];
+  for(int32_t x = 0; x < w - 1; x++)
+  {
+   uint32_t b = target[x];
+   uint32_t c = target[x + 1];
+   uint32_t ac = BHALF(a, c);
+   uint32_t bac = BHALF(b, ac);
+
+   target[x] = bac;
+   a = b;
+  }
+  return w;
+ }
+ #undef BHALF
+}
+
+static INLINE void SaveLineState(VDP2LineState* st)
+{
+ for(unsigned n = 0; n < 2; n++)
+ {
+  st->VCLast[n] = VCLast[n];
+  st->YCoordAccum[n] = YCoordAccum[n];
+  st->CurXScrollIF[n] = CurXScrollIF[n];
+  st->CurYScrollIF[n] = CurYScrollIF[n];
+  st->CurLSA[n] = CurLSA[n];
+  st->CurXCoordInc[n] = CurXCoordInc[n];
+  st->NBG23_YCounter[n] = NBG23_YCounter[n];
+  st->WindowCurLineWinAddr[n] = Window[n].CurLineWinAddr;
+ }
+ st->CurBackTabAddr = CurBackTabAddr;
+ st->CurLCTabAddr = CurLCTabAddr;
+ st->CurBackColor = CurBackColor;
+ st->CurLCColor = CurLCColor;
+ st->MosaicVCount = MosaicVCount;
+}
+
+static INLINE void LoadLineState(const VDP2LineState* st)
+{
+ for(unsigned n = 0; n < 2; n++)
+ {
+  VCLast[n] = st->VCLast[n];
+  YCoordAccum[n] = st->YCoordAccum[n];
+  CurXScrollIF[n] = st->CurXScrollIF[n];
+  CurYScrollIF[n] = st->CurYScrollIF[n];
+  CurLSA[n] = st->CurLSA[n];
+  CurXCoordInc[n] = st->CurXCoordInc[n];
+  NBG23_YCounter[n] = st->NBG23_YCounter[n];
+  Window[n].CurLineWinAddr = st->WindowCurLineWinAddr[n];
+ }
+ CurBackTabAddr = st->CurBackTabAddr;
+ CurLCTabAddr = st->CurLCTabAddr;
+ CurBackColor = st->CurBackColor;
+ CurLCColor = st->CurLCColor;
+ MosaicVCount = st->MosaicVCount;
+}
+
+static NO_INLINE void DrawLine(const uint16_t out_line, const uint16_t vdp2_line, const bool field)
+{
+ const int32_t tvdw = ((!CorrectAspect || Clock28M) ? 352 : 330) << ((HRes & 0x2) >> 1);
+ const unsigned rbg_w = ((HRes & 0x1) ? 352 : 320);
+ const unsigned w = ((HRes & 0x1) ? 352 : 320) << ((HRes & 0x2) >> 1);
+ const int32_t tvxo = ((int32_t)(0) > (int32_t)((int32_t)(tvdw - w) >> 1) ? (int32_t)(0) : (int32_t)((int32_t)(tvdw - w) >> 1));
+ uint32_t back_rgb24;
+ uint32_t border_ncf;
+ uint32_t *target = espec->surface->pixels + out_line * espec->surface->pitchinpix;
+
+ // Invalidate LB clean flags whenever w changes -- a flag means
+ // "buffer is zero in [0, LB_cleaned_w)", and after a width change
+ // a flag of true would falsely cover stale memory in
+ // [LB_cleaned_w, w). Cheap (one compare + five byte stores in the
+ // rare miss case) and runs once per DrawLine.
+ if(MDFN_UNLIKELY(w != LB_cleaned_w))
+ {
+  LB_clean_rbg0    = false;
+  LB_clean_nbg[0]  = false;
+  LB_clean_nbg[1]  = false;
+  LB_clean_nbg[2]  = false;
+  LB_clean_nbg[3]  = false;
+  LB_cleaned_w     = w;
+ }
+
+ espec->LineWidths[out_line] = tvdw;
+
+ if(!ShowHOverscan)
+ {
+  const int32_t ntdw = tvdw * 1024 / 1056;
+  const int32_t tadj = ((int32_t)(0) > (int32_t)(espec->DisplayRect.x - ((tvdw - ntdw) >> 1)) ? (int32_t)(0) : (int32_t)(espec->DisplayRect.x - ((tvdw - ntdw) >> 1)));
+
+  assert((tvdw + tadj) <= 704);
+
+  target += tadj;
+  espec->LineWidths[out_line] = ntdw;
+ }
+
+ //
+ // FIXME: Timing
+ //
+ if(vdp2_line == 0)
+ {
+  CurBackTabAddr = (BKTA & 0x7FFFF) + ((BKTA & 0x80000000) && InterlaceMode == IM_DOUBLE && field);
+  CurLCTabAddr = (LCTA & 0x7FFFF) + ((LCTA & 0x80000000) && InterlaceMode == IM_DOUBLE && field);
+
+  for(unsigned n = 0; n < 2; n++)
+  {
+   YCoordAccum[n] = (InterlaceMode == IM_DOUBLE && field) ? YCoordInc[n] : 0;
+
+   CurLSA[n] = LineScrollAddr[n];
+
+   if(InterlaceMode == IM_DOUBLE && field)
+   {
+    const uint8_t sc = (SCRCTL >> (n << 3));
+    const uint8_t lss = ((sc >> 4) & 0x3);
+
+    if(!lss)
+     CurLSA[n] += ((bool)(sc & 0x2) + (bool)(sc & 0x4) + (bool)(sc & 0x8)) << 1;
+   }
+   //
+   //
+   NBG23_YCounter[n & 1] = YScrollI[2 + n];
+  }
+
+  for(unsigned d = 0; d < 2; d++)
+  {
+   Window[d].CurLineWinAddr = Window[d].LineWinAddr;
+
+   if(InterlaceMode == IM_DOUBLE && field)
+    Window[d].CurLineWinAddr += 2;
+  }
+
+  MosaicVCount = 0;
+ }
+
+ if(vdp2_line != 0xFFFF)
+ {
+  CurBackColor = VRAM[CurBackTabAddr & 0x3FFFF] & 0x7FFF;
+
+  if(BKTA & 0x80000000)
+   CurBackTabAddr += 1 << (InterlaceMode == IM_DOUBLE);
+  //
+  CurLCColor = VRAM[CurLCTabAddr & 0x3FFFF] & 0x07FF;
+  if(LCTA & 0x80000000)
+   CurLCTabAddr += 1 << (InterlaceMode == IM_DOUBLE);
+ }
+
+ back_rgb24 = rgb15_to_rgb24(CurBackColor);
+
+ if(BorderMode)
+  border_ncf = MAKECOLOR((uint8_t)(back_rgb24 >> 0), (uint8_t)(back_rgb24 >> 8), (uint8_t)(back_rgb24 >> 16), 0);
+ else
+  border_ncf = MAKECOLOR(0, 0, 0, 0);
+
+ if(vdp2_line == 0xFFFF)
+ {
+  for(int32_t i = 0; i < tvdw; i++)
+   target[i] = border_ncf;
+ }
+ else
+ {
+  //
+  // Line scroll
+  //
+  const unsigned ls_comp_line = vdp2_line << (InterlaceMode == IM_DOUBLE);
+
+  for(unsigned n = 0; n < 2; n++)
+  {
+   const uint8_t sc = (SCRCTL >> (n << 3));
+   const uint8_t lss = ((sc >> 4) & 0x3);
+
+   if((ls_comp_line & ((1 << lss) - 1)) == 0)
+   {
+    if(sc & 0x2)	// X
+    {
+     CurXScrollIF[n] = (VRAM[CurLSA[n] & 0x3FFFF] & 0x7FF) << 8;
+     CurLSA[n]++;
+     CurXScrollIF[n] |= VRAM[CurLSA[n] & 0x3FFFF] >> 8;
+     CurLSA[n]++;
+
+     CurXScrollIF[n] += (XScrollI[n] << 8) + XScrollF[n];
+    }
+
+    if(sc & 0x4) // Y
+    {
+     YCoordAccum[n] = 0;	// Don't (InterlaceMode == IM_DOUBLE && field)
+     //
+     CurYScrollIF[n] = (VRAM[CurLSA[n] & 0x3FFFF] & 0x7FF) << 8;
+     CurLSA[n]++;
+     CurYScrollIF[n] |= VRAM[CurLSA[n] & 0x3FFFF] >> 8;
+     CurLSA[n]++;
+
+     CurYScrollIF[n] += (YScrollI[n] << 8) + YScrollF[n];
+    }
+
+    if(sc & 0x8) // X zoom
+    {
+     CurXCoordInc[n] = (VRAM[CurLSA[n] & 0x3FFFF] & 0x7) << 8;
+     CurLSA[n]++;
+     CurXCoordInc[n] |= VRAM[CurLSA[n] & 0x3FFFF] >> 8;
+     CurLSA[n]++;
+    }
+
+    if(InterlaceMode == IM_DOUBLE && !lss)
+     CurLSA[n] += ((bool)(sc & 0x2) + (bool)(sc & 0x4) + (bool)(sc & 0x8)) << 1;
+   }
+
+   if(!(sc & 0x2))
+    CurXScrollIF[n] = (XScrollI[n] << 8) + XScrollF[n];
+
+   if(!(sc & 0x4))
+    CurYScrollIF[n] = (YScrollI[n] << 8) + YScrollF[n];
+
+   if(!(sc & 0x8))
+    CurXCoordInc[n] = XCoordInc[n];
+  }
+
+  //
+  // Line Window
+  //
+  {
+   for(unsigned d = 0; d < 2; d++)
+   {
+    if(Window[d].LineWinEn)
+    {
+     const uint16_t* vrt = &VRAM[Window[d].CurLineWinAddr & 0x3FFFE];
+
+     Window[d].XStart = vrt[0] & 0x3FF;
+     Window[d].XEnd = vrt[1] & 0x3FF;
+    }
+    //
+    //
+    //
+    int32_t xs = Window[d].XStart, xe = Window[d].XEnd;
+
+    // FIXME: Kludge, until we can figure out what's going on.
+    if(xs >= 0x380)
+     xs = 0;
+
+    // FIXME: Kludge, until we can figure out what's going on.
+    if(xe >= 0x380)
+    {
+     xs = 2;
+     xe = 0;
+    }
+
+    if(!(HRes & 0x2))
+    {
+     xs >>= 1;
+     xe >>= 1;
+    }
+    Window[d].CurXStart = xs;
+    Window[d].CurXEnd = xe;
+
+    Window[d].CurLineWinAddr += 2 << (InterlaceMode == IM_DOUBLE);
+
+    Window[d].YMet = LIB[vdp2_line].win_ymet[d];
+    //
+    //
+    //
+   }
+
+   //
+   //
+   //
+   WinPieces[0] = Window[0].CurXStart;
+   WinPieces[1] = Window[0].CurXEnd + 1;
+   WinPieces[2] = Window[1].CurXStart;
+   WinPieces[3] = Window[1].CurXEnd + 1;
+   WinPieces[4] = w;
+
+   for(unsigned piece = 0; piece < 5; piece++)
+    WinPieces[piece] = ((unsigned)(w) < (unsigned)(WinPieces[piece]) ? (unsigned)(w) : (unsigned)(WinPieces[piece]));	// Almost forgot to do this...
+
+   /* 5-element ascending insertion sort.  std::sort on a known-tiny
+    * array is overkill; insertion sort has fewer comparisons at n=5
+    * and inlines cleanly without function call overhead.  Replaces
+    * the prior std::sort(WinPieces.begin(), WinPieces.end()). */
+   {
+    unsigned i;
+    for(i = 1; i < 5; i++)
+    {
+     const unsigned k = WinPieces[i];
+     int j = (int)i - 1;
+     while(j >= 0 && WinPieces[j] > k)
+     {
+      WinPieces[j + 1] = WinPieces[j];
+      j--;
+     }
+     WinPieces[j + 1] = k;
+    }
+   }
+  }
+
+  //
+  // Process sprite data before NBG0-3 and RBG0-1, but defer applying the window until after NBG and RBG are handled(so the sprite window
+  // bit in the sprite linebuffer data isn't trashed prematurely).
+  //
+  // (Sprite layer was conditional on UserLayerEnableMask & (1U << 6)
+  //  in upstream Mednafen, with the else branch zero-filling LB.spr
+  //  to keep the disabled-layer composite clean.  The libretro fork
+  //  has no user-layer-mask UI; the bit was always set, so the else
+  //  was always dead.  Sprite draw runs unconditionally now.)
+  MakeSpriteCCLUT();
+  {
+   const bool use_vdp1_alt = (ConsumerDeinterlaceMode == VDP2_DEINT_PROGRESSIVE) && espec->InterlaceOn && (InterlaceMode == IM_DOUBLE) && field && LIB[vdp2_line].vdp1_alt_valid;
+   DrawSpriteData[(HRes & 0x2) >> 0x1][(SDCTL >> 8) & 0x1][SPCTL_Low](use_vdp1_alt ? LIB[vdp2_line].vdp1_line_alt : LIB[vdp2_line].vdp1_line, use_vdp1_alt ? LIB[vdp2_line].vdp1_alt_hires8 : LIB[vdp2_line].vdp1_hires8, w);
+  }
+
+  if(BGON & 0x30)
+  {
+   // LB.lc handling: pre-fill the line-colour-index buffer at
+   // width `w`, run SetupRotVars (which may overwrite parts of it),
+   // then expand the rbg_w-wide writes to w via Doubleize in
+   // hi-res mode IF SetupRotVars actually wrote.
+   //
+   // -- Width: filling at `w` instead of `rbg_w` lets us drop
+   // Doubleize for the common case where SetupRotVars writes
+   // nothing to LB.lc (KTCTL bit 0x10 clear on both active rotation
+   // params -- "no per-coefficient line colour"). rep-stosq covers
+   // the extra w - rbg_w bytes essentially for free; Doubleize was
+   // a real backward read-modify-write scan. In low-res
+   // w == rbg_w so the fill matches the original rbg_w-wide
+   // semantics exactly. When KTCTL bit 0x10 IS set on at least
+   // one param, SetupRotVars writes non-uniform values into
+   // [0, rbg_w) and Doubleize is needed to overwrite [rbg_w, w)
+   // with the doubled results -- the hi-res + KTCTL-set gate
+   // below picks that up.
+   //
+   // -- LineColorEn: when LineColorEn == 0 the entire chain is
+   // dead. Every site that sets PIX_LCE_SHIFT on a pixel's
+   // pix_base_or (sprite, RBG0, RBG1, all 4 NBGs) ANDs its
+   // corresponding LineColorEn bit, so LineColorEn == 0 means no
+   // pixel ever has the LCE bit set and MixIt's
+   //   else if(pix & (1U << PIX_LCE_SHIFT))
+   // line-colour-blend branch at line 2512 never fires. With
+   // nothing reading LB.lc this scanline, neither the FastArraySet
+   // nor the Doubleize have any observable effect, and skipping
+   // them saves w bytes/line of memory traffic plus the Doubleize
+   // call in the rare hi-res + KTCTL-set case.
+   //
+   // SetupRotVars's own conditional write to LB.lc[x] (under
+   // KTCTL[i] & 0x10) isn't gated by LineColorEn here -- it's
+   // per-pixel inside SetupRotVars's existing loop and the writes
+   // are likewise dead when LineColorEn == 0, harmless but
+   // technically wasted. Conservatively rare; not worth threading
+   // the extra parameter through.
+   //
+   // LB.lc lives OUTSIDE the LB union (__attribute__((aligned(16)))
+   // uint8_t lc[704] is a sibling of the nbg union, not part of it),
+   // so stale
+   // content from a prior LineColorEn != 0 frame can never alias
+   // any nbg buffer -- the Sega Rally aliasing failure mode from
+   // commit b9f8b4e doesn't apply to LB.lc.
+   if(LineColorEn)
+    MDFN_FastArraySet(LB.lc, CurLCColor & 0x7F, w);
+   SetupRotVars(LIB[vdp2_line].rv, rbg_w);
+   // SetupRotVars writes LB.rotabsel / LB.rotv / LB.rotcoeff (and
+   // the MDFN_FastArraySet of LB.rotabsel further down inside the
+   // RBG1 branch likewise). All three of those scratch arrays
+   // alias the start of LB.nbg[1] via the LB union -- they cover
+   // the first ~1968 bytes, well past where MixIt reads at
+   // (LB.nbg[1] + 8)[i] for i in [0, w). So SetupRotVars
+   // unconditionally corrupts nbg[1]'s storage, and the lazy-zero
+   // clean flag has to reflect that or a later line with NBG1
+   // disabled will skip its zero-fill and MixIt will read the
+   // aliased rotabsel/rotv/rotcoeff bytes as nbg[1] pixel data --
+   // the Sega Rally vertical-line regression cause.
+   LB_clean_nbg[1] = false;
+   if(LineColorEn && (HRes & 0x2) && ((KTCTL[0] | KTCTL[1]) & 0x10))
+    DOUBLEIZE_U8(LB.lc, rbg_w);
+
+   // RBG0
+   if(MDFN_LIKELY(BGON & 0x10))
+   {
+    const bool igntp = (BGON >> 12) & 1;
+    const bool bmen = (CHCTLB >> 9) & 1;
+    const unsigned colornum = ((unsigned)(4) < (unsigned)((CHCTLB >> 12) & 0x7) ? (unsigned)(4) : (unsigned)((CHCTLB >> 12) & 0x7));	// TODO: Test 5 ... 7
+    const unsigned priomode = (SFPRMD >> 8) & 0x3;
+    const unsigned ccmode = (CCCTL & 0x10) ? ((SFCCMD >> 8) & 0x3) : 0;
+    const uint32_t prio = RBG0PrioNum;
+    uint32_t pix_base_or;
+
+    pix_base_or = ((colornum >= 3) << PIX_ISRGB_SHIFT);
+    pix_base_or |= ((ColorOffsEn >> 4) & 1) << PIX_COE_SHIFT;
+    pix_base_or |= ((ColorOffsSel >> 4) & 1) << PIX_COSEL_SHIFT;
+    pix_base_or |= ((LineColorEn >> 4) & 1) << PIX_LCE_SHIFT;
+    pix_base_or |= RBG0CCRatio << PIX_CCRATIO_SHIFT;
+    pix_base_or |= (((CCCTL >> 12) & 0x7) == 0x1) << PIX_GRAD_SHIFT;
+    pix_base_or |= ((CCCTL >> 4) & 1) << PIX_LAYER_CCE_SHIFT;
+    pix_base_or |= ((SDCTL >> 4) & 1) << PIX_SHADEN_SHIFT;
+
+    if(ccmode == 0)
+     pix_base_or |= ((CCCTL >> 4) & 1) << PIX_CCE_SHIFT;
+
+    if(priomode >= 1)
+     pix_base_or |= ((prio &~ 1) << PIX_PRIO_SHIFT);
+    else
+     pix_base_or |= (prio << PIX_PRIO_SHIFT);
+
+    // ConstAB dispatch: when RPMD < 2, SetupRotVars filled
+    // LB.rotabsel[] uniformly with RPMD (see line 1899) and that value
+    // is < 2 so LB.rotv[const_ab] is always in-bounds. This covers the
+    // common 3D-game cases -- single rotation parameter, EffRPMD == 0
+    // (RBG1 forces this too) or 1. The variable-ab fallback handles
+    // RPMD == 2 (per-coefficient runtime switching) and RPMD == 3
+    // (window-decided), plus the pathological RPMD >= 2 with BGON&0x20
+    // case which was already producing rotabsel >= 2 in the existing
+    // path and tripping the same out-of-bounds on LB.rotv[2].
+    if(RPMD < 2)
+     DrawRBG_ConstAB[bmen][colornum][igntp][priomode % 3][ccmode](0, RPMD, LB.rbg0, rbg_w, pix_base_or);
+    else
+     DrawRBG[bmen][colornum][igntp][priomode % 3][ccmode](0, LB.rbg0, rbg_w, pix_base_or);
+    RBGPP(4, LB.rbg0, rbg_w);
+    LB_clean_rbg0 = false;
+   }
+   else if(!LB_clean_rbg0)
+   {
+    MDFN_FastArraySet(LB.rbg0, 0, w);
+    LB_clean_rbg0 = true;
+   }
+
+   // RBG1
+   if(BGON & 0x20)
+   {
+    const bool igntp = (BGON >> 8) & 1;
+    const unsigned colornum = ((unsigned)(4) < (unsigned)((CHCTLA >> 4) & 0x7) ? (unsigned)(4) : (unsigned)((CHCTLA >> 4) & 0x7));	// TODO: Test 5 ... 7
+    const unsigned priomode = (SFPRMD >> 0) & 0x3;
+    const unsigned ccmode = (CCCTL & 0x01) ? ((SFCCMD >> 0) & 0x3) : 0;
+    const uint32_t prio = NBGPrioNum[0];
+    uint32_t pix_base_or;
+
+    pix_base_or = (false << PIX_ISRGB_SHIFT);
+    pix_base_or |= ((ColorOffsEn >> 0) & 1) << PIX_COE_SHIFT;
+    pix_base_or |= ((ColorOffsSel >> 0) & 1) << PIX_COSEL_SHIFT;
+    pix_base_or |= ((LineColorEn >> 0) & 1) << PIX_LCE_SHIFT;
+    pix_base_or |= NBGCCRatio[0] << PIX_CCRATIO_SHIFT;
+    pix_base_or |= (((CCCTL >> 12) & 0x7) == 0x2) << PIX_GRAD_SHIFT;
+    pix_base_or |= ((CCCTL >> 0) & 1) << PIX_LAYER_CCE_SHIFT;
+    pix_base_or |= ((SDCTL >> 0) & 1) << PIX_SHADEN_SHIFT;
+
+    if(ccmode == 0)
+     pix_base_or |= ((CCCTL >> 0) & 1) << PIX_CCE_SHIFT;
+
+    if(priomode >= 1)
+     pix_base_or |= ((prio &~ 1) << PIX_PRIO_SHIFT);
+    else
+     pix_base_or |= (prio << PIX_PRIO_SHIFT);
+
+    MDFN_FastArraySet(LB.rotabsel, 1, rbg_w);
+    // RBG1 always uses rotation parameter B (ab == 1) -- the
+    // MDFN_FastArraySet above pins rotabsel uniformly to 1, so this is
+    // an unconditional ConstAB dispatch. Pre-fill kept anyway because
+    // a future change to make RBGPP read rotabsel beyond w would
+    // otherwise see stale content; T_DrawRBG_CAB only writes the [0,w)
+    // range like its variable-ab sibling.
+    DrawRBG_ConstAB[false][colornum][igntp][priomode % 3][ccmode](1, 1, LB.nbg[0] + 8, rbg_w, pix_base_or);
+    RBGPP(0, LB.nbg[0] + 8, rbg_w);
+    LB_clean_nbg[0] = false;
+   }
+   else if((BGON & 0x20) && !LB_clean_nbg[0])
+   {
+    MDFN_FastArraySet(LB.nbg[0] + 8, 0, w);
+    LB_clean_nbg[0] = true;
+   }
+  }
+  else
+  {
+   // Same LineColorEn-dead-fill argument as the RBG path's
+   // companion fill above.
+   if(LineColorEn)
+    MDFN_FastArraySet(LB.lc, CurLCColor & 0x7F, w);
+   if(!LB_clean_rbg0)
+   {
+    MDFN_FastArraySet(LB.rbg0, 0, w);
+    LB_clean_rbg0 = true;
+   }
+  }
+  //
+  //
+  //
+  for(unsigned n = 0; n < 4; n++)
+  {
+   if(!MosaicVCount || !(MZCTL & (1U << n)))
+   {
+    if(n < 2)
+    {
+     MosEff_YCoordAccum[n] = YCoordAccum[n];	// Don't + (InterlaceMode == IM_DOUBLE && field)
+    }
+    else
+    {
+     MosEff_NBG23_YCounter[n & 1] = NBG23_YCounter[n & 1] + (InterlaceMode == IM_DOUBLE && field);
+    }
+   }
+  }
+
+  if(SCRCTL & 0x0101)
+  {
+   FetchVCScroll(w);	// Call after handling line scroll, and before DrawNBG() stuff
+   // FetchVCScroll writes LB.vcscr[0..1][tile], which aliases the
+   // first ~360 bytes of LB.nbg[2] via the union. Conservatively
+   // invalidate the lazy-zero clean flag for nbg[2] -- vcscr writes
+   // are gated internally on vcon[0]/vcon[1], but the call-site
+   // condition (SCRCTL & 0x0101) is what matters externally and
+   // the cost of a stray flag clear is one byte store. See
+   // companion comment at the SetupRotVars call above for the same
+   // union-aliasing situation hitting nbg[1].
+   LB_clean_nbg[2] = false;
+  }
+
+  if((BGON & 0x30) != 0x30)
+  {
+   for(unsigned n = (bool)(BGON & 0x20); n < 4; n++)
+   {
+    if(MDFN_LIKELY((BGON >> n) & 1))
+    {
+     const bool igntp = (BGON >> (n + 8)) & 1;
+     bool bmen = false;
+     unsigned colornum;
+     unsigned priomode;
+     unsigned ccmode;
+
+     if(n < 2)
+     {
+      const unsigned nshift = (n & 1) << 3;
+
+      bmen = (CHCTLA >> (1 + nshift)) & 1;
+      colornum = (CHCTLA >> (4 + nshift)) & (n ? 0x3 : 0x7);
+     }
+     else	// n >= 2
+     {
+      const unsigned nshift = (n & 1) << 2;
+
+      colornum = (CHCTLB >> (1 + nshift)) & 1;
+     }
+
+     if(colornum > 4) // TODO: test 5 ... 7
+      colornum = 4;
+
+     priomode = (SFPRMD >> (n << 1)) & 0x3;
+     ccmode = (SFCCMD >> (n << 1)) & 0x3;
+     if(!((CCCTL >> n) & 1))
+      ccmode = 0;
+     //
+     //
+     const uint32_t prio = NBGPrioNum[n];
+     uint32_t pix_base_or;
+
+     pix_base_or = ((colornum >= 3) << PIX_ISRGB_SHIFT);
+     pix_base_or |= ((ColorOffsEn >> n) & 1) << PIX_COE_SHIFT;
+     pix_base_or |= ((ColorOffsSel >> n) & 1) << PIX_COSEL_SHIFT;
+     pix_base_or |= ((LineColorEn >> n) & 1) << PIX_LCE_SHIFT;
+     pix_base_or |= NBGCCRatio[n] << PIX_CCRATIO_SHIFT;
+     pix_base_or |= (((CCCTL >> 12) & 0x7) == (3 + n - !n)) << PIX_GRAD_SHIFT;
+     pix_base_or |= ((CCCTL >> n) & 1) << PIX_LAYER_CCE_SHIFT;
+     pix_base_or |= ((SDCTL >> n) & 1) << PIX_SHADEN_SHIFT;
+
+     if(ccmode == 0)
+      pix_base_or |= ((CCCTL >> n) & 1) << PIX_CCE_SHIFT;
+
+     if(priomode >= 1)
+      pix_base_or |= ((prio &~ 1) << PIX_PRIO_SHIFT);
+     else
+      pix_base_or |= (prio << PIX_PRIO_SHIFT);
+
+     // NBG1 doubles as the external background input when EXBGEN is
+     // set.  Gated on the card being present and enabled as well, so a
+     // game that sets the bit with nothing plugged in gets NBG1 as
+     // before rather than a screenful of border colour.
+     if(n == 1 && ExBGEnable && MPEG_IsPresent() && MPEG_DirectOutput()
+        && MPEG_GetDisplayState()->enabled)
+      DrawEXBG(LB.nbg[n] + 8, w, pix_base_or | (1U << PIX_ISRGB_SHIFT), vdp2_line);
+     else if(n < 2)
+      DrawNBG[bmen][colornum][igntp][priomode % 3][ccmode](n, LB.nbg[n] + 8, w, pix_base_or);
+     else
+      DrawNBG23[colornum][igntp][priomode % 3][ccmode](n, LB.nbg[n] + 8, w, pix_base_or);
+
+     ApplyHMosaic(n, LB.nbg[n] + 8, w);
+     ApplyWin(n, LB.nbg[n] + 8);
+     LB_clean_nbg[n] = false;
+    }
+    else if(!LB_clean_nbg[n])
+    {
+     MDFN_FastArraySet(LB.nbg[n] + 8, 0, w);
+     LB_clean_nbg[n] = true;
+    }
+   }
+  }
+
+  //
+  //
+  //
+  //
+  //
+  // Apply window to sprite linebuffer after BG layers have windows applied.
+  ApplyWin(WINLAYER_SPRITE, LB.spr);
+
+  //
+  for(int32_t i = 0; i < tvxo; i++)
+   target[i] = border_ncf;
+
+  for(int32_t i = tvxo + w; i < tvdw; i++)
+   target[i] = border_ncf;
+
+  {
+   const bool rbgdualen = ((BGON & 0x30) == 0x30);
+   unsigned special = MIXIT_SPECIAL_NONE;
+   const bool CCRTMD = (bool)(CCCTL & 0x0200);
+   const bool CCMD = (bool)(CCCTL & 0x0100);
+   static const uint64_t* blurremap[8] = { LB.spr, LB.rbg0, LB.nbg[0] + 8, /*Dummy:*/LB.spr,
+					 LB.nbg[1] + 8, LB.nbg[2] + 8, LB.nbg[3] + 8, /*Dummy:*/LB.spr
+				       };
+   const uint64_t* blursrc = blurremap[(CCCTL >> 12) & 0x7];
+
+   if(!(HRes & 0x6))
+   {
+    if(CCCTL & 0x8000)
+    {
+     if(CRAM_Mode == 0)
+      special = MIXIT_SPECIAL_GRAD;
+    }
+    else if(CCCTL & 0x0400)
+    {
+     special = 0x2;
+     special += (bool)CRAM_Mode;
+     special += (CCCTL >> 4) & 0x2;
+    }
+   }
+   else
+   {
+    if(CRAM_Mode)
+     special = MIXIT_SPECIAL_HIRES_CRAM12;
+   }
+   MixIt[rbgdualen][special][CCRTMD][CCMD](target + tvxo, vdp2_line, w, back_rgb24, blursrc);
+   // RGB-to-output byte-swap now folded into MixIt's terminal store
+   // (single bswap+shr per pixel at a register that already holds the
+   // value, instead of a separate read-modify-write pass over the row).
+   // Border pixels were already written in output format by the two
+   // border-fill loops above, so they pass through unchanged.
+
+   // Late composite for the improved-mesh-transparency option. Reads
+   // the per-scanline mesh side-buffer that VDP1_GetLine populated
+   // from MeshFB; blends mesh pixels at 50% on top of the freshly-
+   // composited surface row, gated on the mesh's would-be sprite
+   // priority vs the winning layer's priority recorded by MixIt.
+   // Gated on the runtime flag so the default-off path skips both
+   // this scan and the priority-store in MixIt; MeshFB is also
+   // zeroed unconditionally by VBErase, so flipping the option on
+   // mid-session can't bleed stale data through.
+   if(VDP1_MeshImproved)
+   {
+    const bool use_vdp1_alt = (ConsumerDeinterlaceMode == VDP2_DEINT_PROGRESSIVE) && espec->InterlaceOn && (InterlaceMode == IM_DOUBLE) && field && LIB[vdp2_line].vdp1_alt_valid;
+    ApplyMeshOverlay(target + tvxo, use_vdp1_alt ? LIB[vdp2_line].vdp1_mesh_line_alt : LIB[vdp2_line].vdp1_mesh_line, LIB[vdp2_line].vdp1_winprio, w, (HRes & 0x2) >> 1);
+   }
+  }
+  //
+  //
+  //
+  // FIXME: Timing
+  //
+  for(unsigned n = 0; n < 2; n++)
+  {
+   YCoordAccum[n] += YCoordInc[n] << (InterlaceMode == IM_DOUBLE);
+   NBG23_YCounter[n & 1] += 1 << (InterlaceMode == IM_DOUBLE);
+  }
+
+  if(MosaicVCount >= ((MZCTL >> 12) & 0xF))
+   MosaicVCount = 0;
+  else
+   MosaicVCount++;
+ }
+
+ //
+ //
+ //
+ if(DoHBlend)
+ {
+  espec->LineWidths[out_line] = ApplyHBlend(espec->surface->pixels + out_line * espec->surface->pitchinpix + espec->DisplayRect.x, espec->LineWidths[out_line]);
+
+  // Kind of late, but meh. ;p
+  assert((espec->DisplayRect.x + espec->LineWidths[out_line]) <= 704);
+ }
+
+ //
+ // DEINT_OFF: when the user has selected Deinterlace = Off and we
+ // are rendering an interlaced frame, also fill the opposite-field
+ // row of the surface with this scanline's content. Every emulated
+ // frame thus produces a stable, full-vertical-resolution image
+ // where both surface rows in each (even, odd) pair hold
+ // current-frame pixels. The deinterlacer in libretro.c is set
+ // to DEINT_OFF alongside this flag so it doesn't try to combine
+ // fields.
+ //
+ // What we copy: only the pixel range the libretro frontend will
+ // actually read from this row -- DisplayRect.x for LineWidths
+ // pixels (= the post-HBlend, post-overscan-crop active region).
+ // Anything outside that range is either stale (untouched this
+ // frame) or border-fill that lives outside the frontend's view;
+ // mirroring it wouldn't change what the user sees and would just
+ // waste memory bandwidth.  At low-res 320 NTSC with HBlend off
+ // that drops the per-line memcpy from 2816 to ~1364 bytes.
+ //
+ // Note that espec->LineWidths[out_line] is the FINAL width set
+ // after MixIt + (optional) HBlend; HBlend's low-res path doubles
+ // the original width but still leaves the result within
+ // DisplayRect.x + LineWidths <= 704 (asserted in DrawLine just
+ // above).
+ //
+ if(MDFN_UNLIKELY(ConsumerDeinterlaceMode == VDP2_DEINT_OFF) && espec->InterlaceOn)
+ {
+  const int32_t mirror_line = (int32_t)out_line ^ 1;
+  const int32_t rect_end = espec->DisplayRect.y + espec->DisplayRect.h;
+  if(mirror_line >= espec->DisplayRect.y && mirror_line < rect_end)
+  {
+   const size_t   col_off  = (size_t)espec->DisplayRect.x;
+   const size_t   copy_pix = (size_t)espec->LineWidths[out_line];
+   const uint32_t*  src_row  = espec->surface->pixels
+                              + out_line    * espec->surface->pitchinpix + col_off;
+   uint32_t*        dst_row  = espec->surface->pixels
+                              + mirror_line * espec->surface->pitchinpix + col_off;
+   memcpy(dst_row, src_row, copy_pix * sizeof(uint32_t));
+   espec->LineWidths[mirror_line] = espec->LineWidths[out_line];
+  }
+ }
+}
+
+//
+//
+//
+static INLINE void DrawLineCommand(const uint16_t out_line, const uint16_t vdp2_line, const bool field)
+{
+ if(MDFN_UNLIKELY(ConsumerDeinterlaceMode == VDP2_DEINT_PROGRESSIVE && espec && espec->InterlaceOn))
+ {
+  const unsigned f = (unsigned)field & 1U;
+
+  if(ProgressiveLineStateValid[f])
+   LoadLineState(&ProgressiveLineState[f]);
+
+  DrawLine(out_line, vdp2_line, field);
+
+  SaveLineState(&ProgressiveLineState[f]);
+  ProgressiveLineStateValid[f] = true;
+ }
+ else
+  DrawLine(out_line, vdp2_line, field);
+}
+
+static sthread_t *RThread = NULL;
+
+enum
+{
+ COMMAND_WRITE8 = 0,
+ COMMAND_WRITE16,
+ COMMAND_WRITE16_BURST,	// Arg32 = base B-bus address, Arg16 = n16 | (add_mode << 13); n16 uint16_t payload words follow in BurstBuf.
+
+ COMMAND_DRAW_LINE,
+
+ COMMAND_SET_DEINT_MODE,
+
+ COMMAND_SET_BUSYWAIT,
+
+ COMMAND_RESET,
+ COMMAND_EXIT
+};
+
+struct WQ_Entry
+{
+ uint16_t Command;
+ uint16_t Arg16;
+ uint32_t Arg32;
+};
+
+#define WQ_SIZE 0x80000u
+static struct WQ_Entry WQ[WQ_SIZE];
+
+// Payload ring for COMMAND_WRITE16_BURST (DSP-DMA streaming a contiguous run of
+// 16-bit writes into the VDP2 register/RAM window). Single-producer (emulator
+// thread, in DMAInstr) / single-consumer (RThreadEntry). It carries no atomic of
+// its own beyond BurstPopCount: the producer fills the payload slots *before* the
+// WWQ() that publishes the burst command, so that WWQ's release-store on
+// WQ_PushCount also publishes these writes, and the consumer's acquire-load makes
+// them visible before it dispatches the burst. Sized large enough that the
+// occupancy check below never realistically blocks (one max burst is 512 words).
+#define BurstBufSize ((uint32_t)(1u << 20))
+#define BurstBufMask ((uint32_t)(BurstBufSize - 1))
+static uint16_t BurstBuf[BurstBufSize];
+// SPSC queue state. Each atomic is written by exactly one thread (release-store)
+// and read by the other (acquire-load); live queue depth is recovered by
+// subtraction, avoiding the cross-thread RMW that bounced the cache line.
+// Producer-side and consumer-side state live on separate cache lines so the
+// consumer's pop-side writes don't thrash the producer's reads of its own
+// counters. WQ_PopCached lets WWQ skip the per-call atomic load on the
+// queue-full check. DrawFinishCount (consumer-written) is read directly by
+// the producer because the wakeup heuristic needs an up-to-date queue depth;
+// DrawPushCount (producer-written) mirrors Prod.DrawPushLocal so the consumer
+// can tell when it has finished every DRAW_LINE the producer queued and wake
+// EndFrame's drain wait.
+__attribute__((aligned(64))) static vdp2_atomic_u32 WQ_PushCount;     // producer-written
+__attribute__((aligned(64))) static vdp2_atomic_u32 WQ_PopCount;      // consumer-written
+__attribute__((aligned(64))) static vdp2_atomic_u32 DrawFinishCount;  // consumer-written
+__attribute__((aligned(64))) static vdp2_atomic_u32 DrawPushCount;    // producer-written
+__attribute__((aligned(64))) static vdp2_atomic_u32 BurstPopCount;    // consumer-written; cumulative uint16_t words drained from BurstBuf
+struct __attribute__((aligned(64))) ProducerState
+{
+ size_t WritePos;
+ uint32_t PushLocal;        // total WQ pushes
+ uint32_t DrawPushLocal;    // total VDP2REND_DrawLine pushes
+ uint32_t WQ_PopCached;     // last-seen WQ_PopCount; refreshed only when the queue
+                          // appears full (huge queue, so basically never)
+ uint32_t BurstWritePos;    // cumulative uint16_t words written to BurstBuf
+ uint32_t BurstPopCached;   // last-seen BurstPopCount; refreshed only when BurstBuf appears full
+};
+struct __attribute__((aligned(64))) ConsumerState
+{
+ size_t ReadPos;
+ uint32_t PopLocal;         // total WQ pops
+ uint32_t DrawFinishLocal;  // total DrawLine completions
+ uint32_t BurstReadPos;     // cumulative uint16_t words drained from BurstBuf
+};
+static struct ProducerState Prod;
+static struct ConsumerState Cons;
+static bool DoBusyWait;
+
+/* Busy-waiting exists to shave wakeup latency off the frame-end drain,
+ * and it only helps when the producer keeps running while the consumer
+ * spins.  On a single hardware thread the spin merely delays the
+ * producer it is waiting for; measured on such a box, 92% of the render
+ * thread's samples were the spin and it cost the emulation thread about
+ * a third of the CPU.  So the producer never requests busy-waiting
+ * unless at least two hardware threads are online. */
+static bool BusyWaitAllowed = true;
+
+static unsigned online_cpu_count(void)
+{
+#if defined(_WIN32)
+ SYSTEM_INFO si;
+ GetSystemInfo(&si);
+ return si.dwNumberOfProcessors ? (unsigned)si.dwNumberOfProcessors : 1u;
+#elif defined(_SC_NPROCESSORS_ONLN)
+ long n = sysconf(_SC_NPROCESSORS_ONLN);
+ return n > 0 ? (unsigned)n : 1u;
+#else
+ return 2u;   /* unknown platform: keep the historical behaviour */
+#endif
+}
+
+/* Consumer wakeup.  The command queue itself is the lock-free SPSC ring
+ * above; this pair only parks the consumer while the ring is empty and
+ * busy-waiting is off.  It replaces a counting semaphore (rsemaphore,
+ * which libretro-common no longer carries): the semaphore's count was
+ * never load-bearing, because the consumer re-reads WQ_PushCount after
+ * every wait anyway, so a condvar with the predicate re-checked under
+ * WakeLock is the same protocol.  The producer publishes WQ_PushCount
+ * (release) before it signals, and the consumer checks it under the
+ * lock before it waits, which closes the missed-wakeup window. */
+static slock_t *WakeLock = NULL;
+static scond_t *WakeCond = NULL;
+
+// Drain coordination: when EndFrame is called the producer has to wait
+// for the consumer to finish this frame's DRAW_LINE commands -- i.e. for
+// DrawFinishCount to catch up to the producer's DrawPushLocal. The old
+// implementation spun: wake the consumer + retro_sleep repeatedly
+// until the two were equal. That works but burns producer CPU on every
+// frame transition for as long as the consumer takes -- and on some
+// systems retro_sleep(0) is implemented as sched_yield(), which keeps
+// the producer at the head of the runqueue, defeating the yield.
+//
+// Replacement: a mutex+condvar pair. EndFrame waits on scond_wait
+// (proper kernel block, zero spinning); the consumer's COMMAND_DRAW_LINE
+// handler signals once -- on the completion that makes DrawFinishLocal
+// reach the published DrawPushCount. Per-frame overhead: 1 lock+unlock+
+// wait on the producer, 1 lock+signal+unlock on the consumer (only for
+// the line that drains the frame, not every line). A few microseconds
+// per frame, in exchange for zero CPU spent spinning during the drain.
+static slock_t  *DrainLock = NULL;
+static scond_t  *DrainCond = NULL;
+static bool DoWakeupIfNecessary;
+
+static INLINE void WakeConsumer(void)
+{
+ slock_lock(WakeLock);
+ scond_signal(WakeCond);
+ slock_unlock(WakeLock);
+}
+
+static INLINE void WWQ(uint16_t command, uint32_t arg32, uint16_t arg16)
+{
+ // Queue back-pressure spin. retro_sleep(1) was problematic on Windows
+ // without timeBeginPeriod(1) -- Sleep(1) rounds up to the 15.6ms timer
+ // tick by default, which would have wedged the producer for almost a
+ // whole frame each time the queue filled. retro_sleep(0) yields to the
+ // scheduler without that minimum dwell.
+ while(MDFN_UNLIKELY(Prod.PushLocal - Prod.WQ_PopCached == WQ_SIZE))
+ {
+  Prod.WQ_PopCached = VDP2_ATOMIC_LOAD_ACQ(WQ_PopCount);
+  if(Prod.PushLocal - Prod.WQ_PopCached == WQ_SIZE)
+   retro_sleep(0);
+ }
+
+ struct WQ_Entry* wqe = &WQ[Prod.WritePos];
+
+ wqe->Command = command;
+ wqe->Arg16 = arg16;
+ wqe->Arg32 = arg32;
+
+ Prod.WritePos = (Prod.WritePos + 1) % WQ_SIZE;
+ VDP2_ATOMIC_STORE_REL(WQ_PushCount, ++Prod.PushLocal);
+}
+
+static void/*int*/ RThreadEntry(void* data)
+{
+ bool Running = true;
+
+ while(MDFN_LIKELY(Running))
+ {
+  while(MDFN_UNLIKELY(VDP2_ATOMIC_LOAD_ACQ(WQ_PushCount) == Cons.PopLocal))
+  {
+   if(!DoBusyWait)
+   {
+    slock_lock(WakeLock);
+    while(VDP2_ATOMIC_LOAD_ACQ(WQ_PushCount) == Cons.PopLocal)
+     scond_wait(WakeCond, WakeLock);
+    slock_unlock(WakeLock);
+   }
+   else
+   {
+#if defined(MDFN_SS_BUSYWAIT_PAUSE) || defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    /* PAUSE: the spin-wait hint every x86 since P4 honours.  It yields
+     * the core's front end to a hyperthread sibling and avoids the
+     * memory-order-violation pipeline flush a tight load loop provokes
+     * when the awaited store lands; a NOP loop does neither. */
+ #ifdef _MSC_VER
+    _mm_pause(); _mm_pause(); _mm_pause(); _mm_pause();
+ #else
+    asm volatile("pause\n\tpause\n\tpause\n\tpause\n\t");
+ #endif
+#elif defined(__aarch64__) || defined(__arm__)
+    asm volatile("yield\n\tyield\n\tyield\n\tyield\n\tyield\n\tyield\n\tyield\n\t");
+#else
+    for(int i = 1000; i; i--)
+    {
+     #ifdef _MSC_VER
+     __nop();
+     #else
+     asm volatile("nop\n\t");
+     #endif
+    }
+#endif
+   }
+  }
+  //
+  //
+  //
+  struct WQ_Entry* wqe = &WQ[Cons.ReadPos];
+
+  switch(wqe->Command)
+  {
+   case COMMAND_WRITE8:
+	MemW_u8(wqe->Arg32, wqe->Arg16);
+	break;
+
+   case COMMAND_WRITE16:
+	MemW_u16(wqe->Arg32, wqe->Arg16);
+	break;
+
+   case COMMAND_WRITE16_BURST:
+	{
+	 const uint32_t n16 = wqe->Arg16 & 0x1FFF;
+	 const uint32_t stride = (1u << (wqe->Arg16 >> 13)) &~ 1u;
+	 uint32_t a = wqe->Arg32;
+
+	 for(uint32_t i = 0; i < n16; i++)
+	 {
+	  MemW_u16(a, BurstBuf[(Cons.BurstReadPos + i) & BurstBufMask]);
+	  a += stride;
+	 }
+	 Cons.BurstReadPos += n16;
+	 VDP2_ATOMIC_STORE_REL(BurstPopCount, Cons.BurstReadPos);
+	}
+	break;
+
+   case COMMAND_DRAW_LINE:
+	//for(unsigned i = 0; i < 2; i++)
+	DrawLineCommand((uint16_t)wqe->Arg32, wqe->Arg32 >> 16, wqe->Arg16);
+	//
+	// Publish completion: DrawFinishCount is consumer-written, read by
+	// the producer (EndFrame's drain wait, and the wdcq wakeup
+	// heuristic in VDP2REND_DrawLine). If this completion brings us
+	// level with everything the producer has queued so far, and
+	// EndFrame is blocked on the drain condvar, wake it. The
+	// slock_lock / unlock pair around scond_signal closes the
+	// missed-wakeup race between EndFrame's recheck and its scond_wait;
+	// scond_signal with no waiter is a harmless no-op.
+	VDP2_ATOMIC_STORE_REL(DrawFinishCount, ++Cons.DrawFinishLocal);
+	if (Cons.DrawFinishLocal == VDP2_ATOMIC_LOAD_ACQ(DrawPushCount))
+	{
+	   slock_lock(DrainLock);
+	   scond_signal(DrainCond);
+	   slock_unlock(DrainLock);
+	}
+	break;
+
+   case COMMAND_RESET:
+	Reset(wqe->Arg32);
+	break;
+
+   case COMMAND_SET_DEINT_MODE:
+	ConsumerDeinterlaceMode = wqe->Arg32;
+	break;
+
+   case COMMAND_SET_BUSYWAIT:
+	DoBusyWait = wqe->Arg32;
+	break;
+
+   case COMMAND_EXIT:
+	Running = false;
+	break;
+  }
+  //
+  //
+  //
+  Cons.ReadPos = (Cons.ReadPos + 1) % WQ_SIZE;
+  VDP2_ATOMIC_STORE_REL(WQ_PopCount, ++Cons.PopLocal);
+  /* Queue drained: wake a producer parked in StateAction's full-drain
+   * wait.  Fires once per catch-up, not per command. */
+  if(Cons.PopLocal == VDP2_ATOMIC_LOAD_ACQ(WQ_PushCount))
+  {
+   slock_lock(DrainLock);
+   scond_signal(DrainCond);
+   slock_unlock(DrainLock);
+  }
+ }
+
+ // return 0; // Libretro fix
+}
+
+//
+//
+//
+//
+//
+void VDP2REND_Init(const bool IsPAL, const uint64_t affinity)
+{
+ PAL = IsPAL;
+ VisibleLines = PAL ? 288 : 240;
+ //
+ Clock28M = false;
+ //
+ /* C++ aggregate-init `X = {};` zeroed Prod/Cons in the .cpp form;
+  * use memset for C compatibility.  Both compile to the same code. */
+ memset(&Prod, 0, sizeof(Prod));
+ memset(&Cons, 0, sizeof(Cons));
+ VDP2_ATOMIC_STORE_REL(WQ_PushCount, 0);
+ VDP2_ATOMIC_STORE_REL(WQ_PopCount, 0);
+ VDP2_ATOMIC_STORE_REL(DrawFinishCount, 0);
+ VDP2_ATOMIC_STORE_REL(DrawPushCount, 0);
+ VDP2_ATOMIC_STORE_REL(BurstPopCount, 0);
+ BusyWaitAllowed = online_cpu_count() >= 2u;
+
+ WakeLock = slock_new();
+ WakeCond = scond_new();
+ DrainLock = slock_new();
+ DrainCond = scond_new();
+ RThread = sthread_create(RThreadEntry, NULL);
+}
+
+// Needed for ss.correct_aspect == 0
+void VDP2REND_GetGunXTranslation(const bool clock28m, int32_t* sn, int32_t* on, int32_t* d)
+{
+ /* Gun X transform: out = round((in*sn + on) / d).  Identity by default.
+  * When the picture is not aspect-corrected and not in the 28MHz/hi-res
+  * mode, apply scale 65/61 with offset -42944/65
+  * ( = -(21472 - 21472*61/65) / 2 ), both over the common denominator
+  * 61*65 = 3965: 65/61 = 4225/3965, -42944/65 = -2619584/3965.  Integer
+  * coefficients keep the transform (which feeds emulated gun state via
+  * TransformInput -> nom_coord) free of host floating point. */
+ *sn = 1;
+ *on = 0;
+ *d  = 1;
+
+ if(!CorrectAspect && !clock28m)
+ {
+  *sn = 4225;
+  *on = -2619584;
+  *d  = 3965;
+ }
+}
+
+void VDP2REND_SetGetVideoParams(struct MDFNGI* gi, const bool caspect, const int sls, const int sle, const bool show_h_overscan, const bool dohblend)
+{
+ CorrectAspect = caspect;
+ ShowHOverscan = show_h_overscan;
+ DoHBlend = dohblend;
+ LineVisFirst = sls;
+ LineVisLast = sle;
+ //
+ // Geometry hints written into MDFNGI for downstream consumers.
+ // Only the four fields actually read by SMPC's gun-coordinate
+ // math (smpc_iodevice.c) are populated here -- the previous list
+ // also wrote lcm_width / lcm_height / fb_width / fb_height /
+ // nominal_height / mouse_scale_y, but none of those are read
+ // anywhere in this fork.  See the MDFNGI definition in
+ // mdfn_gameinfo.h for the trimmed set.
+ //
+ if(PAL)
+  gi->nominal_width = (ShowHOverscan ? 365 : 354);
+ else
+  gi->nominal_width = (ShowHOverscan ? 302 : 292);
+
+ gi->mouse_scale_x = (ShowHOverscan? 21472 : 20821);
+ gi->mouse_offs_x2 = (ShowHOverscan? 0 : 651); /* 2 * mouse_offs_x */
+ gi->mouse_offs_y  = LineVisFirst;
+ //
+ //
+ //
+ if(!CorrectAspect)
+ {
+  gi->nominal_width = (ShowHOverscan ? 352 : 341);
+
+  gi->mouse_scale_x = (ShowHOverscan? 21472 : 20821);
+  gi->mouse_offs_x2 = (ShowHOverscan? 0 : 651); /* 2 * mouse_offs_x */
+ }
+}
+
+void VDP2REND_Kill(void)
+{
+ if(WakeCond != NULL)
+ {
+  WWQ(COMMAND_SET_BUSYWAIT, true, 0);
+  WakeConsumer();
+ }
+
+ if(RThread != NULL)
+ {
+  WWQ(COMMAND_EXIT, 0, 0);
+  sthread_join(RThread);
+  /* sthread_join frees the handle (libretro-common's rthreads.c
+     does `free(thread)` at the end of sthread_join), so RThread
+     points to released memory after this point. NULL it to match
+     the post-free pattern used for WakeCond / DrainCond /
+     DrainLock below, so a re-entry of Kill (or any future code
+     that NULL-checks RThread) sees a clean state. */
+  RThread = NULL;
+ }
+
+ if(WakeCond != NULL)
+ {
+  scond_free(WakeCond);
+  WakeCond = NULL;
+ }
+ if(WakeLock != NULL)
+ {
+  slock_free(WakeLock);
+  WakeLock = NULL;
+ }
+
+ // Drain primitives are freed after sthread_join above so we can't be
+ // racing with a consumer that's still alive and might try to signal
+ // the cond. Producer (this thread) is the only remaining accessor at
+ // this point.
+ if (DrainCond != NULL)
+ {
+  scond_free(DrainCond);
+  DrainCond = NULL;
+ }
+ if (DrainLock != NULL)
+ {
+  slock_free(DrainLock);
+  DrainLock = NULL;
+ }
+}
+
+void VDP2REND_StartFrame(struct EmulateSpecStruct* espec_arg, const bool clock28m, const int SurfInterlaceField)
+{
+ NextOutLine = 0;
+ Clock28M = clock28m;
+ ProgressiveLineStateValid[0] = false;
+ ProgressiveLineStateValid[1] = false;
+
+ espec = espec_arg;
+
+ if(SurfInterlaceField >= 0)
+ {
+  espec->LineWidths[0] = 0;
+  espec->InterlaceOn = true;
+  espec->InterlaceField = SurfInterlaceField;
+ }
+ else
+  espec->InterlaceOn = false;
+
+ espec->DisplayRect.x = (ShowHOverscan ? 0 : 10);
+ espec->DisplayRect.y = LineVisFirst << espec->InterlaceOn;
+ espec->DisplayRect.w = 0;
+ espec->DisplayRect.h = (LineVisLast + 1 - LineVisFirst) << espec->InterlaceOn;
+}
+
+void VDP2REND_EndFrame(void)
+{
+ // Wait for the consumer thread to finish all queued DRAW_LINE
+ // commands for this frame -- i.e. for DrawFinishCount to catch up
+ // to the producer-local DrawPushLocal. Replaces an old spin-yield
+ // loop (wake the consumer + retro_sleep repeatedly) with a
+ // condvar wait. The consumer's DRAW_LINE handler signals DrainCond
+ // on the completion that levels the two counters; see the case in
+ // RThreadEntry. The slock around scond_wait is POSIX-required even
+ // though we never write any shared state while holding it -- the
+ // lock is what closes the missed-wakeup race between checking the
+ // counters and entering scond_wait.
+ //
+ // The initial wakeup is still needed: it kicks the consumer out of
+ // any parked wait it might be in on an empty command queue, so
+ // progress on DrawFinishCount can resume.
+ if (MDFN_UNLIKELY(VDP2_ATOMIC_LOAD_ACQ(DrawFinishCount) != Prod.DrawPushLocal))
+ {
+  WakeConsumer();
+  slock_lock(DrainLock);
+  while (VDP2_ATOMIC_LOAD_ACQ(DrawFinishCount) != Prod.DrawPushLocal)
+   scond_wait(DrainCond, DrainLock);
+  slock_unlock(DrainLock);
+ }
+
+ WWQ(COMMAND_SET_BUSYWAIT, false, 0);
+
+ if(NextOutLine < VisibleLines)
+ {
+  const bool progressive = (ProducerDeinterlaceMode == VDP2_DEINT_PROGRESSIVE && espec->InterlaceOn);
+
+  do
+  {
+   if(progressive)
+   {
+    for(unsigned f = 0; f < 2; f++)
+    {
+     const uint16_t out_line = (NextOutLine << 1) | f;
+     uint32_t* target = espec->surface->pixels + out_line * espec->surface->pitchinpix;
+
+     target[0] = target[1] = target[2] = target[3] = MAKECOLOR(0, 0, 0, 0);
+     espec->LineWidths[out_line] = 4;
+    }
+   }
+   else
+   {
+    uint16_t out_line = NextOutLine;
+    uint32_t* target;
+
+    if(espec->InterlaceOn)
+     out_line = (out_line << 1) | espec->InterlaceField;
+
+    target = espec->surface->pixels + out_line * espec->surface->pitchinpix;
+    target[0] = target[1] = target[2] = target[3] = MAKECOLOR(0, 0, 0, 0);
+    espec->LineWidths[out_line] = 4;
+   }
+  } while(++NextOutLine < VisibleLines);
+ }
+
+ espec = NULL;
+}
+
+struct VDP2Rend_LIB* VDP2REND_GetLIB(unsigned line)
+{
+ /* Mask to the on-static LIB[256] array bounds.  Pre-fix the assert
+  * docs `line < (PAL ? 256 : 240)` -- a bug upstream that passed
+  * line >= 256 (VPHASE_ACTIVE failing to gate VCounter, mis-set
+  * VisibleLines, etc.) would have returned &LIB[256+] and the
+  * caller's writes would land in adjacent statics.  AND mask is a
+  * single instruction and cannot lengthen the per-scanline hot
+  * path, so it works as a release-mode runtime guard the assert
+  * couldn't be. */
+ return &LIB[line & 0xFF];
+}
+
+void VDP2REND_DrawLine(const int vdp2_line, const uint32_t crt_line, const bool field)
+{
+ const unsigned bwthresh = VisibleLines - 48;
+
+ if(MDFN_LIKELY(crt_line < VisibleLines))
+ {
+  const bool progressive = (ProducerDeinterlaceMode == VDP2_DEINT_PROGRESSIVE && espec->InterlaceOn);
+  const unsigned queued_lines = progressive ? 2U : 1U;
+  const uint32_t wdcq = Prod.DrawPushLocal - VDP2_ATOMIC_LOAD_ACQ(DrawFinishCount);
+
+  Prod.DrawPushLocal += queued_lines;
+  VDP2_ATOMIC_STORE_REL(DrawPushCount, Prod.DrawPushLocal);
+
+  if(progressive)
+  {
+   const uint16_t base_out_line = crt_line << 1;
+
+   WWQ(COMMAND_DRAW_LINE, ((uint16_t)vdp2_line << 16) | (base_out_line | 0), false);
+   WWQ(COMMAND_DRAW_LINE, ((uint16_t)vdp2_line << 16) | (base_out_line | 1), true);
+  }
+  else
+  {
+   uint16_t out_line = crt_line;
+
+   if(espec->InterlaceOn)
+    out_line = (out_line << 1) | espec->InterlaceField;
+
+   WWQ(COMMAND_DRAW_LINE, ((uint16_t)vdp2_line << 16) | out_line, field);
+  }
+  //
+  //
+  if(crt_line == bwthresh)
+  {
+   if(BusyWaitAllowed)
+    WWQ(COMMAND_SET_BUSYWAIT, true, 0);
+   WakeConsumer();
+  }
+  else if(crt_line < bwthresh)
+  {
+   if(wdcq == 0)
+    DoWakeupIfNecessary = true;
+   else if((wdcq + queued_lines) >= 64 && DoWakeupIfNecessary)
+   {
+    //printf("Post Wakeup: %3d --- crt_line=%3d\n", wdcq + queued_lines, crt_line);
+    WakeConsumer();
+    DoWakeupIfNecessary = false;
+   }
+  }
+
+  NextOutLine = crt_line + 1;
+ }
+}
+
+void VDP2REND_Reset(bool powering_up)
+{
+ WWQ(COMMAND_RESET, powering_up, 0);
+}
+
+void VDP2REND_SetDeinterlaceMode(unsigned mode)
+{
+ if(mode > VDP2_DEINT_PROGRESSIVE)
+  mode = VDP2_DEINT_NORMAL;
+
+ ProducerDeinterlaceMode = mode;
+
+ /* Route the consumer copy through the queue when the render thread is
+  * alive, so option changes are observed between draw commands.  Before
+  * Init creates the thread, write directly; an early queued command would
+  * be lost when Init resets the ring counters. */
+ if(RThread == NULL)
+  ConsumerDeinterlaceMode = mode;
+ else
+  WWQ(COMMAND_SET_DEINT_MODE, mode, 0);
+}
+
+void VDP2REND_Write8_DB(uint32_t A, uint16_t DB)
+{
+ //if(VDP2_ATOMIC_LOAD_ACQ(DrawFinishCount) != Prod.DrawPushLocal)
+  WWQ(COMMAND_WRITE8, A, DB);
+ //else
+ // MemW_u8(A, DB);
+}
+
+void VDP2REND_Write16_DB(uint32_t A, uint16_t DB)
+{
+ //if(VDP2_ATOMIC_LOAD_ACQ(DrawFinishCount) != Prod.DrawPushLocal)
+  WWQ(COMMAND_WRITE16, A, DB);
+ //else
+ // MemW_u16(A, DB);
+}
+
+// DSP-DMA burst of n16 16-bit writes: words[i] -> (base + i * ((1<<add_mode)&~1)).
+// Equivalent to n16 successive VDP2REND_Write16_DB() calls but collapses them to a
+// single queue command + a bulk payload copy. n16 <= 512, add_mode <= 7.
+void VDP2REND_WriteBurst16_DB(uint32_t base, uint32_t n16, uint32_t add_mode, const uint16_t* words)
+{
+ // Reserve n16 contiguous (mod BurstBufSize) payload slots, spin-sleeping if the
+ // consumer hasn't drained enough yet (mirrors WWQ's queue-full handling).
+ while(MDFN_UNLIKELY((Prod.BurstWritePos - Prod.BurstPopCached) > (BurstBufSize - n16)))
+ {
+  Prod.BurstPopCached = VDP2_ATOMIC_LOAD_ACQ(BurstPopCount);
+  if((Prod.BurstWritePos - Prod.BurstPopCached) > (BurstBufSize - n16))
+   retro_sleep(1);
+ }
+
+ // Copy `words` into BurstBuf at offset (BurstWritePos & mask). With
+ // BurstBufSize = 1MB and n16 capped at 512 (~1 KB), the ring almost
+ // never wraps mid-burst -- but it can, when BurstWritePos is near
+ // BurstBufSize. Split into the contiguous prefix and (rarely) a
+ // wrap-around tail so each chunk is a single memcpy and the compiler
+ // can lower to SIMD / rep-movsq without the per-iteration & mask
+ // that defeated autovectorisation in the original scalar loop.
+ {
+  const uint32_t wpos = Prod.BurstWritePos & BurstBufMask;
+  const uint32_t first = (n16 <= BurstBufSize - wpos) ? n16 : (BurstBufSize - wpos);
+  memcpy(&BurstBuf[wpos], words, (size_t)first * sizeof(uint16_t));
+  if(MDFN_UNLIKELY(first < n16))
+   memcpy(&BurstBuf[0], words + first, (size_t)(n16 - first) * sizeof(uint16_t));
+ }
+ Prod.BurstWritePos += n16;
+
+ WWQ(COMMAND_WRITE16_BURST, base, (uint16_t)(n16 | (add_mode << 13)));
+}
+
+void VDP2REND_StateAction(StateMem* sm, const unsigned load, const bool data_only, uint16_t* rr, uint16_t* cr, uint16_t* vr)
+{
+ // Full drain: every queued command must have been consumed before the
+ // renderer state is serialised.  Wake the consumer once, then block on
+ // DrainCond, which the consumer signals each time it catches up with
+ // WQ_PushCount; the predicate is re-checked under DrainLock.  This
+ // replaces a wake + retro_sleep(1) poll.
+ if(MDFN_UNLIKELY(VDP2_ATOMIC_LOAD_ACQ(WQ_PopCount) != Prod.PushLocal))
+ {
+  WakeConsumer();
+  slock_lock(DrainLock);
+  while(VDP2_ATOMIC_LOAD_ACQ(WQ_PopCount) != Prod.PushLocal)
+   scond_wait(DrainCond, DrainLock);
+  slock_unlock(DrainLock);
+ }
+ //
+ //
+ //
+ SFORMAT StateRegs[] =
+ {
+  SFVAR(Clock28M),	// DUBIOUS
+
+  SFVAR(MosaicVCount),
+
+  SFPTR32N(&(VCLast)[0], (sizeof(VCLast) / sizeof(uint32_t)), "VCLast"),
+
+  SFPTR32N(&(YCoordAccum)[0], (sizeof(YCoordAccum) / sizeof(uint32_t)), "YCoordAccum"),
+  SFPTR32N(&(MosEff_YCoordAccum)[0], (sizeof(MosEff_YCoordAccum) / sizeof(uint32_t)), "MosEff_YCoordAccum"),
+
+  SFPTR32N(&(CurXScrollIF)[0], (sizeof(CurXScrollIF) / sizeof(uint32_t)), "CurXScrollIF"),
+  SFPTR32N(&(CurYScrollIF)[0], (sizeof(CurYScrollIF) / sizeof(uint32_t)), "CurYScrollIF"),
+  SFPTR16N(&(CurXCoordInc)[0], (sizeof(CurXCoordInc) / sizeof(uint16_t)), "CurXCoordInc"),
+  SFPTR32N(&(CurLSA)[0], (sizeof(CurLSA) / sizeof(uint32_t)), "CurLSA"),
+
+  SFPTR16N(&(NBG23_YCounter)[0], (sizeof(NBG23_YCounter) / sizeof(uint16_t)), "NBG23_YCounter"),
+  SFPTR16N(&(MosEff_NBG23_YCounter)[0], (sizeof(MosEff_NBG23_YCounter) / sizeof(uint16_t)), "MosEff_NBG23_YCounter"),
+
+  SFVAR(CurBackTabAddr),
+  SFVAR(CurBackColor),
+
+  SFVAR(CurLCTabAddr),
+  SFVAR(CurLCColor),
+
+  // XStart and XEnd can be modified by line window processing.
+  SFVAR(Window->XStart, 2, sizeof(*Window), Window),
+  SFVAR(Window->XEnd, 2, sizeof(*Window), Window),
+  SFVAR(Window->CurXStart, 2, sizeof(*Window), Window),
+  SFVAR(Window->CurXEnd, 2, sizeof(*Window), Window),
+  SFVAR(Window->CurLineWinAddr, 2, sizeof(*Window), Window),
+
+  SFEND
+ };
+
+ // Calls to RegsWrite() should go before MDFNSS_StateAction(), and before memcpy() to VRAM and CRAM.
+ if(load)
+ {
+  for(unsigned i = 0; i < 0x100; i++)
+  {
+   RegsWrite(i << 1, rr[i]);
+  }
+ }
+
+ MDFNSS_StateAction(sm, load, data_only, StateRegs, "VDP2REND", false);
+
+ if(load)
+ {
+  memcpy(VRAM, vr, sizeof(VRAM));
+  memcpy(CRAM, cr, sizeof(CRAM));
+
+  RecalcColorCache();
+ }
+}
